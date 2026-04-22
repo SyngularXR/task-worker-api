@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "task-worker-api"
+version = "0.1.0"
+description = "Shared contract and worker SDK for the SynPusher task queue."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Syngular Technology" }]
+dependencies = [
+    "pydantic>=2.0",
+    # httpx lands in v0.2+ when the HTTP client module ships. Omitted from
+    # v0.1.0 so installing the package doesn't force a httpx upgrade on
+    # any consumer (notably the SynPusher backend, which pins 0.23.3).
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "aioresponses>=0.7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/task_worker_api"]
