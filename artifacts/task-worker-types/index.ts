@@ -92,9 +92,49 @@ export interface ModelInitializingParams {
   base_name: string;
 }
 
+/**
+ * Input for the colmap-splat worker's gs_build handler.
+ */
+export interface GsBuildParams {
+  /** Scene directory on shared volume. */
+  scene?: string;
+  /** Alias for `scene`. */
+  scene_path?: string;
+  /** Scene id; defaults to dir basename. */
+  scene_id?: string;
+  method?: string;
+  iterations?: number;
+  max_image_size?: number;
+  max_splats?: number;
+  sh_degree?: number;
+  seed?: number;
+  sift_max_image_size?: number;
+  num_threads?: number;
+  background?: string;
+  strategy?: string;
+}
+
+/**
+ * Input for Neural-Canvas's segmentation handler.
+ */
+export interface SegmentationParams {
+  /** NIfTI volume on the shared volume. */
+  input_path: string;
+  /** Segmentation model: 'vista3d' or 'medsam3'. */
+  model: string;
+  /** Target label names. */
+  labels?: Array<string>;
+  case_id?: number;
+  dicom_id?: number;
+  /** Mask identifier for result mirror. */
+  mask_id?: string;
+}
+
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
   'detect_cut_planes': DetectCutPlanesParams;
   'model_initializing': ModelInitializingParams;
+  'gs_build': GsBuildParams;
+  'segmentation': SegmentationParams;
 }

@@ -10,19 +10,17 @@ from __future__ import annotations
 from ..enums import TaskType
 from ._base import TaskParamsBase
 from .detect_cut_planes import DetectCutPlanesParams
+from .gs_build import GsBuildParams
 from .model_initializing import ModelInitializingParams
+from .segmentation import SegmentationParams
 
-# NOTE: Not every TaskType has a schema yet. Render/gs_build/segmentation/
-# apple_ml_gs land during Phase 1 proper; v0.1.0 ships the two Blender
-# task types needed to unblock detect_cut_planes end-to-end and
-# model_initializing (already in production via the existing worker).
-#
-# Unregistered task types can still be enqueued via the backend's
-# per-feature endpoints (render_job.py, gs_build.py, intelligence.py)
-# until their schemas land here.
+# render + apple_ml_gs land in a future release once the handler shapes
+# are audited (see design spec Appendix A).
 TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
     TaskType.DETECT_CUT_PLANES: DetectCutPlanesParams,
     TaskType.MODEL_INITIALIZING: ModelInitializingParams,
+    TaskType.GS_BUILD: GsBuildParams,
+    TaskType.SEGMENTATION: SegmentationParams,
 }
 
 
@@ -31,4 +29,6 @@ __all__ = [
     "TASK_PARAMS_SCHEMAS",
     "DetectCutPlanesParams",
     "ModelInitializingParams",
+    "GsBuildParams",
+    "SegmentationParams",
 ]

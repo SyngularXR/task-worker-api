@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.0 — 2026-04-22
+
+- Adds `GsBuildParams` schema (colmap-splat worker) with all 11 run.sh
+  knobs (`scene`, `iterations`, `max_splats`, `sh_degree`, `seed`,
+  `num_threads`, `background`, `strategy`, etc.). All fields optional
+  except one of `scene` / `scene_path`.
+- Adds `SegmentationParams` schema (Neural-Canvas worker) with
+  `input_path`, `model`, `labels`, `case_id`, `dicom_id`, `mask_id`.
+- Registers both in `TASK_PARAMS_SCHEMAS`.
+- TypeScript codegen picks them up automatically; regenerated
+  `artifacts/task-worker-types/index.ts` ships in this release.
+
+`RenderParams` and `AppleMlGsParams` still deferred — audit pending.
+
 ## v0.2.0 — 2026-04-22
 
 Adds the runtime SDK — workers can now depend on this package and
