@@ -1,0 +1,24 @@
+name: TypeScript codegen drift check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/task_worker_api/**"
+      - "tools/gen_typescript.py"
+      - "artifacts/task-worker-types/**"
+  push:
+    branches: [main]
+
+jobs:
+  check-ts-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package
+        run: pip install -e .
+      - name: Check TypeScript artifact is up to date
+        run: python tools/gen_typescript.py --check

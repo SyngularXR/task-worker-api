@@ -1,0 +1,10 @@
+{
+  "name": "@syngularxr/task-worker-types",
+  "version": "0.2.0",
+  "description": "Generated TypeScript types for the SynPusher task queue. Regenerated from task-worker-api Pydantic schemas.",
+  "types": "index.ts",
+  "main": "index.ts",
+  "files": ["index.ts", "README.md"],
+  "license": "Proprietary",
+  "private": true
+}
