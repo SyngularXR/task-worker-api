@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.1 — 2026-04-22
+
+- Python floor lowered to 3.10 (was 3.11). Neural-Canvas runs 3.10
+  and needed the SDK to consume there.
+- `run_hybrid` rewritten to use `asyncio.wait` + explicit cancel
+  instead of `asyncio.TaskGroup` (3.11+ only). Same semantics: if
+  either the FastAPI app or Worker exits, the other gets cancelled
+  cleanly and the first exception propagates to the caller.
+- No public API change otherwise.
+
 ## v0.3.0 — 2026-04-22
 
 - Adds `GsBuildParams` schema (colmap-splat worker) with all 11 run.sh

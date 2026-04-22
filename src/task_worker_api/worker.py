@@ -222,10 +222,34 @@ async def run_hybrid(
 ) -> None:
     """Run an awaitable (e.g. uvicorn.Server.serve()) and a Worker concurrently.
 
-    If either exits, the other is cancelled cleanly via TaskGroup semantics.
-    Used by Neural-Canvas where the FastAPI server and the task worker
-    share one process + event loop.
+    If either exits, the other is cancelled cleanly. Used by Neural-
+    Canvas where the FastAPI server and the task worker share one
+    process + event loop.
+
+    Implemented with `asyncio.wait` + cancel (not `asyncio.TaskGroup`)
+    to keep Python 3.10 compatibility. Neural-Canvas currently runs
+    3.10 and can't easily jump to 3.11; raising the SDK's floor would
+    strand that consumer.
     """
-    async with asyncio.TaskGroup() as tg:
-        tg.create_task(app_coro, name="fastapi-app")
-        tg.create_task(worker.run_forever(), name="task-worker")
+    app_task = asyncio.ensure_future(app_coro)
+    worker_task = asyncio.ensure_future(worker.run_forever())
+    try:
+        done, pending = await asyncio.wait(
+            {app_task, worker_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # Cancel whichever sibling is still running so we don't leak.
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # Re-raise the first exception from the completed side so the
+        # caller sees it (TaskGroup behavior equivalent).
+        for t in done:
+            exc = t.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                raise exc
+    finally:
+        for t in (app_task, worker_task):
+            if not t.done():
+                t.cancel()

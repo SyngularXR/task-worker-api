@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "task-worker-api"
-version = "0.3.0"
+version = "0.3.1"
 description = "Shared contract and worker SDK for the SynPusher task queue."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Syngular Technology" }]
 dependencies = [
