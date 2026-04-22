@@ -19,6 +19,7 @@ class TaskType(str, Enum):
     MODEL_INITIALIZING = "model_initializing"
     APPLE_ML_GS = "apple_ml_gs"
     DETECT_CUT_PLANES = "detect_cut_planes"
+    CINEMATIC_BAKING = "cinematic_baking"
 
 
 class TaskStatus(IntEnum):
