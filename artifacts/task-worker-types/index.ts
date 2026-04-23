@@ -11,6 +11,7 @@ export type TaskType =
   | 'model_initializing'
   | 'apple_ml_gs'
   | 'detect_cut_planes'
+  | 'cinematic_baking'
 ;
 
 export const TaskType = {
@@ -20,6 +21,7 @@ export const TaskType = {
   MODEL_INITIALIZING: 'model_initializing' as const,
   APPLE_ML_GS: 'apple_ml_gs' as const,
   DETECT_CUT_PLANES: 'detect_cut_planes' as const,
+  CINEMATIC_BAKING: 'cinematic_baking' as const,
 } as const;
 
 export enum TaskStatus {
@@ -93,6 +95,18 @@ export interface ModelInitializingParams {
 }
 
 /**
+ * Input for the Blender worker's cinematic_baking handler.
+ */
+export interface CinematicBakingParams {
+  /** Stable job identifier for metadata mirror. */
+  job_id: string;
+  /** Absolute preview GLB path on the shared volume. */
+  input_path: string;
+  /** Filename stem for outputs; _finalized.glb appended. */
+  base_name: string;
+}
+
+/**
  * Input for the colmap-splat worker's gs_build handler.
  */
 export interface GsBuildParams {
@@ -135,6 +149,7 @@ export interface SegmentationParams {
 export interface TaskParamsByType {
   'detect_cut_planes': DetectCutPlanesParams;
   'model_initializing': ModelInitializingParams;
+  'cinematic_baking': CinematicBakingParams;
   'gs_build': GsBuildParams;
   'segmentation': SegmentationParams;
 }
