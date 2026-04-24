@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.1 — 2026-04-24
+
+- `upload_outputs` now stages local-mode outputs under
+  `shared_volume_path/temp/{task_id}/` instead of
+  `shared_volume_path/{task_id}/`. Keeps the shared volume root clean
+  and gives the backend mirror an obvious place to `rmdir` once it has
+  moved the artifacts to their permanent home. Behaviour is otherwise
+  unchanged — the return value is still a `{key: absolute_path}` map
+  pointing at whatever location the SDK chose.
+
 ## v0.3.1 — 2026-04-22
 
 - Python floor lowered to 3.10 (was 3.11). Neural-Canvas runs 3.10

@@ -264,7 +264,7 @@ A dict for the `PUT /tasks/{id}/complete` payload. Shape is your
 choice, but two conventions:
 
 - **`output_files`**: `{logical_key: filename}`. The SDK publishes
-  these — local mode copies to `shared_volume_path/<task_id>/`; remote
+  these — local mode copies to `shared_volume_path/temp/<task_id>/`; remote
   mode PUTs each via the file endpoints.
 - **Everything else**: lives on `task.result` verbatim, accessible to
   the frontend or task-result-mirror hooks. Keep it small — JSONB
@@ -395,7 +395,7 @@ The SDK auto-detects based on what's in `task.params`:
 
 The SDK copies the file into `ctx.files.input_dir` so your handler
 can write to it safely without mutating the shared source. Your
-`output_files` get copied back to `shared_volume_path/<task_id>/`.
+`output_files` get copied back to `shared_volume_path/temp/<task_id>/`.
 
 This is the common case for workers running in the same Docker Compose
 or Kubernetes namespace as SynPusher — everyone mounts the same

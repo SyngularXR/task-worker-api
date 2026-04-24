@@ -8,7 +8,9 @@ Remote mode — ``task.params.input_files`` is a ``{key: filename}`` map;
 each is streamed via ``GET /tasks/{id}/files/{name}``.
 
 The same file supplies output publishing: local mode copies to
-``shared_volume_path/<task_id>/``; remote mode PUTs each via HTTP.
+``shared_volume_path/temp/<task_id>/`` (a short-lived staging dir the
+backend consumer is expected to sweep after it moves the artifacts to
+their final location); remote mode PUTs each via HTTP.
 """
 from __future__ import annotations
 
@@ -95,7 +97,12 @@ async def upload_outputs(
         return dict(output_files)
 
     if shared_volume_path:
-        dest_dir = Path(shared_volume_path) / str(task.id)
+        # Staging dir for local-mode outputs. Lives under ``temp/`` so
+        # (a) workers don't pollute the shared volume root with one
+        # ``{task_id}/`` folder per completed task, and (b) the backend
+        # mirror has an obvious place to rmdir once it has moved the
+        # artifacts to their permanent home.
+        dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
         dest_dir.mkdir(parents=True, exist_ok=True)
         manifest: dict[str, str] = {}
         for key, filename in output_files.items():
