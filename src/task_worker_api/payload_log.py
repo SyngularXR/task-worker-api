@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,6 +139,43 @@ class PayloadLogger:
                 "boot_id": self.boot_id,
             }
             self._write_line("raw_envelopes", record, now=now)
+        except Exception as exc:  # noqa: BLE001
+            self._warn_once(exc)
+
+    def cleanup_old_files(self) -> None:
+        """Delete files past retention. Runs even when disabled. Never raises.
+
+        Runs on three schedules — at Worker startup, on UTC date rollover, and
+        on a periodic timer (configurable via WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S).
+        Disabled-mode still runs cleanup so a kill-switch deployment doesn't leave
+        residual logs forever.
+        """
+        try:
+            if not self.root.exists():
+                return
+            cutoff_seconds = self.retention_days * 86400
+            now_ts = time.time()
+            for entry in self.root.iterdir():
+                if not entry.is_file():
+                    continue
+                if not (
+                    entry.name.startswith("payloads-")
+                    or entry.name.startswith("raw_envelopes-")
+                ):
+                    continue
+                if not entry.name.endswith(".jsonl"):
+                    continue
+                try:
+                    age = now_ts - entry.stat().st_mtime
+                except OSError:
+                    continue
+                if age >= cutoff_seconds:
+                    try:
+                        entry.unlink()
+                    except (FileNotFoundError, PermissionError, OSError):
+                        # Race with another replica or a Windows handle still
+                        # open elsewhere. Skip and continue.
+                        continue
         except Exception as exc:  # noqa: BLE001
             self._warn_once(exc)
 

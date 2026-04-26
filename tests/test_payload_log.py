@@ -340,3 +340,80 @@ def test_record_raw_handles_non_dict_raw(tmp_path: Path):
     assert parsed[0]["raw"] is None
     assert parsed[1]["raw"] == [1, 2, 3]
     assert parsed[2]["raw"] == "<html>500</html>"
+
+
+# ----- cleanup_old_files -----------------------------------------------------
+
+import os
+import time
+
+
+def _create_old_file(path: Path, age_days: float) -> None:
+    path.write_text("{}\n", encoding="utf-8")
+    age_seconds = age_days * 86400
+    mtime = time.time() - age_seconds
+    os.utime(path, (mtime, mtime))
+
+
+def test_cleanup_removes_files_at_or_past_retention(tmp_path: Path):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    root.mkdir(parents=True)
+    seven_d = root / "payloads-2026-04-19-pid1-aaaa.jsonl"
+    fourteen_d = root / "payloads-2026-04-12-pid1-bbbb.jsonl"
+    thirty_d = root / "payloads-2026-03-27-pid1-cccc.jsonl"
+    raw_thirty_d = root / "raw_envelopes-2026-03-27-pid1-dddd.jsonl"
+    _create_old_file(seven_d, 7)
+    _create_old_file(fourteen_d, 14.5)  # past the inclusive boundary
+    _create_old_file(thirty_d, 30)
+    _create_old_file(raw_thirty_d, 30)
+
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", retention_days=14, enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1,
+    )
+    logger.cleanup_old_files()
+
+    assert seven_d.exists()
+    assert not fourteen_d.exists()
+    assert not thirty_d.exists()
+    assert not raw_thirty_d.exists()  # both streams cleaned
+
+
+def test_cleanup_tolerates_permission_error(tmp_path: Path, monkeypatch):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    root.mkdir(parents=True)
+    a = root / "payloads-2026-03-27-pid1-aaaa.jsonl"
+    b = root / "payloads-2026-03-27-pid1-bbbb.jsonl"
+    _create_old_file(a, 30)
+    _create_old_file(b, 30)
+
+    real_unlink = Path.unlink
+    def flaky_unlink(self, *args, **kwargs):
+        if self.name.endswith("aaaa.jsonl"):
+            raise PermissionError("file held open by another process")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", retention_days=14, enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1,
+    )
+    logger.cleanup_old_files()  # must not raise
+
+    assert a.exists()       # PermissionError-raising one survived
+    assert not b.exists()   # the other was still removed
+
+
+def test_cleanup_runs_even_when_disabled(tmp_path: Path):
+    """A deployment that flips enabled=false shouldn't accumulate forever."""
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    root.mkdir(parents=True)
+    expired = root / "payloads-2026-03-27-pid1-aaaa.jsonl"
+    _create_old_file(expired, 30)
+
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", retention_days=14, enabled=False,
+    )
+    logger.cleanup_old_files()
+    assert not expired.exists()
