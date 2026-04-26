@@ -25,6 +25,13 @@ _WINDOWS_RESERVED = (
     | {f"LPT{i}" for i in range(1, 10)}
 )
 
+# Two-stage size cap: cap individual variable-size fields at PAYLOAD_FIELD_CAP_BYTES
+# (224KB) so we never serialize a 50MB params blob even once, and cap the final
+# constructed record at RECORD_CAP_BYTES (256KB) so pathological non-payload fields
+# (huge worker_id, huge error string in raw stream) can't sneak past either.
+PAYLOAD_FIELD_CAP_BYTES = 224 * 1024
+RECORD_CAP_BYTES = 256 * 1024
+
 
 def sanitize_worker_id(worker_id: str) -> str:
     """Make a worker_id safe to use as a path segment on Linux and Windows."""
@@ -80,6 +87,9 @@ class PayloadLogger:
             return
         try:
             now = self._now()
+            safe_params, truncated_size = self._maybe_truncate_field(task.params)
+            if truncated_size:
+                self._warn_truncated_once(task.id, "pre-serialization", truncated_size)
             record = {
                 "captured_at": now.isoformat(),
                 "stream": "typed",
@@ -88,7 +98,7 @@ class PayloadLogger:
                 "case_id": task.case_id,
                 "item_key": task.item_key,
                 "status": int(task.status),
-                "params": task.params,
+                "params": safe_params,
                 "worker_id": task.worker_id or self.worker_id,
                 "process_id": self._pid(),
                 "boot_id": self.boot_id,
@@ -126,10 +136,55 @@ class PayloadLogger:
         return cached[1]
 
     def _write_line(self, stream: str, record: dict, *, now: datetime) -> None:
-        line = json.dumps(record, default=str)
+        line = self._serialize_record(record)
         handle = self._ensure_handle(stream, now=now)
         handle.write(line + "\n")
         handle.flush()
+
+    def _maybe_truncate_field(self, value: Any) -> tuple[Any, Optional[int]]:
+        """Return (value-or-marker, original_size_bytes_if_truncated_else_None).
+
+        Serializes ``value`` exactly once. If the JSON form exceeds
+        PAYLOAD_FIELD_CAP_BYTES, returns a small marker dict and the
+        original byte count; otherwise returns the value unchanged.
+        """
+        serialized = json.dumps(value, default=str)
+        size = len(serialized.encode("utf-8"))
+        if size > PAYLOAD_FIELD_CAP_BYTES:
+            return {"_truncated": True, "_original_size_bytes": size}, size
+        return value, None
+
+    def _serialize_record(self, record: dict) -> str:
+        """Stage 2 of the size cap. The variable-size field has already been
+        truncated by _maybe_truncate_field; this catches pathological wrappers
+        (huge item_key, huge error string in raw stream)."""
+        line = json.dumps(record, default=str)
+        if len(line.encode("utf-8")) <= RECORD_CAP_BYTES:
+            return line
+        original_size = len(line.encode("utf-8"))
+        self._warn_truncated_once(
+            record.get("task_id"), "post-construction", original_size
+        )
+        replacement = {
+            "_record_truncated": True,
+            "_original_size_bytes": original_size,
+            "task_id": record.get("task_id"),
+            "stream": record.get("stream"),
+            "captured_at": record.get("captured_at"),
+        }
+        return json.dumps(replacement, default=str)
+
+    def _warn_truncated_once(
+        self, task_id: Any, stage: str, size: int,
+    ) -> None:
+        if getattr(self, "_truncate_warned", False):
+            return
+        self._truncate_warned = True
+        log.warning(
+            "payload_log: truncated record (task_id=%s, stage=%s, size=%d bytes); "
+            "further truncations suppressed",
+            task_id, stage, size,
+        )
 
     def _warn_once(self, exc: BaseException) -> None:
         if self._warned_once:

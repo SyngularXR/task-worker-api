@@ -194,3 +194,48 @@ def test_record_handles_non_json_serializable_params(tmp_path: Path):
     assert isinstance(entry["params"]["input_path"], str)
     assert "scene.stl" in entry["params"]["input_path"]
     assert "2026-04-26" in entry["params"]["started_at"]
+
+
+def test_record_truncates_oversized_params(tmp_path: Path):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    huge = {"blob": "x" * (300 * 1024)}  # > 224KB cap
+    logger.record(_make_task(params=huge))
+
+    entry = json.loads(
+        (root / "payloads-2026-04-26-pid1-deadbeef.jsonl").read_text(encoding="utf-8")
+    )
+    assert entry["params"]["_truncated"] is True
+    assert entry["params"]["_original_size_bytes"] > 224 * 1024
+    # task metadata still present after truncation
+    assert entry["task_id"] == 1
+    assert entry["task_type"] == "detect_cut_planes"
+
+
+def test_final_record_size_cap_applies_when_non_param_fields_huge(tmp_path: Path):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    # Pathological: small params, but the item_key itself is huge.
+    task = ClaimedTask(
+        id=99,
+        task_type=TaskType.DETECT_CUT_PLANES,
+        case_id=1,
+        item_key="X" * (300 * 1024),
+        status=TaskStatus.IN_PROGRESS,
+        params={"k": "v"},
+        worker_id="test-worker",
+    )
+    logger.record(task)
+
+    entry = json.loads(
+        (root / "payloads-2026-04-26-pid1-deadbeef.jsonl").read_text(encoding="utf-8")
+    )
+    assert entry["_record_truncated"] is True
+    assert entry["task_id"] == 99
+    assert "captured_at" in entry
