@@ -153,6 +153,26 @@ class Worker:
             self.worker_id, self.backend_url,
             ",".join(t.value for t in self.task_types),
         )
+        if self._payload_logger.enabled:
+            log.info(
+                "payload logging: enabled, root=%s, retention=%dd",
+                self._payload_logger.root, self._payload_logger.retention_days,
+            )
+        else:
+            log.info(
+                "payload logging: disabled (shared_volume_path=%r, env=%r)",
+                self.shared_volume_path,
+                os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
+            )
+        self._payload_logger.cleanup_old_files()
+
+        cleanup_interval_s = float(
+            os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
+        )
+        cleanup_task = asyncio.create_task(
+            self._periodic_cleanup_loop(cleanup_interval_s)
+        )
+
         try:
             while not self._stop.is_set():
                 claimed = await self._claim()
@@ -167,8 +187,31 @@ class Worker:
                     continue
                 await self._run_one(claimed)
         finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._payload_logger.close()
             await self._client.close()
             log.info("task-worker-api Worker stopped: id=%s", self.worker_id)
+
+    async def _periodic_cleanup_loop(self, interval_s: float) -> None:
+        """Background timer that re-runs cleanup so idle workers stay honest.
+
+        Without this, a worker that wrote files 30 days ago and then sat
+        dormant would never clean up — rollover-triggered cleanup only fires
+        on the next write. The timer fires every interval_s seconds; when
+        shutdown is requested, the loop returns immediately.
+        """
+        try:
+            while True:
+                await asyncio.sleep(interval_s)
+                if self._stop.is_set():
+                    return
+                self._payload_logger.cleanup_old_files()
+        except asyncio.CancelledError:
+            raise
 
     async def run_one(self) -> bool:
         """Process exactly one claim cycle. Returns True iff a task ran.
