@@ -567,6 +567,78 @@ Look at these for reference when building yours:
 
 ---
 
+## Replaying captured payloads
+
+`task-worker-api` v0.5.0+ captures every claimed task's full envelope to
+`/app/shared/_worker_payloads/{worker_id}/payloads-YYYY-MM-DD-pidNNN-XXXX.jsonl`
+inside the worker container. Use this when reproducing a worker bug locally
+or replaying real producer traffic into a new feature's tests.
+
+The capture is on by default; disable per deployment with
+`WORKER_PAYLOAD_LOG_ENABLED=false`. Tune retention with
+`WORKER_PAYLOAD_LOG_RETENTION_DAYS` (default 14).
+
+### What's in a captured line
+
+Each line is a JSON object with both **task fields** (the original envelope
+the backend sent) and **capture metadata** (process id, boot id, capture
+timestamp, status). When re-enqueuing for replay you must drop the capture
+metadata — the backend will assign new values for those fields:
+
+| Field          | Keep on replay? | Why |
+|----------------|-----------------|-----|
+| `task_type`    | yes             | required for re-enqueue |
+| `case_id`      | yes             | task spec |
+| `item_key`     | yes             | task spec |
+| `params`       | yes             | task spec |
+| `task_id`      | **drop**        | backend assigns a new id |
+| `status`       | **drop**        | will be PENDING after re-enqueue |
+| `worker_id`    | **drop**        | claim metadata, not part of the task spec |
+| `captured_at`  | **drop**        | replay metadata |
+| `stream`       | **drop**        | always `"typed"` |
+| `process_id`   | **drop**        | replay metadata |
+| `boot_id`      | **drop**        | replay metadata |
+
+### Replay snippet
+
+```python
+# replay_payloads.py — re-enqueue captured tasks against a backend
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+from task_worker_api import BackendClient, TaskType
+
+REPLAY_KEEP_FIELDS = {"task_type", "case_id", "item_key", "params"}
+
+
+async def replay(jsonl_path: Path, backend_url: str, api_key: str) -> None:
+    async with BackendClient(backend_url, api_key) as client:
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            envelope = json.loads(line)
+            if envelope.get("stream") != "typed":
+                continue  # skip raw_envelopes lines
+            spec = {k: v for k, v in envelope.items() if k in REPLAY_KEEP_FIELDS}
+            spec["task_type"] = TaskType(spec["task_type"])
+            await client.enqueue(**spec)  # use your backend's enqueue method
+
+
+if __name__ == "__main__":
+    asyncio.run(replay(Path(sys.argv[1]), sys.argv[2], sys.argv[3]))
+```
+
+### The raw_envelopes sidecar
+
+Alongside `payloads-*.jsonl` you'll also see `raw_envelopes-*.jsonl`. This
+is written only when `BackendClient.claim_next` couldn't parse the response
+or `ClaimedTask.from_dict()` rejected it — typically because the backend
+shipped a new `task_type` before the worker fleet was upgraded. On healthy
+days this file is empty; when it has content it's a strong signal of
+backend/worker schema drift.
+
+---
+
 ## Questions?
 
 - Design spec: [`SynPusher-Vue/docs/specs/2026-04-22-unified-task-queue-api-contract-design.md`](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/specs/2026-04-22-unified-task-queue-api-contract-design.md) — the full architecture
