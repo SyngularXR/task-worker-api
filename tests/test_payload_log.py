@@ -134,3 +134,63 @@ def test_record_writes_one_typed_line(tmp_path: Path):
     assert entry["process_id"] == 12345
     assert entry["boot_id"] == "deadbeef"
     assert entry["captured_at"] == "2026-04-26T14:23:11.234567+00:00"
+
+
+def test_record_rotates_on_utc_date_change(tmp_path: Path):
+    """Date check fires at the start of every record() call."""
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    times = iter([
+        datetime(2026, 4, 26, 23, 59, 59, tzinfo=timezone.utc),
+        datetime(2026, 4, 27, 0, 0, 30, tzinfo=timezone.utc),
+    ])
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=lambda: next(times),
+    )
+    logger.record(_make_task(task_id=1))
+    logger.record(_make_task(task_id=2))
+
+    files = sorted(p.name for p in root.glob("payloads-*.jsonl"))
+    assert files == [
+        "payloads-2026-04-26-pid1-deadbeef.jsonl",
+        "payloads-2026-04-27-pid1-deadbeef.jsonl",
+    ]
+
+
+def test_record_rotates_after_idle_across_multiple_days(tmp_path: Path):
+    """A single record() after several idle days lands in the new date's file."""
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    times = iter([
+        datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 5, 3, 12, 0, 0, tzinfo=timezone.utc),
+    ])
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=lambda: next(times),
+    )
+    logger.record(_make_task(task_id=1))
+    logger.record(_make_task(task_id=2))
+
+    files = sorted(p.name for p in root.glob("payloads-*.jsonl"))
+    assert "payloads-2026-04-26-pid1-deadbeef.jsonl" in files
+    assert "payloads-2026-05-03-pid1-deadbeef.jsonl" in files
+
+
+def test_record_handles_non_json_serializable_params(tmp_path: Path):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    bad_params = {
+        "input_path": Path("/tmp/scene.stl"),
+        "started_at": datetime(2026, 4, 26, tzinfo=timezone.utc),
+    }
+    logger.record(_make_task(params=bad_params))
+
+    line = (root / "payloads-2026-04-26-pid1-deadbeef.jsonl").read_text(encoding="utf-8")
+    entry = json.loads(line)
+    # default=str converts both to strings — no crash, no skipped record
+    assert isinstance(entry["params"]["input_path"], str)
+    assert "scene.stl" in entry["params"]["input_path"]
+    assert "2026-04-26" in entry["params"]["started_at"]

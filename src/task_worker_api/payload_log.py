@@ -79,8 +79,9 @@ class PayloadLogger:
         if not self.enabled:
             return
         try:
+            now = self._now()
             record = {
-                "captured_at": self._now().isoformat(),
+                "captured_at": now.isoformat(),
                 "stream": "typed",
                 "task_id": task.id,
                 "task_type": task.task_type.value,
@@ -92,7 +93,7 @@ class PayloadLogger:
                 "process_id": self._pid(),
                 "boot_id": self.boot_id,
             }
-            self._write_line("payloads", record)
+            self._write_line("payloads", record, now=now)
         except Exception as exc:  # noqa: BLE001 — never-raises contract
             self._warn_once(exc)
 
@@ -103,8 +104,15 @@ class PayloadLogger:
             f"{stream}-{date_str}-pid{self._pid()}-{self.boot_id}.jsonl"
         )
 
-    def _ensure_handle(self, stream: str) -> TextIO:
-        date_str = self._now().date().isoformat()
+    def _ensure_handle(self, stream: str, now: datetime) -> TextIO:
+        """Return the open handle for ``stream``, rotating on UTC date change.
+
+        The caller passes the timestamp it already captured for ``captured_at``
+        so we only call ``self._now()`` once per record() — keeps tests with
+        injected iterator-based ``_now`` simple and avoids any window where
+        two timestamps in one record could disagree about which day it is.
+        """
+        date_str = now.date().isoformat()
         cached = self._handles.get(stream)
         if cached is None or cached[0] != date_str:
             if cached is not None:
@@ -117,9 +125,9 @@ class PayloadLogger:
             return handle
         return cached[1]
 
-    def _write_line(self, stream: str, record: dict) -> None:
+    def _write_line(self, stream: str, record: dict, *, now: datetime) -> None:
         line = json.dumps(record, default=str)
-        handle = self._ensure_handle(stream)
+        handle = self._ensure_handle(stream, now=now)
         handle.write(line + "\n")
         handle.flush()
 
