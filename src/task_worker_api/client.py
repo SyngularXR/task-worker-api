@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import httpx
 
 from .context import ClaimedTask
 from .errors import ProtocolError
+
+if TYPE_CHECKING:
+    from .payload_log import PayloadLogger
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +42,7 @@ class BackendClient:
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         client: Optional[httpx.AsyncClient] = None,
+        payload_logger: Optional["PayloadLogger"] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -50,6 +54,7 @@ class BackendClient:
             timeout=timeout_s,
             headers={"Authorization": f"Bearer {api_key}"},
         )
+        self._payload_logger = payload_logger
 
     async def __aenter__(self) -> "BackendClient":
         return self
