@@ -270,3 +270,69 @@ async def test_worker_sanitizes_worker_id_in_log_path(tmp_path):
     assert "passwd" in sanitized
     # The directory must be a direct child of _worker_payloads.
     assert children[0].parent.name == "_worker_payloads"
+
+
+# ----- _run_one capture -----------------------------------------------------
+
+import json
+
+
+@pytest.mark.asyncio
+async def test_worker_writes_typed_record_on_happy_path(tmp_path):
+    fake = FakeBackendClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    fake.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl"), "max_results": 3},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    shared = tmp_path / "shared"
+    worker = Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        work_dir=str(tmp_path / "work"), client=fake,
+        shared_volume_path=str(shared),
+    )
+    await worker.run_one()
+    worker._payload_logger.close()
+
+    payload_dir = shared / "_worker_payloads" / "w"
+    files = list(payload_dir.glob("payloads-*.jsonl"))
+    assert len(files) == 1
+    entry = json.loads(files[0].read_text(encoding="utf-8").strip())
+    assert entry["task_type"] == "detect_cut_planes"
+    assert entry["params"]["max_results"] == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_writes_typed_record_even_on_schema_rejection(tmp_path):
+    """Malformed payloads are exactly the bugs we most want to replay."""
+    fake = FakeBackendClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    fake.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl"), "input_file": "oops"},
+    )
+
+    async def handler(ctx, params):
+        raise AssertionError("must not run")
+
+    shared = tmp_path / "shared"
+    worker = Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        work_dir=str(tmp_path / "work"), client=fake,
+        shared_volume_path=str(shared),
+    )
+    await worker.run_one()
+    worker._payload_logger.close()
+
+    files = list((shared / "_worker_payloads" / "w").glob("payloads-*.jsonl"))
+    entry = json.loads(files[0].read_text(encoding="utf-8").strip())
+    # Captured BEFORE schema validation, so the bad field is preserved.
+    assert entry["params"]["input_file"] == "oops"
+    # And the task itself was failed:
+    assert len(fake.failed_tasks) == 1

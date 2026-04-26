@@ -201,6 +201,11 @@ class Worker:
         )
 
         try:
+            # Capture BEFORE schema validation so malformed payloads — exactly
+            # the bugs most worth replaying — still produce a typed-stream
+            # record. record() never raises (see PayloadLogger contract).
+            self._payload_logger.record(task)
+
             handler = self.handlers.get(task.task_type)
             if handler is None:
                 raise ProtocolError(
