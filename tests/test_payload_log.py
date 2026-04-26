@@ -75,3 +75,62 @@ def test_sanitize_rejects_windows_reserved_names():
 def test_sanitize_output_never_contains_separators():
     assert "/" not in sanitize_worker_id("worker/1")
     assert "\\" not in sanitize_worker_id("worker\\1")
+
+
+# ----- record() typed stream -------------------------------------------------
+
+import json
+from datetime import datetime, timezone
+from typing import Optional
+
+from task_worker_api.context import ClaimedTask
+from task_worker_api.enums import TaskStatus, TaskType
+
+
+def _make_task(task_id: int = 1, params: Optional[dict] = None) -> ClaimedTask:
+    return ClaimedTask(
+        id=task_id,
+        task_type=TaskType.DETECT_CUT_PLANES,
+        case_id=42,
+        item_key="case_42_scene_1",
+        status=TaskStatus.IN_PROGRESS,
+        params=params if params is not None else {"input_path": "/tmp/x.stl", "max_results": 3},
+        worker_id="test-worker",
+    )
+
+
+def _fixed_now() -> datetime:
+    return datetime(2026, 4, 26, 14, 23, 11, 234567, tzinfo=timezone.utc)
+
+
+def test_record_writes_one_typed_line(tmp_path: Path):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root,
+        worker_id="test-worker",
+        enabled=True,
+        _boot_id="deadbeef",
+        _now=_fixed_now,
+        _pid=lambda: 12345,
+    )
+
+    logger.record(_make_task())
+
+    files = list(root.glob("payloads-*.jsonl"))
+    assert len(files) == 1
+    assert files[0].name == "payloads-2026-04-26-pid12345-deadbeef.jsonl"
+
+    lines = files[0].read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+
+    entry = json.loads(lines[0])
+    assert entry["stream"] == "typed"
+    assert entry["task_id"] == 1
+    assert entry["task_type"] == "detect_cut_planes"
+    assert entry["case_id"] == 42
+    assert entry["item_key"] == "case_42_scene_1"
+    assert entry["params"] == {"input_path": "/tmp/x.stl", "max_results": 3}
+    assert entry["worker_id"] == "test-worker"
+    assert entry["process_id"] == 12345
+    assert entry["boot_id"] == "deadbeef"
+    assert entry["captured_at"] == "2026-04-26T14:23:11.234567+00:00"
