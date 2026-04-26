@@ -1,0 +1,152 @@
+{
+  "$schema_version": "1.0.0",
+  "fleet_version": "1.0.0",
+  "generated_at": "2026-04-26",
+  "description": "Machine-readable manifest of every task-worker-api consumer in the SyngularXR fleet. Source of truth for backend handler routing, deployment health checks, and SDK-upgrade automation. Fetch via the GitHub raw URL — see docs/fleet/README.md for the canonical link.",
+  "sdk": {
+    "name": "task-worker-api",
+    "repo": "https://github.com/SyngularXR/task-worker-api",
+    "current_release": "v0.5.0",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.5.0",
+    "release_workflow": ".github/workflows/release.yml — publishes wheel + tag on every merge to main"
+  },
+  "workers": [
+    {
+      "id": "neural-canvas",
+      "repo": "https://github.com/SyngularXR/Neural-Canvas",
+      "image": "syngular/neural-canvas",
+      "image_tag_env": "NEURAL_CANVAS_TAG",
+      "compose_service": "neural-canvas",
+      "mode": "hybrid",
+      "mode_description": "Runs FastAPI app + task worker on one event loop via run_hybrid(). Falls back to FastAPI-only if SYNPUSHER_URL or WORKER_API_KEY are missing — safe for API-only deployments.",
+      "task_types": ["segmentation"],
+      "sdk_pin": {
+        "style": "git_ref",
+        "version": "v0.5.0",
+        "file": "requirements.txt",
+        "line_pattern": "task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v{version}"
+      },
+      "env": {
+        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID"],
+        "optional": [
+          "SHARED_VOLUME_PATH",
+          "WORKER_PAYLOAD_LOG_ENABLED",
+          "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
+          "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S",
+          "FASTAPI_HOST",
+          "FASTAPI_PORT"
+        ]
+      },
+      "shared_volume_wired": true,
+      "scaling": "single",
+      "gpu": "compute,utility",
+      "notes": "Hybrid mode runs --workers 1 (down from 2) because run_hybrid is one process; GPU-bound so single model-cache process is more efficient than 2 competing copies."
+    },
+    {
+      "id": "blender-worker",
+      "repo": "https://github.com/SyngularXR/Blender-CLI",
+      "image": "syngular/blender-worker",
+      "image_tag_env": "BLENDER_WORKER_TAG",
+      "compose_service": "blender-worker",
+      "mode": "polling",
+      "mode_description": "Standalone Worker.run_forever() polling loop; no FastAPI side.",
+      "task_types": [
+        "optimize",
+        "uv_unwrap",
+        "render",
+        "pipeline",
+        "cinematic_baking",
+        "model_initializing",
+        "detect_cut_planes"
+      ],
+      "sdk_pin": {
+        "style": "wheel_url",
+        "version": "v0.4.0",
+        "file": "pyproject.toml",
+        "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl",
+        "upgrade_pending": "v0.5.0 dep-bump PR #29 open; main branch CI is currently red on unrelated pre-existing tests (Solid_Mat material rename, export_glb function rename) which need a separate fix."
+      },
+      "env": {
+        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID", "WORKER_TASK_TYPES"],
+        "optional": [
+          "SHARED_VOLUME_PATH",
+          "WORKER_WORKDIR",
+          "WORKER_POLL_INTERVAL",
+          "WORKER_PAYLOAD_LOG_ENABLED",
+          "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
+          "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S"
+        ]
+      },
+      "shared_volume_wired": true,
+      "scaling": "single",
+      "gpu": "compute,utility,graphics",
+      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering."
+    },
+    {
+      "id": "colmap-splat-worker",
+      "repo": "https://github.com/SyngularXR/colmap-splat",
+      "image": "syngular/colmap-splat-worker",
+      "image_tag_env": "COLMAP_SPLAT_WORKER_TAG",
+      "compose_service": "colmap-splat-worker",
+      "mode": "polling",
+      "mode_description": "Standalone Worker.run_forever() polling loop. Image's baked-in CMD is ['--help'] (back-compat with legacy 'docker run colmap-splat --help' callers); worker mode is gated on ENABLE_TASK_WORKER=true env var.",
+      "task_types": ["gs_build"],
+      "sdk_pin": {
+        "style": "git_ref",
+        "version": "v0.5.0",
+        "file": "requirements.txt",
+        "line_pattern": "task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v{version}",
+        "build_dependency": "Dockerfile must pre-install hatchling (task-worker-api's PEP 517 backend) because requirements.txt installs run with --no-build-isolation for torch/CUDA pinning."
+      },
+      "env": {
+        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID", "ENABLE_TASK_WORKER"],
+        "optional": [
+          "SHARED_VOLUME_PATH",
+          "WORKER_WORKDIR",
+          "WORKER_POLL_INTERVAL",
+          "WORKER_TASK_TYPES",
+          "WORKER_PAYLOAD_LOG_ENABLED",
+          "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
+          "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S"
+        ]
+      },
+      "shared_volume_wired": true,
+      "scaling": "horizontal",
+      "scaling_command": "docker compose up --scale colmap-splat-worker=N",
+      "gpu": "compute,utility",
+      "notes": "Per-process payload-log filenames (PID + 8-char boot id) ensure scaled replicas with one shared WORKER_ID don't corrupt JSONL via interleaved appends."
+    }
+  ],
+  "deployment": {
+    "repo": "https://github.com/SyngularXR/syngar-deployment-scripts",
+    "compose_dir": "surgiclaw/",
+    "shared_volume_env": "SHARED_DATA_PATH",
+    "shared_volume_mount": "/app/shared",
+    "platforms": ["linux/amd64 (native)", "windows/amd64 (Docker Desktop / WSL2)"]
+  },
+  "common_env_vars": {
+    "WORKER_PAYLOAD_LOG_ENABLED": {
+      "default": "true",
+      "description": "Master kill switch for payload logging. Set 'false' to disable the JSONL capture stream entirely; cleanup of existing files still runs.",
+      "since": "task-worker-api v0.5.0"
+    },
+    "WORKER_PAYLOAD_LOG_RETENTION_DAYS": {
+      "default": "14",
+      "description": "Files older than this are deleted at worker startup, on UTC date rollover, and on a periodic timer. Bad/zero/negative values fall back to 14 with a WARNING.",
+      "since": "task-worker-api v0.5.0"
+    },
+    "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S": {
+      "default": "3600",
+      "description": "Periodic cleanup interval (seconds). Keeps idle workers honest between rollover events. Tighter intervals are useful for tests.",
+      "since": "task-worker-api v0.5.0"
+    }
+  },
+  "links": {
+    "fleet_readme": "https://github.com/SyngularXR/task-worker-api/blob/main/docs/fleet/README.md",
+    "conventions": "https://github.com/SyngularXR/task-worker-api/blob/main/docs/fleet/conventions.md",
+    "sdk_upgrade_runbook": "https://github.com/SyngularXR/task-worker-api/blob/main/docs/fleet/runbooks/sdk-upgrade.md",
+    "local_testing_runbook": "https://github.com/SyngularXR/task-worker-api/blob/main/docs/fleet/runbooks/local-testing.md",
+    "payload_replay_runbook": "https://github.com/SyngularXR/task-worker-api/blob/main/docs/fleet/runbooks/debugging-with-payload-logs.md",
+    "raw_manifest": "https://raw.githubusercontent.com/SyngularXR/task-worker-api/main/docs/fleet/workers.json"
+  }
+}
