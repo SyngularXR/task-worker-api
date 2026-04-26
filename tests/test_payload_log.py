@@ -42,3 +42,36 @@ def test_boot_id_can_be_injected_for_tests(tmp_path: Path):
         _boot_id="deadbeef",
     )
     assert logger.boot_id == "deadbeef"
+
+
+# ----- sanitize_worker_id ----------------------------------------------------
+
+from task_worker_api.payload_log import sanitize_worker_id
+
+
+def test_sanitize_replaces_unsafe_chars():
+    assert sanitize_worker_id("blender-worker-1") == "blender-worker-1"
+    assert sanitize_worker_id("worker/1") == "worker_1"
+    assert sanitize_worker_id("worker\\1") == "worker_1"
+    assert sanitize_worker_id("worker:1") == "worker_1"
+    assert sanitize_worker_id("../etc") == ".._etc"  # `.` is allowed; `/` becomes `_`
+
+
+def test_sanitize_rejects_dot_only_names():
+    assert sanitize_worker_id(".") == "._x"
+    assert sanitize_worker_id("..") == ".._x"
+    assert sanitize_worker_id("") == "_x"
+
+
+def test_sanitize_rejects_windows_reserved_names():
+    assert sanitize_worker_id("CON") == "CON_x"
+    assert sanitize_worker_id("nul") == "nul_x"
+    assert sanitize_worker_id("COM3") == "COM3_x"
+    assert sanitize_worker_id("LPT9") == "LPT9_x"
+    # extension after reserved name is still reserved on Windows
+    assert sanitize_worker_id("CON.log") == "CON.log_x"
+
+
+def test_sanitize_output_never_contains_separators():
+    assert "/" not in sanitize_worker_id("worker/1")
+    assert "\\" not in sanitize_worker_id("worker\\1")

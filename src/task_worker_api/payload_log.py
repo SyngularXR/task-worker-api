@@ -6,9 +6,38 @@ mtime-based retention, never-raises contract).
 """
 from __future__ import annotations
 
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
+
+_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def sanitize_worker_id(worker_id: str) -> str:
+    """Make a worker_id safe to use as a path segment on Linux and Windows.
+
+    Replaces characters outside ``[A-Za-z0-9._-]`` with ``_`` (covers
+    forward/back slashes, colons, spaces, etc.). Then appends ``_x`` if
+    the result is empty, dot-only, or matches a Windows reserved device
+    name (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with or without an
+    extension — Windows treats e.g. ``CON.log`` as the device too).
+
+    The output is purely a path segment — no separators ever appear.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", worker_id)
+    base_for_check = cleaned.split(".", 1)[0].upper()
+    if (
+        not cleaned
+        or cleaned in {".", ".."}
+        or base_for_check in _WINDOWS_RESERVED
+    ):
+        cleaned = cleaned + "_x"
+    return cleaned
 
 
 class PayloadLogger:
