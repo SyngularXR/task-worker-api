@@ -107,6 +107,40 @@ class PayloadLogger:
         except Exception as exc:  # noqa: BLE001 — never-raises contract
             self._warn_once(exc)
 
+    def record_raw(
+        self,
+        raw: Any,
+        *,
+        error_type: str,
+        error: str,
+    ) -> None:
+        """Append one raw-envelope JSON line. Never raises. No-op when disabled.
+
+        Called from BackendClient.claim_next when ClaimedTask.from_dict() raises
+        OR when the response itself fails to parse as JSON. ``raw`` may be any
+        JSON-coercible value (dict, list, None) or unparseable text.
+        """
+        if not self.enabled:
+            return
+        try:
+            now = self._now()
+            safe_raw, truncated_size = self._maybe_truncate_field(raw)
+            if truncated_size:
+                self._warn_truncated_once(None, "pre-serialization", truncated_size)
+            record = {
+                "captured_at": now.isoformat(),
+                "stream": "raw",
+                "raw": safe_raw,
+                "error_type": error_type,
+                "error": error,
+                "worker_id": self.worker_id,
+                "process_id": self._pid(),
+                "boot_id": self.boot_id,
+            }
+            self._write_line("raw_envelopes", record, now=now)
+        except Exception as exc:  # noqa: BLE001
+            self._warn_once(exc)
+
     # ----- internals ----------------------------------------------------
 
     def _file_path(self, stream: str, date_str: str) -> Path:

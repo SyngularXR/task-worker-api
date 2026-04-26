@@ -300,3 +300,43 @@ def test_repeat_failures_suppress_warning(tmp_path: Path, caplog, monkeypatch):
 
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
+
+
+def test_record_raw_writes_to_raw_envelopes_stream(tmp_path: Path):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    raw = {"id": 7, "task_type": 999, "params": {"k": "v"}}
+    logger.record_raw(raw, error_type="ValueError", error="999 is not a valid TaskType")
+
+    files = list(root.glob("raw_envelopes-*.jsonl"))
+    assert len(files) == 1
+    entry = json.loads(files[0].read_text(encoding="utf-8"))
+    assert entry["stream"] == "raw"
+    assert entry["raw"] == raw
+    assert entry["error_type"] == "ValueError"
+    assert entry["error"] == "999 is not a valid TaskType"
+    assert entry["worker_id"] == "test-worker"
+
+
+def test_record_raw_handles_non_dict_raw(tmp_path: Path):
+    """raw can be None, a list, or a parse-failure string."""
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    logger.record_raw(None, error_type="TypeError", error="expected dict")
+    logger.record_raw([1, 2, 3], error_type="TypeError", error="got list")
+    logger.record_raw("<html>500</html>", error_type="JSONDecodeError", error="bad")
+
+    lines = (
+        root / "raw_envelopes-2026-04-26-pid1-deadbeef.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    parsed = [json.loads(line) for line in lines]
+    assert parsed[0]["raw"] is None
+    assert parsed[1]["raw"] == [1, 2, 3]
+    assert parsed[2]["raw"] == "<html>500</html>"
