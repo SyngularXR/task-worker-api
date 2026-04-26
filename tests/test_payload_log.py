@@ -239,3 +239,64 @@ def test_final_record_size_cap_applies_when_non_param_fields_huge(tmp_path: Path
     assert entry["_record_truncated"] is True
     assert entry["task_id"] == 99
     assert "captured_at" in entry
+
+
+def test_record_never_raises_on_open_failure(tmp_path: Path, caplog, monkeypatch):
+    """A failure in open() must not propagate; one WARNING logged. Subsequent
+    calls keep retrying — degraded mode suppresses warnings, not retries."""
+    import builtins
+    real_open = builtins.open
+
+    calls = {"n": 0}
+
+    def fake_open(path, *args, **kwargs):
+        if "_worker_payloads" in str(path) and "payloads-" in str(path):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("disk full")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    with caplog.at_level("WARNING"):
+        logger.record(_make_task(task_id=1))  # first call: open fails
+        logger.record(_make_task(task_id=2))  # second call: open succeeds
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "I/O failure" in warnings[0].message
+
+    # Second record landed on disk — degraded mode kept retrying.
+    files = list(root.glob("payloads-*.jsonl"))
+    assert len(files) == 1
+    assert files[0].read_text(encoding="utf-8").strip()
+
+
+def test_repeat_failures_suppress_warning(tmp_path: Path, caplog, monkeypatch):
+    """After the first WARNING, subsequent failures stay silent."""
+    import builtins
+    real_open = builtins.open
+
+    def always_fail_open(path, *args, **kwargs):
+        if "_worker_payloads" in str(path) and "payloads-" in str(path):
+            raise OSError("permanent")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", always_fail_open)
+
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    with caplog.at_level("WARNING"):
+        for i in range(5):
+            logger.record(_make_task(task_id=i))
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
