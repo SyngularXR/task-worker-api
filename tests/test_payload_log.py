@@ -433,3 +433,26 @@ def test_close_is_idempotent_and_flushes_handles(tmp_path: Path):
         root / "payloads-2026-04-26-pid1-deadbeef.jsonl"
     ).read_text(encoding="utf-8")
     assert json.loads(line)["task_id"] == 1
+
+
+def test_init_self_disables_on_mkdir_permission_error(tmp_path: Path, caplog, monkeypatch):
+    """A PermissionError in mkdir must not crash Worker construction."""
+    real_mkdir = Path.mkdir
+
+    def fail_mkdir(self, *args, **kwargs):
+        if "_worker_payloads" in str(self):
+            raise PermissionError("read-only volume")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+
+    with caplog.at_level("WARNING"):
+        logger = PayloadLogger(
+            root=tmp_path / "_worker_payloads" / "test-worker",
+            worker_id="test-worker", enabled=True,
+        )
+
+    # __init__ did not raise.
+    assert logger.enabled is False  # self-disabled
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("payload_log" in r.message and "mkdir" in r.message for r in warnings)

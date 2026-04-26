@@ -78,7 +78,14 @@ class PayloadLogger:
         self._handles: dict[str, tuple[str, TextIO]] = {}
         self._warned_once = False
         if self.enabled:
-            self.root.mkdir(parents=True, exist_ok=True)
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:  # noqa: BLE001 — never-raises includes __init__
+                log.warning(
+                    "payload_log: mkdir failed (%s: %s); disabling capture",
+                    type(exc).__name__, exc,
+                )
+                self.enabled = False
 
     # ----- public API ---------------------------------------------------
 
