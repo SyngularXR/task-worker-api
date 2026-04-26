@@ -183,3 +183,90 @@ def test_detect_cut_planes_schema_rejects_extra_fields():
     import pydantic
     with pytest.raises(pydantic.ValidationError):
         DetectCutPlanesParams(input_path="/tmp/x.stl", input_file="nope")
+
+
+# ----- Worker payload-logger wiring -----------------------------------------
+
+@pytest.mark.asyncio
+async def test_worker_constructs_payload_logger_when_shared_volume_set(tmp_path):
+    fake = FakeBackendClient()
+    worker = Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        shared_volume_path=str(tmp_path / "shared"),
+    )
+    assert worker._payload_logger is not None
+    assert worker._payload_logger.enabled is True
+    assert (tmp_path / "shared" / "_worker_payloads" / "w").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_worker_disabled_when_shared_volume_unset(tmp_path):
+    """Existing tests rely on this — no shared_volume_path means no logger."""
+    fake = FakeBackendClient()
+    worker = Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+    )
+    assert worker._payload_logger is not None
+    assert worker._payload_logger.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_worker_disabled_via_env_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKER_PAYLOAD_LOG_ENABLED", "false")
+    fake = FakeBackendClient()
+    worker = Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        shared_volume_path=str(tmp_path / "shared"),
+    )
+    assert worker._payload_logger.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_worker_retention_env_falls_back_on_bad_value(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("WORKER_PAYLOAD_LOG_RETENTION_DAYS", "abc")
+    fake = FakeBackendClient()
+    with caplog.at_level("WARNING"):
+        worker = Worker(
+            backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+            handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+            shared_volume_path=str(tmp_path / "shared"),
+        )
+    assert worker._payload_logger.retention_days == 14
+    assert any("retention" in r.message.lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_worker_retention_env_falls_back_on_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKER_PAYLOAD_LOG_RETENTION_DAYS", "0")
+    fake = FakeBackendClient()
+    worker = Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        shared_volume_path=str(tmp_path / "shared"),
+    )
+    assert worker._payload_logger.retention_days == 14
+
+
+@pytest.mark.asyncio
+async def test_worker_sanitizes_worker_id_in_log_path(tmp_path):
+    """worker_id with slashes/.. must not escape into a sibling directory."""
+    fake = FakeBackendClient()
+    Worker(
+        backend_url="http://fake/api/v1", api_key="k",
+        worker_id="../etc/passwd",
+        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        shared_volume_path=str(tmp_path / "shared"),
+    )
+    children = list((tmp_path / "shared" / "_worker_payloads").iterdir())
+    assert len(children) == 1
+    sanitized = children[0].name
+    # Path separators are what would actually escape into a sibling dir;
+    # `.` characters are allowed (the dir is a single segment).
+    assert "/" not in sanitized
+    assert "\\" not in sanitized
+    assert "passwd" in sanitized
+    # The directory must be a direct child of _worker_payloads.
+    assert children[0].parent.name == "_worker_payloads"
