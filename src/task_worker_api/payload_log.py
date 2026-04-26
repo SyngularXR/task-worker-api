@@ -179,6 +179,19 @@ class PayloadLogger:
         except Exception as exc:  # noqa: BLE001
             self._warn_once(exc)
 
+    def close(self) -> None:
+        """Flush + close any open handles. Idempotent. Never raises."""
+        try:
+            for _date_str, handle in list(self._handles.values()):
+                try:
+                    handle.flush()
+                    handle.close()
+                except Exception:  # noqa: BLE001
+                    continue
+            self._handles.clear()
+        except Exception as exc:  # noqa: BLE001
+            self._warn_once(exc)
+
     # ----- internals ----------------------------------------------------
 
     def _file_path(self, stream: str, date_str: str) -> Path:

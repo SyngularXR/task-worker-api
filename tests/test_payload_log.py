@@ -417,3 +417,19 @@ def test_cleanup_runs_even_when_disabled(tmp_path: Path):
     )
     logger.cleanup_old_files()
     assert not expired.exists()
+
+
+def test_close_is_idempotent_and_flushes_handles(tmp_path: Path):
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    logger.record(_make_task())
+    logger.close()
+    logger.close()  # second call must not raise
+
+    line = (
+        root / "payloads-2026-04-26-pid1-deadbeef.jsonl"
+    ).read_text(encoding="utf-8")
+    assert json.loads(line)["task_id"] == 1
