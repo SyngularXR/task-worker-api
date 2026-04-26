@@ -6,7 +6,9 @@ mtime-based retention, never-raises contract).
 """
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
+from typing import Optional
 
 
 class PayloadLogger:
@@ -24,8 +26,12 @@ class PayloadLogger:
         worker_id: str,
         retention_days: int = 14,
         enabled: bool = True,
+        _boot_id: Optional[str] = None,
     ) -> None:
         self.root = root
         self.worker_id = worker_id
         self.retention_days = retention_days
         self.enabled = enabled
+        self.boot_id = _boot_id or uuid.uuid4().hex[:8]
+        if self.enabled:
+            self.root.mkdir(parents=True, exist_ok=True)
