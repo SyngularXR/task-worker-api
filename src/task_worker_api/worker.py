@@ -28,6 +28,7 @@ from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
 from .files import prepare_inputs, upload_outputs
+from .payload_log import PayloadLogger, sanitize_worker_id
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
 
@@ -79,10 +80,61 @@ class Worker:
         self.heartbeat_interval_s = heartbeat_interval_s
         self.cancel_poll_interval_s = cancel_poll_interval_s
 
-        self._client = client or BackendClient(
-            backend_url, api_key, timeout_s=request_timeout_s,
-        )
+        self._payload_logger = self._build_payload_logger()
+
+        if client is None:
+            self._client = BackendClient(
+                backend_url, api_key, timeout_s=request_timeout_s,
+                payload_logger=self._payload_logger,
+            )
+        else:
+            # Externally-supplied client (e.g. FakeBackendClient in tests) is
+            # used as-is; we don't reach in and rewrite its state.
+            self._client = client
         self._stop = asyncio.Event()
+
+    def _build_payload_logger(self) -> PayloadLogger:
+        """Construct a PayloadLogger from env + shared_volume_path.
+
+        When shared_volume_path is None the logger is disabled (no place to
+        write). When the env var WORKER_PAYLOAD_LOG_ENABLED is "false" it's
+        disabled regardless. Bad WORKER_PAYLOAD_LOG_RETENTION_DAYS values
+        fall back to 14 days with a WARNING.
+        """
+        env_enabled = (
+            os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true").lower() != "false"
+        )
+        enabled = bool(self.shared_volume_path) and env_enabled
+
+        retention_raw = os.environ.get("WORKER_PAYLOAD_LOG_RETENTION_DAYS", "14")
+        try:
+            retention = int(retention_raw)
+            if retention < 1:
+                raise ValueError(f"retention must be >= 1, got {retention}")
+        except (ValueError, TypeError):
+            log.warning(
+                "payload_log: WORKER_PAYLOAD_LOG_RETENTION_DAYS=%r is invalid; "
+                "falling back to 14 days",
+                retention_raw,
+            )
+            retention = 14
+
+        if self.shared_volume_path:
+            root = (
+                Path(self.shared_volume_path)
+                / "_worker_payloads"
+                / sanitize_worker_id(self.worker_id)
+            )
+        else:
+            # Placeholder; logger is disabled so it's never touched.
+            root = Path("/__payload_log_disabled__")
+
+        return PayloadLogger(
+            root=root,
+            worker_id=self.worker_id,
+            retention_days=retention,
+            enabled=enabled,
+        )
 
     @property
     def task_types(self) -> list[TaskType]:
@@ -101,6 +153,26 @@ class Worker:
             self.worker_id, self.backend_url,
             ",".join(t.value for t in self.task_types),
         )
+        if self._payload_logger.enabled:
+            log.info(
+                "payload logging: enabled, root=%s, retention=%dd",
+                self._payload_logger.root, self._payload_logger.retention_days,
+            )
+        else:
+            log.info(
+                "payload logging: disabled (shared_volume_path=%r, env=%r)",
+                self.shared_volume_path,
+                os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
+            )
+        self._payload_logger.cleanup_old_files()
+
+        cleanup_interval_s = float(
+            os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
+        )
+        cleanup_task = asyncio.create_task(
+            self._periodic_cleanup_loop(cleanup_interval_s)
+        )
+
         try:
             while not self._stop.is_set():
                 claimed = await self._claim()
@@ -115,8 +187,31 @@ class Worker:
                     continue
                 await self._run_one(claimed)
         finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._payload_logger.close()
             await self._client.close()
             log.info("task-worker-api Worker stopped: id=%s", self.worker_id)
+
+    async def _periodic_cleanup_loop(self, interval_s: float) -> None:
+        """Background timer that re-runs cleanup so idle workers stay honest.
+
+        Without this, a worker that wrote files 30 days ago and then sat
+        dormant would never clean up — rollover-triggered cleanup only fires
+        on the next write. The timer fires every interval_s seconds; when
+        shutdown is requested, the loop returns immediately.
+        """
+        try:
+            while True:
+                await asyncio.sleep(interval_s)
+                if self._stop.is_set():
+                    return
+                self._payload_logger.cleanup_old_files()
+        except asyncio.CancelledError:
+            raise
 
     async def run_one(self) -> bool:
         """Process exactly one claim cycle. Returns True iff a task ran.
@@ -149,6 +244,11 @@ class Worker:
         )
 
         try:
+            # Capture BEFORE schema validation so malformed payloads — exactly
+            # the bugs most worth replaying — still produce a typed-stream
+            # record. record() never raises (see PayloadLogger contract).
+            self._payload_logger.record(task)
+
             handler = self.handlers.get(task.task_type)
             if handler is None:
                 raise ProtocolError(

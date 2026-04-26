@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import httpx
 
 from .context import ClaimedTask
 from .errors import ProtocolError
+
+if TYPE_CHECKING:
+    from .payload_log import PayloadLogger
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +42,7 @@ class BackendClient:
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         client: Optional[httpx.AsyncClient] = None,
+        payload_logger: Optional["PayloadLogger"] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -50,6 +54,7 @@ class BackendClient:
             timeout=timeout_s,
             headers={"Authorization": f"Bearer {api_key}"},
         )
+        self._payload_logger = payload_logger
 
     async def __aenter__(self) -> "BackendClient":
         return self
@@ -94,7 +99,14 @@ class BackendClient:
     async def claim_next(
         self, task_types: list, worker_id: str
     ) -> Optional[ClaimedTask]:
-        """GET /tasks/next — claim the next available task. Returns None on 204."""
+        """GET /tasks/next — claim the next available task. Returns None on 204.
+
+        On protocol-drift failures (response not parseable as JSON, or JSON
+        body that fails ClaimedTask.from_dict validation) the raw response is
+        recorded via the optional payload_logger before re-raising. This is
+        how a worker captures evidence when the backend ships a new task
+        type before the worker fleet has been upgraded.
+        """
         types_str = ",".join(
             t.value if hasattr(t, "value") else str(t) for t in task_types
         )
@@ -109,12 +121,35 @@ class BackendClient:
             log.warning("backend %s has no /tasks/next", self.base_url)
             return None
         resp.raise_for_status()
+
         try:
-            return ClaimedTask.from_dict(resp.json())
-        except (KeyError, ValueError) as e:
+            body = resp.json()
+        except Exception as exc:
+            if self._payload_logger is not None:
+                self._payload_logger.record_raw(
+                    resp.text,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            raise ProtocolError(
+                f"claim_next response was not valid JSON: {resp.text[:500]!r}"
+            ) from exc
+
+        if body is None:
+            return None
+
+        try:
+            return ClaimedTask.from_dict(body)
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            if self._payload_logger is not None:
+                self._payload_logger.record_raw(
+                    body,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
             raise ProtocolError(
                 f"claim_next returned an unexpected envelope: {resp.text[:500]!r}"
-            ) from e
+            ) from exc
 
     async def report_progress(
         self,

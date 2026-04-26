@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.5.0 — 2026-04-26
+
+Adds per-worker payload logging — every claimed task's full envelope is
+captured to JSONL inside the worker container so an operator can reproduce
+a worker bug or replay producer traffic into tests without rebuilding
+payloads by hand.
+
+**New:**
+- `PayloadLogger` (internal) writes two streams under
+  `/app/shared/_worker_payloads/{worker_id}/`:
+  - `payloads-DATE-pidPID-BOOT.jsonl` — one line per claimed task,
+    captured before schema validation.
+  - `raw_envelopes-DATE-pidPID-BOOT.jsonl` — captured by `BackendClient`
+    when `ClaimedTask.from_dict()` or `response.json()` raises (protocol
+    drift between backend and worker schema).
+- Daily UTC rotation. Per-process file naming (PID + 8-char boot id) so
+  scaled replicas with one shared `WORKER_ID` don't corrupt JSONL via
+  interleaved writes.
+- Default 14-day retention via `WORKER_PAYLOAD_LOG_RETENTION_DAYS`.
+  Cleanup runs at startup, on UTC date rollover, and on a periodic
+  timer (`WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S`, default 3600s).
+  Cleanup runs even when the logger is disabled, so a kill-switch
+  deployment doesn't accumulate logs forever.
+- 256KB per-record cap with two-stage truncation (224KB on the
+  variable-size field; full-record check after construction for
+  pathological non-payload fields).
+- Default-on. Disable per deployment with
+  `WORKER_PAYLOAD_LOG_ENABLED=false`.
+
+**Failure contract:** `PayloadLogger` (including `__init__`) never
+raises. Disk full, fs flap, permission errors, or unserialisable
+values produce one WARNING log per process lifetime; subsequent
+failures are silent. Worker keeps polling and running tasks.
+
+**Worker integration:** `Worker.__init__` constructs the logger when
+`shared_volume_path` is set, parses env vars with safe fallbacks for
+bad values, sanitises `worker_id` for path safety (Windows reserved
+names, slashes, `..`), and wires the logger into `BackendClient` only
+when the SDK constructs the client itself. Externally-supplied
+clients (e.g., `FakeBackendClient`) are not modified.
+
+**Tests:** new `tests/test_payload_log.py` (pure unit) and
+`tests/test_payload_log_integration.py` (real `BackendClient` +
+`httpx.MockTransport`, plus `Worker.run_forever` startup/finally).
+
+**Docs:** `docs/adding-a-worker.md` gains a "Replaying captured
+payloads" section with a runnable transform that drops claim
+metadata before re-enqueueing.
+
+**Deployment-side (separate PR in `syngar-deployment-scripts/surgiclaw`):**
+add `WORKER_PAYLOAD_LOG_ENABLED` and `WORKER_PAYLOAD_LOG_RETENTION_DAYS`
+to `.env`, `.env.linux`, `.env.example`, and to each worker service's
+`environment:` block in `docker-compose.yml`. No volume changes —
+the existing `${SHARED_DATA_PATH}:/app/shared` mount is reused.
+
 ## v0.4.1 — 2026-04-24
 
 - `upload_outputs` now stages local-mode outputs under
