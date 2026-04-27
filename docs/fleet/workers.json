@@ -6,8 +6,8 @@
   "sdk": {
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
-    "current_release": "v0.5.0",
-    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.5.0",
+    "current_release": "v0.6.0",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.6.0",
     "release_workflow": ".github/workflows/release.yml — publishes wheel + tag on every merge to main"
   },
   "workers": [
@@ -81,6 +81,37 @@
       "scaling": "single",
       "gpu": "compute,utility,graphics",
       "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering."
+    },
+    {
+      "id": "assetbundle-builder-worker",
+      "repo": "https://github.com/SyngularXR/syngar-ml-assetbundle-builder",
+      "image": "syngular/assetbundle-builder-worker",
+      "image_tag_env": "ASSETBUNDLE_BUILDER_WORKER_TAG",
+      "compose_service": "assetbundle-builder-worker",
+      "mode": "polling",
+      "mode_description": "Standalone Worker.run_forever() polling loop. Gated on ENABLE_TASK_WORKER=true. Worker lives under worker/ in the Unity project repo.",
+      "task_types": ["deploy_case"],
+      "sdk_pin": {
+        "style": "wheel_url",
+        "version": "v0.6.0",
+        "file": "worker/pyproject.toml",
+        "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
+      },
+      "env": {
+        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID", "ENABLE_TASK_WORKER"],
+        "optional": [
+          "SHARED_VOLUME_PATH",
+          "WORKER_WORKDIR",
+          "WORKER_POLL_INTERVAL",
+          "WORKER_PAYLOAD_LOG_ENABLED",
+          "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
+          "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S"
+        ]
+      },
+      "shared_volume_wired": true,
+      "scaling": "single",
+      "gpu": "none",
+      "notes": "Unity CLI build integration deferred to a future session (build-bundle.sh). v0.1.0 handler validates content folder exists and is non-empty; raises TaskParamsError for empty/missing folders."
     },
     {
       "id": "colmap-splat-worker",
