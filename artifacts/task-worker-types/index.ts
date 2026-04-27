@@ -12,6 +12,7 @@ export type TaskType =
   | 'apple_ml_gs'
   | 'detect_cut_planes'
   | 'cinematic_baking'
+  | 'deploy_case'
 ;
 
 export const TaskType = {
@@ -22,6 +23,7 @@ export const TaskType = {
   APPLE_ML_GS: 'apple_ml_gs' as const,
   DETECT_CUT_PLANES: 'detect_cut_planes' as const,
   CINEMATIC_BAKING: 'cinematic_baking' as const,
+  DEPLOY_CASE: 'deploy_case' as const,
 } as const;
 
 export enum TaskStatus {
@@ -144,6 +146,14 @@ export interface SegmentationParams {
   mask_id?: string;
 }
 
+/**
+ * Input for the assetbundle-builder worker's deploy_case handler.
+ */
+export interface DeployCaseParams {
+  content_path: string;
+  build_target?: string;
+}
+
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
@@ -152,4 +162,5 @@ export interface TaskParamsByType {
   'cinematic_baking': CinematicBakingParams;
   'gs_build': GsBuildParams;
   'segmentation': SegmentationParams;
+  'deploy_case': DeployCaseParams;
 }

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.0 — 2026-04-28
+
+Adds `DEPLOY_CASE` task type for the assetbundle-builder worker.
+
+**New:**
+- `TaskType.DEPLOY_CASE = "deploy_case"` in `enums.py`.
+- `DeployCaseParams` Pydantic v2 schema: required `content_path` (absolute
+  path to case content folder on shared volume) and optional `build_target`
+  (default `"Android"`, passed to Unity CLI `-buildTarget` flag).
+- `TASK_PARAMS_SCHEMAS[TaskType.DEPLOY_CASE]` registered.
+- 5 new schema tests cover registration, roundtrip, default, extra-field
+  rejection, and missing required field.
+
 ## v0.5.0 — 2026-04-26
 
 Adds per-worker payload logging — every claimed task's full envelope is
