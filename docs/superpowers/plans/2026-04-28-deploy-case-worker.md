@@ -57,19 +57,24 @@ def test_deploy_case_registered():
     assert TASK_PARAMS_SCHEMAS[TaskType.DEPLOY_CASE] is DeployCaseParams
 
 
-def test_deploy_case_defaults():
-    obj = DeployCaseParams()
-    assert obj.model_dump() == {"build_target": "Android", "content_path": None}
-
-
 def test_deploy_case_roundtrip():
-    obj = DeployCaseParams(build_target="iOS", content_path="/app/shared/content/abc123")
-    assert obj.model_dump() == {"build_target": "iOS", "content_path": "/app/shared/content/abc123"}
+    obj = DeployCaseParams(content_path="/app/shared/content/abc123", build_target="iOS")
+    assert obj.model_dump() == {"content_path": "/app/shared/content/abc123", "build_target": "iOS"}
+
+
+def test_deploy_case_default_build_target():
+    obj = DeployCaseParams(content_path="/app/shared/content/abc123")
+    assert obj.build_target == "Android"
 
 
 def test_deploy_case_rejects_extra_field():
     with pytest.raises(Exception):
-        DeployCaseParams(surprise="extra")
+        DeployCaseParams(content_path="/p", surprise="extra")
+
+
+def test_deploy_case_content_path_required():
+    with pytest.raises(Exception):
+        DeployCaseParams()
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -111,7 +116,7 @@ from ._base import TaskParamsBase
 class DeployCaseParams(TaskParamsBase):
     """Input for the assetbundle-builder worker's deploy_case handler."""
 
-    content_path: Optional[str] = None
+    content_path: str  # absolute path to case content folder on shared volume
     build_target: str = "Android"
 ```
 
@@ -133,6 +138,8 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
 ```
 
 Also add `"DeployCaseParams"` to `__all__`.
+
+**Note:** Remove `from typing import Optional` import from `deploy_case.py` — no longer needed since `content_path` is a required `str`.
 
 - [ ] **Step 6: Run all tests to verify they pass**
 
@@ -592,23 +599,17 @@ logger = logging.getLogger(__name__)
 
 async def run(ctx: TaskContext, params: DeployCaseParams) -> dict:
     case_id = ctx.task.case_id
-
-    if not params.content_path:
-        raise TaskParamsError("content_path is required but was not provided in task params")
-
     case_folder = Path(params.content_path)
 
     if not case_folder.exists():
         raise TaskParamsError(f"case folder does not exist: {case_folder}")
 
-    contents = list(case_folder.iterdir())
-    if not contents:
+    if next(case_folder.iterdir(), None) is None:
         raise TaskParamsError(f"case folder is empty: {case_folder}")
 
     logger.info(
-        "[STUB] case %s content folder OK (%d items) — build would run here (build_target=%s)",
+        "[STUB] case %s content folder OK — build would run here (build_target=%s)",
         case_id,
-        len(contents),
         params.build_target,
     )
     return {}
@@ -632,6 +633,92 @@ git commit -m "feat(worker): add deploy_case stub handler with empty-folder guar
 
 ---
 
+## Task 7.5: Worker — handler tests
+
+**Repo:** `syngar-ml-assetbundle-builder`
+
+**Files:**
+- Create: `worker/tests/__init__.py`
+- Create: `worker/tests/test_deploy_case_handler.py`
+
+- [ ] **Step 1: Create `worker/tests/__init__.py`** — empty file.
+
+- [ ] **Step 2: Create `worker/tests/test_deploy_case_handler.py`**
+
+```python
+"""Tests for the deploy_case handler stub."""
+from __future__ import annotations
+
+import pytest
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from task_worker_api.errors import TaskParamsError
+from task_worker_api.schemas import DeployCaseParams
+
+from src.handlers.deploy_case import run
+
+
+def _make_ctx(case_id: int = 42) -> MagicMock:
+    ctx = MagicMock()
+    ctx.task.case_id = case_id
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_folder_does_not_exist(tmp_path):
+    params = DeployCaseParams(content_path=str(tmp_path / "nonexistent"))
+    with pytest.raises(TaskParamsError, match="does not exist"):
+        await run(_make_ctx(), params)
+
+
+@pytest.mark.asyncio
+async def test_folder_is_empty(tmp_path):
+    empty = tmp_path / "case_folder"
+    empty.mkdir()
+    params = DeployCaseParams(content_path=str(empty))
+    with pytest.raises(TaskParamsError, match="is empty"):
+        await run(_make_ctx(), params)
+
+
+@pytest.mark.asyncio
+async def test_folder_has_files_returns_empty_dict(tmp_path):
+    case_dir = tmp_path / "case_folder"
+    case_dir.mkdir()
+    (case_dir / "model_collection.json").write_text("{}")
+    params = DeployCaseParams(content_path=str(case_dir))
+    result = await run(_make_ctx(), params)
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_custom_build_target_logged(tmp_path, caplog):
+    case_dir = tmp_path / "case_folder"
+    case_dir.mkdir()
+    (case_dir / "model_collection.json").write_text("{}")
+    params = DeployCaseParams(content_path=str(case_dir), build_target="iOS")
+    await run(_make_ctx(case_id=7), params)
+    assert "iOS" in caplog.text
+```
+
+- [ ] **Step 3: Run the tests**
+
+```bash
+cd worker
+pytest tests/test_deploy_case_handler.py -v
+```
+
+Expected: All 4 tests PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add worker/tests/__init__.py worker/tests/test_deploy_case_handler.py
+git commit -m "test(worker): add handler tests for deploy_case empty-folder guard"
+```
+
+---
+
 ## Task 8: Worker — Dockerfile
 
 **Repo:** `syngar-ml-assetbundle-builder`
@@ -647,9 +734,9 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
-
 COPY src/ src/
+
+RUN pip install --no-cache-dir .
 
 ENV ENABLE_TASK_WORKER=true
 
@@ -821,6 +908,24 @@ Create a temp folder with a file in the path the task expects, or set `content_p
 
 ---
 
+## NOT in scope
+
+- Unity `build-bundle.sh` integration into the handler (next session)
+- Connecting `worker/Dockerfile` to the existing Unity build container at repo root
+- Frontend status polling / progress display for DEPLOY_CASE tasks
+- Worker-auth endpoint on SynPusher backend (needed if handler ever calls back for case data)
+- Blender-CLI / other workers upgrading to v0.6.0 (tracked in `docs/fleet/workers.json` upgrade_pending)
+
+## What already exists
+
+| Existing code | Reused or rebuilt? |
+|---|---|
+| `deploy_case()` endpoint in `model_collection.py` | Reused — extended, not replaced |
+| `Task.create_or_reject()` with duplicate guard | Reused as-is |
+| `Worker`, `TaskType`, `TaskParamsBase` in SDK | Reused — adding one enum value + schema |
+| colmap-splat `sdk_worker.py` + `handlers/` pattern | Copied exactly — no deviation |
+| `TASK_PARAMS_SCHEMAS` registry | Extended with one entry |
+
 ## Self-review
 
 **Spec coverage check:**
@@ -834,4 +939,15 @@ Create a temp folder with a file in the path the task expects, or set `content_p
 
 **Refinement from spec:** `content_path` is passed in task params (set at creation from `export_result["path"]`) rather than fetched via a worker callback. This avoids auth complexity in the stub — the callback approach can be used in a future session when the worker has a dedicated worker-auth endpoint to call.
 
-**Type consistency check:** `DeployCaseParams` uses `content_path: Optional[str]` in Task 1; handler reads `params.content_path` in Task 7 — consistent. `TaskParamsError` is imported from `task_worker_api.errors` in Task 7 — matches the SDK's public error module.
+**Type consistency check (updated after eng review):** `DeployCaseParams` uses `content_path: str` (required, no default) in Task 1; handler reads `params.content_path` in Task 7 — consistent. `TaskParamsError` is imported from `task_worker_api.errors` in Task 7 — matches the SDK's public error module.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 4 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+
+**VERDICT:** ENG CLEARED — 4 issues found and resolved (content_path required, Dockerfile non-editable, handler tests added, O(1) empty check).
