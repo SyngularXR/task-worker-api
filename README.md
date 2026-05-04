@@ -15,10 +15,10 @@ One Python package consumed by three kinds of callers:
 ## Install
 
 ```
-pip install task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v0.3.0
+pip install task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v0.6.0
 ```
 
-Latest release: [v0.3.0](https://github.com/SyngularXR/task-worker-api/releases/tag/v0.3.0). See [CHANGELOG.md](CHANGELOG.md).
+Latest release: [v0.6.0](https://github.com/SyngularXR/task-worker-api/releases/tag/v0.6.0). See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick look at what a worker looks like
 
