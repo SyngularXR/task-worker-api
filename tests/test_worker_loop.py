@@ -151,29 +151,6 @@ async def test_worker_reports_cancel_as_fail_cooperative(tmp_path):
     assert "cancelled" in fake.failed_tasks[0]["error"].lower()
 
 
-@pytest.mark.asyncio
-async def test_task_type_without_handler_fails_fast(tmp_path):
-    fake = FakeBackendClient()
-    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
-    fake.queue_task(
-        task_type=TaskType.DETECT_CUT_PLANES,
-        params={"input_path": str(tmp_path / "fake.stl")},
-    )
-
-    worker = Worker(
-        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={},  # deliberately empty
-        work_dir=str(tmp_path / "work"), client=fake,
-    )
-    # The worker will claim the task because its registered task_types is
-    # empty, but claim_next is filtered by task_types... so no claim.
-    # This asserts the negative: no task ran.
-    ran = await worker.run_one()
-    assert ran is False
-    assert fake.completed_tasks == []
-    assert fake.failed_tasks == []
-
-
 def test_registry_contains_expected_types():
     assert TaskType.DETECT_CUT_PLANES in TASK_PARAMS_SCHEMAS
     assert TaskType.MODEL_INITIALIZING in TASK_PARAMS_SCHEMAS
@@ -187,12 +164,22 @@ def test_detect_cut_planes_schema_rejects_extra_fields():
 
 # ----- Worker payload-logger wiring -----------------------------------------
 
+
+async def _noop_handler(ctx, params):  # pragma: no cover — never invoked
+    return {}
+
+
+# Worker.__init__ now rejects empty handlers (silent-poll guard); these
+# payload-logger tests don't claim, so any registered TaskType works.
+_PL_HANDLERS = {TaskType.DETECT_CUT_PLANES: _noop_handler}
+
+
 @pytest.mark.asyncio
 async def test_worker_constructs_payload_logger_when_shared_volume_set(tmp_path):
     fake = FakeBackendClient()
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_PL_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(tmp_path / "shared"),
     )
     assert worker._payload_logger is not None
@@ -206,7 +193,7 @@ async def test_worker_disabled_when_shared_volume_unset(tmp_path):
     fake = FakeBackendClient()
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_PL_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
     )
     assert worker._payload_logger is not None
     assert worker._payload_logger.enabled is False
@@ -218,7 +205,7 @@ async def test_worker_disabled_via_env_flag(tmp_path, monkeypatch):
     fake = FakeBackendClient()
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_PL_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(tmp_path / "shared"),
     )
     assert worker._payload_logger.enabled is False
@@ -231,7 +218,7 @@ async def test_worker_retention_env_falls_back_on_bad_value(tmp_path, monkeypatc
     with caplog.at_level("WARNING"):
         worker = Worker(
             backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-            handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+            handlers=_PL_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
             shared_volume_path=str(tmp_path / "shared"),
         )
     assert worker._payload_logger.retention_days == 14
@@ -244,7 +231,7 @@ async def test_worker_retention_env_falls_back_on_zero(tmp_path, monkeypatch):
     fake = FakeBackendClient()
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_PL_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(tmp_path / "shared"),
     )
     assert worker._payload_logger.retention_days == 14
@@ -257,7 +244,7 @@ async def test_worker_sanitizes_worker_id_in_log_path(tmp_path):
     Worker(
         backend_url="http://fake/api/v1", api_key="k",
         worker_id="../etc/passwd",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_PL_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(tmp_path / "shared"),
     )
     children = list((tmp_path / "shared" / "_worker_payloads").iterdir())

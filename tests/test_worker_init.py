@@ -43,3 +43,18 @@ def test_worker_init_accepts_handlers_with_registered_schemas():
         handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
         client=FakeBackendClient(),
     )
+
+
+def test_worker_init_rejects_empty_handlers():
+    """Empty handlers makes task_types=[] in the poll loop, so the worker
+    silently polls forever without ever processing work — same shape of
+    misconfiguration as a handler with no registered schema."""
+    with pytest.raises(ProtocolError) as exc_info:
+        Worker(
+            backend_url="http://fake/api/v1",
+            api_key="k",
+            worker_id="w",
+            handlers={},
+            client=FakeBackendClient(),
+        )
+    assert "handlers is empty" in str(exc_info.value)

@@ -139,13 +139,23 @@ async def _shutdown_after(worker: Worker, delay_s: float):
     await worker.shutdown()
 
 
+async def _noop_handler(ctx, params):  # pragma: no cover — never invoked
+    return {}
+
+
+# Worker.__init__ now rejects empty handlers (silent-poll guard); these
+# lifecycle tests only exercise the payload-logger plumbing, so we hand
+# them any registered TaskType to satisfy the constructor.
+_LIFECYCLE_HANDLERS = {TaskType.DETECT_CUT_PLANES: _noop_handler}
+
+
 @pytest.mark.asyncio
 async def test_run_forever_logs_startup_state(tmp_path: Path, caplog):
     fake = FakeBackendClient()
     shared = tmp_path / "shared"
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(shared),
         poll_interval_s=0.05,
     )
@@ -173,7 +183,7 @@ async def test_run_forever_runs_startup_cleanup(tmp_path: Path):
     fake = FakeBackendClient()
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(shared),
         poll_interval_s=0.05,
     )
@@ -189,7 +199,7 @@ async def test_run_forever_closes_logger_in_finally(tmp_path: Path):
     shared = tmp_path / "shared"
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(shared),
         poll_interval_s=0.05,
     )
@@ -206,7 +216,7 @@ async def test_run_forever_periodic_cleanup(tmp_path: Path, monkeypatch):
     shared = tmp_path / "shared"
     worker = Worker(
         backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers={}, work_dir=str(tmp_path / "work"), client=fake,
+        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
         shared_volume_path=str(shared),
         poll_interval_s=0.01,
     )
