@@ -93,6 +93,19 @@ class Worker:
             self._client = client
         self._stop = asyncio.Event()
 
+        # Fail fast on misconfiguration: any handler whose TaskType has no
+        # registered params schema would only blow up after claim_next pulls
+        # the first matching task off the queue, burning retry budget. Same
+        # check lives in _run_one as defense-in-depth for code paths that
+        # mutate handlers post-construction.
+        missing = [t.value for t in self.handlers if t not in TASK_PARAMS_SCHEMAS]
+        if missing:
+            raise ProtocolError(
+                "no schema registered for task_type "
+                f"{', '.join(sorted(missing))}; "
+                "update task-worker-api or register one locally"
+            )
+
     def _build_payload_logger(self) -> PayloadLogger:
         """Construct a PayloadLogger from env + shared_volume_path.
 
