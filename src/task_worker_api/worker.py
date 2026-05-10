@@ -93,6 +93,17 @@ class Worker:
             self._client = client
         self._stop = asyncio.Event()
 
+        # Fail fast on misconfiguration: an empty handlers dict makes
+        # task_types=[] in run_forever's poll loop, so the worker silently
+        # polls forever without ever processing work. Operators only notice
+        # via the absence of activity. Same shape of misconfiguration as
+        # the missing-schema case below.
+        if not self.handlers:
+            raise ProtocolError(
+                "handlers is empty; Worker has nothing to claim. "
+                "Register at least one TaskType→handler mapping."
+            )
+
         # Fail fast on misconfiguration: any handler whose TaskType has no
         # registered params schema would only blow up after claim_next pulls
         # the first matching task off the queue, burning retry budget. Same
