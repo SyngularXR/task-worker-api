@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.1 — 2026-05-11
+
+Adds an optional `dense_init` field to `GsBuildParams` for the
+colmap-splat worker. Without this, producers stamping `dense_init` into
+`task.params` would trip `extra="forbid"` validation on claim and
+silently fail every GS_BUILD task.
+
+**New:**
+- `GsBuildParams.dense_init: Optional[bool]` — when true, the worker
+  runs COLMAP dense MVS (`image_undistorter` → `patch_match_stereo` →
+  `stereo_fusion`) after the sparse mapper and seeds splat init from
+  the fused point cloud.
+
 ## v0.6.0 — 2026-04-28
 
 Adds `DEPLOY_CASE` task type for the assetbundle-builder worker.
