@@ -128,6 +128,8 @@ export interface GsBuildParams {
   num_threads?: number;
   background?: string;
   strategy?: string;
+  /** Run COLMAP dense MVS for splat init (adds 5–30 min). */
+  dense_init?: boolean;
 }
 
 /**
