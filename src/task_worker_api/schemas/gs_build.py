@@ -33,3 +33,7 @@ class GsBuildParams(TaskParamsBase):
     num_threads: Optional[int] = Field(default=None, ge=0)
     background: Optional[str] = Field(default=None)
     strategy: Optional[str] = Field(default=None)
+    dense_init: Optional[bool] = Field(
+        default=None,
+        description="Run COLMAP dense MVS for splat init (adds 5–30 min).",
+    )

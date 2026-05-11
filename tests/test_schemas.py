@@ -2,7 +2,12 @@
 import pytest
 
 from task_worker_api.enums import TaskType
-from task_worker_api.schemas import TASK_PARAMS_SCHEMAS, CinematicBakingParams, DeployCaseParams
+from task_worker_api.schemas import (
+    TASK_PARAMS_SCHEMAS,
+    CinematicBakingParams,
+    DeployCaseParams,
+    GsBuildParams,
+)
 
 
 def test_cinematic_baking_registered():
@@ -44,3 +49,13 @@ def test_deploy_case_rejects_extra_field():
 def test_deploy_case_content_path_required():
     with pytest.raises(Exception):
         DeployCaseParams()
+
+
+def test_gs_build_accepts_dense_init():
+    obj = GsBuildParams(dense_init=True)
+    assert obj.dense_init is True
+
+
+def test_gs_build_dense_init_optional():
+    obj = GsBuildParams()
+    assert obj.dense_init is None
