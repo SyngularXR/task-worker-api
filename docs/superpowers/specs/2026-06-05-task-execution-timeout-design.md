@@ -48,6 +48,18 @@ blocks the loop. The same is true of any `asyncio.wait_for`-based timeout.
    in the admin UI for a human; the backend may apply its own policy.
 3. **Enforcement = OS watchdog thread** (not asyncio), so the deadline fires even
    when a handler blocks the loop.
+4. **Kill scope = task-spawned children only** (eng review). Snapshot the worker's
+   child PIDs at task start; at timeout target only PIDs that appeared since.
+   Minimizes blast radius vs killing all descendants.
+5. **In-process hangs get a hard-exit last resort** (eng review). With no subprocess
+   to kill (e.g. a wedged in-process GPU call in a `run_hybrid` worker), the watchdog
+   makes a best-effort synchronous `fail(timeout)` then calls an injectable hard-exit
+   (`on_hard_exit`, default `os._exit`); `restart: unless-stopped` (confirmed on all
+   four workers) brings it back. Accepts ~seconds of neural-canvas API downtime on
+   that rare event.
+6. **Deadline covers the whole task** (eng review) — the watchdog starts at claim, so
+   input staging (`prepare_inputs`) and output upload are inside the window, not just
+   the handler.
 
 ## Design
 
@@ -70,49 +82,62 @@ Resolved per task at claim time.
 
 `_run_one` resolves the timeout, then (if enabled) starts a per-task daemon
 `TaskWatchdog` thread holding `deadline = time.monotonic() + timeout`. The thread
-sleeps in short ticks and exits early when the task signals completion. The worker
-runs one task at a time, so at most one watchdog is live and **all descendant
-processes of the worker belong to the current task** — no per-handler wiring needed.
+sleeps in short ticks and exits early when the task signals completion. At task start
+the SDK snapshots the worker's current child PIDs; on timeout it targets only PIDs
+that appeared since (**task-spawned children**) — handler-agnostic, no per-handler
+wiring, minimal blast radius.
 
 On expiry the watchdog escalates:
 
 1. **Mark** a `timed_out` flag for the current task. `_run_one` consults this flag
    and reports `client.fail(id, "timeout: exceeded {N}s")` regardless of what the
    handler ultimately returns or raises.
-2. **SIGTERM** the worker's descendant processes (enumerated via `psutil`
-   `Process(os.getpid()).children(recursive=True)`, or a `/proc` walk to avoid the
-   dependency — workers are Linux containers). Wait `grace_s` (default 15s).
+2. **SIGTERM** the task-spawned child processes (the start-snapshot delta; enumerated
+   via `psutil` `Process(os.getpid()).children(recursive=True)` or a `/proc` walk —
+   workers are Linux containers). Wait `grace_s` (default 15s).
 3. **SIGKILL** any survivors. Killing the child unblocks the handler's blocked wait
    (`subprocess.run` / `proc.communicate` / `proc.wait` returns) → control returns
    to `_run_one` → it reports the timeout failure → the loop resumes polling.
-4. **Last resort** — in-process runaway with no child to kill (e.g. a wedged CUDA
-   call inside a Neural-Canvas threadpool, which a thread cannot be force-killed
-   out of): after a final grace with the task still not done, the watchdog makes a
-   **synchronous best-effort** `fail(timeout)` HTTP call (plain `urllib`, since the
-   async client is on the blocked loop) and then `os._exit()`s the worker so the
-   container restart policy brings it back clean. Rare; only when nothing is
-   killable.
+4. **Last resort** — in-process runaway with no task-spawned child to kill (e.g. a
+   wedged CUDA call inside a Neural-Canvas threadpool, which a thread cannot be
+   force-killed out of): after a final grace with the task still not done, the
+   watchdog makes a **synchronous best-effort** `fail(timeout)` HTTP call (plain
+   `urllib` — the async client is on the blocked loop) and then calls an **injectable
+   hard-exit** (`on_hard_exit`, default `os._exit`). `restart: unless-stopped`
+   (confirmed on all four workers) brings it back. For `run_hybrid` workers
+   (neural-canvas) this also drops the in-process FastAPI app for the few seconds
+   until restart — accepted, since the alternative is an unbounded wedge. The
+   injection point keeps this path unit-testable (assert the callable is invoked
+   rather than killing the test runner).
 
 ### Control flow
 
 ```
 _run_one(task):
-    timeout = resolve_timeout(task.task_type)         # may be 0 → disabled
-    wd = TaskWatchdog(timeout, grace_s) if timeout > 0 else None
-    wd and wd.start()
+    timeout = resolve_timeout(task.task_type)           # 0 → disabled (today's behavior)
+    if timeout > 0:
+        wd = TaskWatchdog(timeout, grace_s, on_hard_exit)
+        wd.start(children_at_start=snapshot_children())  # covers staging→handler→upload
     try:
-        ... existing claim/stage/handler-under-CancelGuard/complete ...
-    except ...:                                       # existing handlers
-        ...
+        ... stage inputs → handler under CancelGuard → upload outputs ...
+        report_terminal('complete', result)             # check-and-set guarded
+    except TaskCancelled:
+        report_terminal('fail', 'cancelled by user')
+    except Exception as e:
+        report_terminal('fail', format_error(e))
     finally:
-        wd and wd.stop_and_join()                     # cancel on normal finish
-        if wd and wd.fired:                           # timeout won the race
-            await client.fail(task.id, f"timeout: exceeded {timeout}s")
+        if timeout > 0:
+            wd.stop()                                   # cancel watchdog on normal finish
+        # If the watchdog already fired it called report_terminal('fail','timeout…')
+        # first; report_terminal is idempotent (lock + terminal_reported flag), so the
+        # normal path's call is a no-op. Timeout wins.
 ```
 
-Wall-clock from handler start, `monotonic()`-based, independent of heartbeats.
-The existing cooperative `CancelGuard` and heartbeat paths are unchanged; the
-watchdog is additive.
+`report_terminal()` is the single check-and-set reporter (lock-protected
+`terminal_reported` flag) — the one place terminal status is sent. Minimal-diff form:
+keep the existing `complete`/`fail` calls, route them through this one guard. Deadline
+is `monotonic()`-based and independent of heartbeats. The cooperative `CancelGuard`
+and heartbeat paths are unchanged; the watchdog is additive.
 
 ### Edge cases
 
@@ -122,8 +147,12 @@ watchdog is additive.
 - `fail()` after a kill: when children are killed and the loop unblocks, the normal
   async `fail` path runs. Only the in-process-exit branch needs the sync `fail`.
 - Disabled (`<= 0`) → no watchdog created.
-- Double-report guard: if both the handler-exception path and the `timed_out` flag
-  would call `fail`, the `timed_out` flag wins and is reported once.
+- Double-report guard (Q1): a single check-and-set (lock-protected `terminal_reported`
+  flag) gates both the normal `complete`/`fail` and the timeout `fail`, so a task that
+  finishes the instant the watchdog fires reports exactly one terminal status (timeout
+  wins).
+- A hang in `prepare_inputs` (staging) past the deadline is terminated too, since the
+  watchdog starts at claim, not at handler entry.
 
 ## Testing
 
@@ -133,6 +162,12 @@ watchdog is additive.
   task is failed.
 - Blocked-loop case: handler does a synchronous `time.sleep` (blocks the loop) →
   asserts the watchdog thread still fires and acts (validates the core fix).
+- In-process last resort: inject a fake `on_hard_exit`; a no-subprocess hang past the
+  deadline → asserts best-effort `fail(timeout)` then `on_hard_exit` invoked (no real
+  process exit in the test).
+- Double-report race: completion and watchdog-fire interleaved → asserts exactly one
+  terminal report, timeout wins.
+- Staging coverage: a hang in `prepare_inputs` past the deadline is terminated.
 - Config resolution: env per-type / constructor per-type / env default / constructor
   default precedence; `0` disables.
 - Existing suite stays green.
@@ -146,7 +181,32 @@ watchdog is additive.
    `bundle/compose/docker-compose.yml` (colmap-splat gets the `gs_build` override).
 4. Publish a new bundle + deploy; the per-service timeout takes effect.
 
+## What already exists
+
+- `CancelGuard` (cancel.py) — cooperative cancel poller with an `on_cancel` hook.
+  Reused conceptually (a timeout is "cancel-like") but it is event-loop-bound, so it
+  cannot stop a handler that blocks the loop — which is exactly why the watchdog is a
+  separate OS thread. Not rebuilt.
+- `ProgressReporter` heartbeat (progress.py) — unchanged; the timeout is wall-clock
+  and independent of heartbeats.
+- `BackendClient.fail()` / `.complete()` (client.py) — reused for terminal reporting;
+  the last-resort path adds a small synchronous `fail` (plain `urllib`) for when the
+  event loop is blocked.
+
+## NOT in scope
+
+- Retrying timed-out tasks — explicitly terminal-fail (Decision 2).
+- Backend (nexus-core) timeout enforcement or a distinct `timed_out` task status —
+  deferred; the worker reports a normal `fail` with a `timeout:` reason.
+- Making individual handlers non-blocking / fully async — larger per-repo work; the
+  watchdog must work regardless of handler behavior.
+- A worker-loop healthcheck that detects a wedged loop — orthogonal to auto-kill
+  (would have surfaced the blender wedge faster). Candidate TODO.
+- Force-killing a non-cooperative in-process thread without exiting the process — not
+  possible in CPython; the hard-exit last resort is the accepted substitute.
+
 ## Open questions
 
-None. (Grace period default 15s, env-var format `default=…,type=…`, and
-exit-as-last-resort for in-process work were all confirmed during design.)
+None. Grace period default 15s, env-var format `default=…,type=…`, kill-scope
+(task-spawned only), and the hard-exit last resort were all confirmed during design
+and eng review.
