@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from task_worker_api import TaskType, Worker
+from task_worker_api.testing import FakeBackendClient
+from task_worker_api.worker import _make_sync_fail
+
+
+# ----- bounded synchronous fail helper -------------------------------------
+
+
+def test_make_sync_fail_builds_put_request(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        def close(self):
+            captured["closed"] = True
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["timeout"] = timeout
+        captured["auth"] = req.get_header("Authorization")
+        captured["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    fn = _make_sync_fail("http://bk/api/v1/", "secret", 42, timeout_s=3.0)
+    fn("timeout: exceeded 1800s (hard-exit)")
+
+    assert captured["url"] == "http://bk/api/v1/tasks/42/fail"
+    assert captured["method"] == "PUT"
+    assert captured["timeout"] == 3.0
+    assert captured["auth"] == "Bearer secret"
+    assert captured["body"] == {"error": "timeout: exceeded 1800s (hard-exit)"}
+    assert captured["closed"] is True
+
+
+# ----- Worker wiring (deterministic watchdog double) -----------------------
+
+
+class _ImmediateWatchdog:
+    """Test double for TaskWatchdog: reports `fired` deterministically without
+    threads/processes. Worker passes it via the _watchdog_factory seam."""
+    last = None
+
+    def __init__(self, *, fire: bool):
+        self._fire = fire
+        self.fired = False
+        self.started = False
+        self.stopped = False
+        _ImmediateWatchdog.last = self
+
+    def start(self):
+        self.started = True
+
+    def stop(self) -> bool:
+        self.stopped = True
+        self.fired = self._fire
+        return self.fired
+
+
+def _worker(fake, tmp_path, **kw):
+    return Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: kw.pop("handler")},
+        work_dir=str(tmp_path / "work"), client=fake, **kw,
+    )
+
+
+def _queue(fake, tmp_path):
+    (tmp_path / "f.stl").write_bytes(b"solid\nendsolid\n")
+    fake.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "f.stl")},
+    )
+
+
+@pytest.mark.asyncio
+async def test_timeout_disabled_no_watchdog(tmp_path):
+    fake = FakeBackendClient()
+    _queue(fake, tmp_path)
+    made = {"n": 0}
+
+    def factory(**kwargs):
+        made["n"] += 1
+        return _ImmediateWatchdog(fire=False)
+
+    async def handler(ctx, params):
+        return {"ok": True}
+
+    w = _worker(fake, tmp_path, handler=handler, task_timeout_s=0.0,
+                _watchdog_factory=factory)
+    await w.run_one()
+    assert made["n"] == 0                      # disabled → no watchdog built
+    assert len(fake.completed_tasks) == 1
+    assert fake.failed_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_timeout_fires_reports_timeout_fail(tmp_path):
+    fake = FakeBackendClient()
+    _queue(fake, tmp_path)
+
+    async def handler(ctx, params):
+        return {"ok": True}   # completes, but the watchdog reports it fired
+
+    w = _worker(fake, tmp_path, handler=handler, task_timeout_s=60.0,
+                _watchdog_factory=lambda **kw: _ImmediateWatchdog(fire=True))
+    await w.run_one()
+    assert fake.completed_tasks == []
+    assert len(fake.failed_tasks) == 1
+    assert "timeout: exceeded 60s" in fake.failed_tasks[0]["error"]
+    assert _ImmediateWatchdog.last.started is True
+    assert _ImmediateWatchdog.last.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_no_timeout_normal_completion(tmp_path):
+    fake = FakeBackendClient()
+    _queue(fake, tmp_path)
+
+    async def handler(ctx, params):
+        return {"ok": True}
+
+    w = _worker(fake, tmp_path, handler=handler, task_timeout_s=60.0,
+                _watchdog_factory=lambda **kw: _ImmediateWatchdog(fire=False))
+    await w.run_one()
+    assert len(fake.completed_tasks) == 1
+    assert fake.failed_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_per_type_env_override_resolved(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKER_TASK_TIMEOUTS", "default=10,detect_cut_planes=0")
+    fake = FakeBackendClient()
+    _queue(fake, tmp_path)
+    built = {"n": 0}
+
+    def factory(**kwargs):
+        built["n"] += 1
+        return _ImmediateWatchdog(fire=False)
+
+    async def handler(ctx, params):
+        return {"ok": True}
+
+    # detect_cut_planes resolves to 0 (disabled) → factory never called.
+    w = _worker(fake, tmp_path, handler=handler, _watchdog_factory=factory)
+    await w.run_one()
+    assert built["n"] == 0
+    assert len(fake.completed_tasks) == 1

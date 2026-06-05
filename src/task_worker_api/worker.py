@@ -14,11 +14,13 @@ Two modes of use:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import tempfile
 import traceback
+import urllib.request
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -31,10 +33,38 @@ from .files import prepare_inputs, upload_outputs
 from .payload_log import PayloadLogger, sanitize_worker_id
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
+from .timeouts import DEFAULT_TASK_TIMEOUT_S, parse_timeouts_env, resolve_task_timeout
+from .watchdog import TaskWatchdog, TerminalGuard, list_descendants
 
 log = logging.getLogger(__name__)
 
 HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
+
+
+def _make_sync_fail(
+    base_url: str, api_key: str, task_id: int, *, timeout_s: float = 3.0,
+):
+    """Build a synchronous ``fail(error)`` callable for the watchdog thread.
+
+    The async BackendClient is bound to the (possibly blocked) event loop, so
+    the watchdog's last-resort report uses plain stdlib urllib with an explicit
+    short timeout — it must never become a second wedge. Matches the wire
+    format of ``BackendClient.fail``: PUT /tasks/{id}/fail {"error": ...}.
+    """
+    url = f"{base_url.rstrip('/')}/tasks/{task_id}/fail"
+
+    def _sync_fail(error: str) -> None:
+        data = json.dumps({"error": error}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="PUT",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        urllib.request.urlopen(req, timeout=timeout_s).close()
+
+    return _sync_fail
 
 
 class Worker:
@@ -66,7 +96,12 @@ class Worker:
         heartbeat_interval_s: float = 10.0,
         cancel_poll_interval_s: float = 2.0,
         request_timeout_s: float = 30.0,
+        task_timeout_s: float = DEFAULT_TASK_TIMEOUT_S,
+        task_timeouts: Optional[dict] = None,
+        timeout_grace_s: float = 15.0,
+        on_hard_exit: Optional[Callable[[], None]] = None,
         client: Optional[BackendClient] = None,
+        _watchdog_factory: Callable[..., object] = TaskWatchdog,
     ):
         self.backend_url = backend_url
         self.api_key = api_key
@@ -79,6 +114,12 @@ class Worker:
         self.poll_interval_s = poll_interval_s
         self.heartbeat_interval_s = heartbeat_interval_s
         self.cancel_poll_interval_s = cancel_poll_interval_s
+        self.task_timeout_s = task_timeout_s
+        self.task_timeouts = task_timeouts or {}
+        self.timeout_grace_s = timeout_grace_s
+        self._on_hard_exit = on_hard_exit or (lambda: os._exit(75))
+        self._timeout_env = parse_timeouts_env(os.environ.get("WORKER_TASK_TIMEOUTS"))
+        self._watchdog_factory = _watchdog_factory
 
         self._payload_logger = self._build_payload_logger()
 
@@ -260,13 +301,43 @@ class Worker:
             return None
 
     async def _run_one(self, task: ClaimedTask) -> None:
-        """Stage inputs → run handler under heartbeat + cancel guard → publish."""
+        """Stage inputs → run handler under heartbeat + cancel guard → publish.
+
+        A per-task watchdog (when ``timeout`` > 0) enforces a wall-clock
+        deadline off the event loop. Terminal reporting goes through a single
+        TerminalGuard so a timeout and a near-simultaneous normal completion
+        report exactly once (first resolver wins).
+        """
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
             self._client, task.id,
             heartbeat_interval_s=self.heartbeat_interval_s,
         )
 
+        timeout_s = resolve_task_timeout(
+            task.task_type,
+            default_s=self.task_timeout_s,
+            per_type=self.task_timeouts,
+            env=self._timeout_env,
+        )
+        guard = TerminalGuard()
+        wd = None
+        if timeout_s > 0:
+            log.info(
+                "task %s: %s timeout=%.0fs",
+                task.id, task.task_type.value, timeout_s,
+            )
+            wd = self._watchdog_factory(
+                timeout_s=timeout_s,
+                grace_s=self.timeout_grace_s,
+                guard=guard,
+                sync_fail=_make_sync_fail(self.backend_url, self.api_key, task.id),
+                on_hard_exit=self._on_hard_exit,
+                children_before=list_descendants(os.getpid()),
+            )
+            wd.start()
+
+        outcome: tuple[str, object] = ("fail", "unknown")
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -310,33 +381,43 @@ class Worker:
                     self.shared_volume_path,
                 )
                 result = {**result, "output_files": delivered}
-
-            await self._client.complete(task.id, result or {})
-            log.info("task %s completed (%s)", task.id, task.task_type.value)
+            outcome = ("complete", result or {})
 
         except TaskCancelled:
-            log.info("task %s cancelled by user", task.id)
-            try:
-                await self._client.fail(task.id, "cancelled by user")
-            except Exception:  # noqa: BLE001
-                pass
+            outcome = ("fail", "cancelled by user")
         except (TaskParamsError, ProtocolError) as e:
             log.error("task %s protocol error: %s", task.id, e)
-            try:
-                await self._client.fail(task.id, str(e))
-            except Exception:  # noqa: BLE001
-                pass
+            outcome = ("fail", str(e))
         except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
             log.error("task %s failed: %s\n%s", task.id, e, tb)
-            try:
-                await self._client.fail(
-                    task.id, f"{type(e).__name__}: {e}\n{tb}",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            outcome = ("fail", f"{type(e).__name__}: {e}\n{tb}")
         finally:
+            fired = wd.stop() if wd is not None else False
             await progress.stop()
+            # Single terminal report. If the watchdog fired, the deadline won;
+            # otherwise report the handler outcome. The guard makes this
+            # exactly-once even against the watchdog's hard-exit path.
+            if guard.claim():
+                try:
+                    if fired:
+                        await self._client.fail(
+                            task.id, f"timeout: exceeded {timeout_s:.0f}s",
+                        )
+                        log.warning(
+                            "task %s timed out (%s)", task.id, task.task_type.value
+                        )
+                    elif outcome[0] == "complete":
+                        await self._client.complete(task.id, outcome[1])
+                        log.info(
+                            "task %s completed (%s)", task.id, task.task_type.value
+                        )
+                    else:
+                        await self._client.fail(task.id, outcome[1])
+                        if outcome[1] == "cancelled by user":
+                            log.info("task %s cancelled by user", task.id)
+                except Exception:  # noqa: BLE001
+                    pass
             shutil.rmtree(task_dir, ignore_errors=True)
 
 
