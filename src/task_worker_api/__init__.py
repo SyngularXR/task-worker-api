@@ -13,7 +13,7 @@ from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
 from .worker import Worker, run_hybrid
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 __all__ = [
     "__version__",
