@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.7.0 — 2026-06-05
+
+Per-task execution timeout. `Worker` now enforces a wall-clock deadline per
+task via an OS watchdog thread that fires even when a handler blocks the event
+loop. On expiry it SIGTERM→SIGKILLs the task-spawned child processes and fails
+the task terminally (`timeout: exceeded Ns`); an in-process wedge with nothing
+to kill triggers a bounded synchronous fail + process exit (the container
+`restart: unless-stopped` recovers). Motivated by a production blender wedge
+(a runaway convex-hull held a worker for 3.5h, offline >1h).
+
+**New:**
+- `Worker(task_timeout_s=1800.0, task_timeouts={TaskType: seconds},
+  timeout_grace_s=15.0, on_hard_exit=...)` plus env
+  `WORKER_TASK_TIMEOUTS="default=1800,gs_build=7200"`. Resolution order:
+  env per-type → ctor per-type → env default → ctor default. A resolved
+  value `<= 0` disables the timeout for that task type.
+- `task_worker_api.watchdog` (`TaskWatchdog`, `TerminalGuard`,
+  `list_descendants`, `kill_procs`) and `task_worker_api.timeouts`
+  (`resolve_task_timeout`, `parse_timeouts_env`).
+
+**Notes:**
+- Known limitations (see the design spec): a pure-Python GIL-holding busy loop
+  can starve the watchdog thread; child attribution in `run_hybrid` workers is
+  snapshot-delta based. Process-per-task is the documented future hardening.
+
 ## v0.6.1 — 2026-05-11
 
 Adds an optional `dense_init` field to `GsBuildParams` for the
