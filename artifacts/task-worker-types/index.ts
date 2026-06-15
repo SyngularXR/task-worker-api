@@ -13,6 +13,8 @@ export type TaskType =
   | 'detect_cut_planes'
   | 'cinematic_baking'
   | 'deploy_case'
+  | 'generate_synthetic'
+  | 'finalize_synthetic'
 ;
 
 export const TaskType = {
@@ -24,6 +26,8 @@ export const TaskType = {
   DETECT_CUT_PLANES: 'detect_cut_planes' as const,
   CINEMATIC_BAKING: 'cinematic_baking' as const,
   DEPLOY_CASE: 'deploy_case' as const,
+  GENERATE_SYNTHETIC: 'generate_synthetic' as const,
+  FINALIZE_SYNTHETIC: 'finalize_synthetic' as const,
 } as const;
 
 export enum TaskStatus {
@@ -156,6 +160,28 @@ export interface DeployCaseParams {
   build_target?: string;
 }
 
+/**
+ * Input for the synthetic-generator SRR compute.
+ */
+export interface GenerateSyntheticParams {
+  sources: Array<SyntheticSource>;
+  source_dicom_ids: Array<number>;
+  reference_dicom_id: number;
+  /** Reference NIfTI GetSize() [X,Y,Z]. */
+  reference_size: Array<number>;
+  /** {'mode':'full'} or {'mode':'roi','bounds':{...}}. */
+  synthetic_roi: Record<string, unknown>;
+  /** Server-minted staging dir on the shared volume. */
+  staging_dir: string;
+  /** Server-minted final dicom dir on the shared volume. */
+  output_dir: string;
+  output_filename: string;
+  name: string;
+  author_id: number;
+  /** NiftyMIC tunables; image defaults apply when empty. */
+  niftymic?: Record<string, unknown>;
+}
+
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
@@ -165,4 +191,5 @@ export interface TaskParamsByType {
   'gs_build': GsBuildParams;
   'segmentation': SegmentationParams;
   'deploy_case': DeployCaseParams;
+  'generate_synthetic': GenerateSyntheticParams;
 }
