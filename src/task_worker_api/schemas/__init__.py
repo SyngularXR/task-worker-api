@@ -12,6 +12,7 @@ from ._base import TaskParamsBase
 from .cinematic_baking import CinematicBakingParams
 from .deploy_case import DeployCaseParams
 from .detect_cut_planes import DetectCutPlanesParams
+from .generate_synthetic import GenerateSyntheticParams
 from .gs_build import GsBuildParams
 from .model_initializing import ModelInitializingParams
 from .segmentation import SegmentationParams
@@ -25,6 +26,9 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
     TaskType.GS_BUILD: GsBuildParams,
     TaskType.SEGMENTATION: SegmentationParams,
     TaskType.DEPLOY_CASE: DeployCaseParams,
+    TaskType.GENERATE_SYNTHETIC: GenerateSyntheticParams,
+    # FINALIZE_SYNTHETIC is backend-local only — no worker-side params schema,
+    # and deliberately absent so the public create endpoint can't accept it.
 }
 
 
@@ -34,6 +38,7 @@ __all__ = [
     "CinematicBakingParams",
     "DeployCaseParams",
     "DetectCutPlanesParams",
+    "GenerateSyntheticParams",
     "ModelInitializingParams",
     "GsBuildParams",
     "SegmentationParams",
