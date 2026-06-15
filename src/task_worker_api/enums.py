@@ -21,6 +21,11 @@ class TaskType(str, Enum):
     DETECT_CUT_PLANES = "detect_cut_planes"
     CINEMATIC_BAKING = "cinematic_baking"
     DEPLOY_CASE = "deploy_case"
+    # Synthetic MRI super-resolution reconstruction (NiftyMIC). GENERATE is the
+    # remote SRR compute (Neural-Canvas worker → synthetic-generator image);
+    # FINALIZE is the backend-local DB import step (never claimed by a worker).
+    GENERATE_SYNTHETIC = "generate_synthetic"
+    FINALIZE_SYNTHETIC = "finalize_synthetic"
 
 
 class TaskStatus(IntEnum):

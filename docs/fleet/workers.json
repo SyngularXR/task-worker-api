@@ -34,7 +34,11 @@
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
           "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S",
           "FASTAPI_HOST",
-          "FASTAPI_PORT"
+          "FASTAPI_PORT",
+          "SYNCAST_URL",
+          "SYNCAST_ROOM_ID",
+          "SYNCAST_DEVICE_ID",
+          "SYNCAST_NAME"
         ]
       },
       "shared_volume_wired": true,
