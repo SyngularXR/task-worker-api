@@ -97,5 +97,6 @@ def test_output_dir_required():
 
 
 def test_finalize_segmentation_enum_exists_but_not_in_registry():
-    assert TaskType.FINALIZE_SEGMENTATION.value == "finalize_segmentation"
+    assert TaskType.FINALIZE_SEGMENTATION.value == "finalize_segment"
+    assert len(TaskType.FINALIZE_SEGMENTATION.value) <= 20
     assert TaskType.FINALIZE_SEGMENTATION not in TASK_PARAMS_SCHEMAS

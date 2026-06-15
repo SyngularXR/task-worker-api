@@ -28,8 +28,9 @@ class TaskType(str, Enum):
     FINALIZE_SYNTHETIC = "finalize_synthetic"
     # One-shot segmentation finalize: backend-local DB/manifest import step for a
     # completed SEGMENTATION task (never claimed by a worker; absent from
-    # TASK_PARAMS_SCHEMAS), mirroring FINALIZE_SYNTHETIC.
-    FINALIZE_SEGMENTATION = "finalize_segmentation"
+    # TASK_PARAMS_SCHEMAS), mirroring FINALIZE_SYNTHETIC. Value kept <=20 chars to
+    # fit the backend's task_type column (CharEnumField max_length=20).
+    FINALIZE_SEGMENTATION = "finalize_segment"
 
 
 class TaskStatus(IntEnum):
