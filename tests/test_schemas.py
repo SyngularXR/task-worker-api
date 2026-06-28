@@ -59,3 +59,13 @@ def test_gs_build_accepts_dense_init():
 def test_gs_build_dense_init_optional():
     obj = GsBuildParams()
     assert obj.dense_init is None
+
+
+def test_gs_build_accepts_warm_start_ply():
+    # 4D warm-chain: each phase after the first seeds from the prior phase's PLY.
+    obj = GsBuildParams(scene="/shared/p1/gs", warm_start_ply="/shared/p0/gs/gs_output/gs_p0.ply")
+    assert obj.warm_start_ply == "/shared/p0/gs/gs_output/gs_p0.ply"
+
+
+def test_gs_build_warm_start_ply_optional():
+    assert GsBuildParams().warm_start_ply is None
