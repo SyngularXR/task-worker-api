@@ -22,6 +22,14 @@ class GsBuildParams(TaskParamsBase):
     scene_path: Optional[str] = Field(default=None, description="Alias for `scene`.")
     scene_id: Optional[str] = Field(default=None, description="Scene id; defaults to dir basename.")
 
+    # 4D warm-chain (sub-project #4): seed this phase's Gaussian init from a
+    # prior phase's trained PLY (run.sh `--warm-start-ply`). Absolute path under
+    # the shared volume. None → cold start (the first phase / all static builds).
+    warm_start_ply: Optional[str] = Field(
+        default=None,
+        description="Prior-phase PLY to warm-start from (4D); absolute, on shared volume.",
+    )
+
     # Tuning knobs — all optional, run.sh defaults apply when omitted.
     method: Optional[str] = Field(default=None)
     iterations: Optional[int] = Field(default=None, ge=0)
