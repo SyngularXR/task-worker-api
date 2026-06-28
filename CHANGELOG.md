@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.10.0 — 2026-06-29
+
+4D Gaussian-splatting (cardiac) support for the task queue.
+
+**New:**
+- `TaskType.GS4D_BUILD` (`"gs4d_build"`) — 4D Gaussian-splatting build over N
+  cardiac phases (warm-start chain). Value ≤20 chars for the backend's
+  `task_type` column.
+- `GsBuildParams.warm_start_ply` (optional) — the prior phase's trained PLY to
+  seed this phase's Gaussian init from (run.sh `--warm-start-ply`). Lets the 4D
+  warm-chain reuse the existing `gs_build` worker; `None` = cold start.
+
 ## v0.7.0 — 2026-06-05
 
 Per-task execution timeout. `Worker` now enforces a wall-clock deadline per
