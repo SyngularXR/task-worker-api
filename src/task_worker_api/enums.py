@@ -15,6 +15,9 @@ class TaskType(str, Enum):
 
     RENDER = "render"
     GS_BUILD = "gs_build"
+    # 4D Gaussian Splatting build — one orchestrator over N cardiac phases with a
+    # per-frame state machine + warm-start (4D cardiac design map, sub-project #4).
+    GS4D_BUILD = "gs4d_build"
     SEGMENTATION = "segmentation"
     MODEL_INITIALIZING = "model_initializing"
     APPLE_ML_GS = "apple_ml_gs"
