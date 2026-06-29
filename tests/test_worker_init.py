@@ -12,40 +12,23 @@ import pytest
 
 from task_worker_api import TaskType, Worker
 from task_worker_api.errors import ProtocolError
-from task_worker_api.testing import FakeBackendClient
 
 
-async def _noop_handler(ctx, params):  # pragma: no cover — never invoked
-    return {}
-
-
-def test_worker_init_rejects_handler_without_registered_schema():
+def test_worker_init_rejects_handler_without_registered_schema(make_worker, noop_handler):
     """RENDER and APPLE_ML_GS are deferred per schemas/__init__.py — a Worker
     that registers a handler for one of them must fail at construction."""
     with pytest.raises(ProtocolError) as exc_info:
-        Worker(
-            backend_url="http://fake/api/v1",
-            api_key="k",
-            worker_id="w",
-            handlers={TaskType.RENDER: _noop_handler},
-            client=FakeBackendClient(),
-        )
+        make_worker(handlers={TaskType.RENDER: noop_handler})
     assert "no schema registered" in str(exc_info.value)
     assert TaskType.RENDER.value in str(exc_info.value)
 
 
-def test_worker_init_accepts_handlers_with_registered_schemas():
+def test_worker_init_accepts_handlers_with_registered_schemas(make_worker):
     """Sanity check: the happy path still constructs without raising."""
-    Worker(
-        backend_url="http://fake/api/v1",
-        api_key="k",
-        worker_id="w",
-        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
-        client=FakeBackendClient(),
-    )
+    make_worker()
 
 
-def test_worker_init_rejects_empty_handlers():
+def test_worker_init_rejects_empty_handlers(fake_client):
     """Empty handlers makes task_types=[] in the poll loop, so the worker
     silently polls forever without ever processing work — same shape of
     misconfiguration as a handler with no registered schema."""
@@ -55,6 +38,6 @@ def test_worker_init_rejects_empty_handlers():
             api_key="k",
             worker_id="w",
             handlers={},
-            client=FakeBackendClient(),
+            client=fake_client,
         )
     assert "handlers is empty" in str(exc_info.value)

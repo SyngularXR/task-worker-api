@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 
 import httpx
@@ -127,35 +129,17 @@ async def test_claim_next_no_raw_on_204(tmp_path: Path):
 
 # ----- Worker.run_forever lifecycle -----------------------------------------
 
-import os
-import time
 
-from task_worker_api.testing import FakeBackendClient
-from task_worker_api.worker import Worker
-
-
-async def _shutdown_after(worker: Worker, delay_s: float):
+async def _shutdown_after(worker, delay_s: float):
     await asyncio.sleep(delay_s)
     await worker.shutdown()
 
 
-async def _noop_handler(ctx, params):  # pragma: no cover — never invoked
-    return {}
-
-
-# Worker.__init__ now rejects empty handlers (silent-poll guard); these
-# lifecycle tests only exercise the payload-logger plumbing, so we hand
-# them any registered TaskType to satisfy the constructor.
-_LIFECYCLE_HANDLERS = {TaskType.DETECT_CUT_PLANES: _noop_handler}
-
-
 @pytest.mark.asyncio
-async def test_run_forever_logs_startup_state(tmp_path: Path, caplog):
-    fake = FakeBackendClient()
+async def test_run_forever_logs_startup_state(make_worker, fake_client, tmp_path, caplog):
     shared = tmp_path / "shared"
-    worker = Worker(
-        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
+    worker = make_worker(
+        client=fake_client,
         shared_volume_path=str(shared),
         poll_interval_s=0.05,
     )
@@ -170,7 +154,7 @@ async def test_run_forever_logs_startup_state(tmp_path: Path, caplog):
 
 
 @pytest.mark.asyncio
-async def test_run_forever_runs_startup_cleanup(tmp_path: Path):
+async def test_run_forever_runs_startup_cleanup(make_worker, fake_client, tmp_path):
     """Pre-existing expired files in the worker dir are gone after startup."""
     shared = tmp_path / "shared"
     worker_dir = shared / "_worker_payloads" / "w"
@@ -180,10 +164,8 @@ async def test_run_forever_runs_startup_cleanup(tmp_path: Path):
     age_s = 30 * 86400
     os.utime(expired, (time.time() - age_s, time.time() - age_s))
 
-    fake = FakeBackendClient()
-    worker = Worker(
-        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
+    worker = make_worker(
+        client=fake_client,
         shared_volume_path=str(shared),
         poll_interval_s=0.05,
     )
@@ -194,12 +176,10 @@ async def test_run_forever_runs_startup_cleanup(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_run_forever_closes_logger_in_finally(tmp_path: Path):
-    fake = FakeBackendClient()
+async def test_run_forever_closes_logger_in_finally(make_worker, fake_client, tmp_path):
     shared = tmp_path / "shared"
-    worker = Worker(
-        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
+    worker = make_worker(
+        client=fake_client,
         shared_volume_path=str(shared),
         poll_interval_s=0.05,
     )
@@ -209,14 +189,14 @@ async def test_run_forever_closes_logger_in_finally(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_run_forever_periodic_cleanup(tmp_path: Path, monkeypatch):
+async def test_run_forever_periodic_cleanup(
+    make_worker, fake_client, tmp_path, monkeypatch,
+):
     """With a tight cleanup interval, the timer fires multiple times during the run."""
     monkeypatch.setenv("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "0.05")
-    fake = FakeBackendClient()
     shared = tmp_path / "shared"
-    worker = Worker(
-        backend_url="http://fake/api/v1", api_key="k", worker_id="w",
-        handlers=_LIFECYCLE_HANDLERS, work_dir=str(tmp_path / "work"), client=fake,
+    worker = make_worker(
+        client=fake_client,
         shared_volume_path=str(shared),
         poll_interval_s=0.01,
     )
