@@ -13,7 +13,7 @@ from .cinematic_baking import CinematicBakingParams
 from .deploy_case import DeployCaseParams
 from .detect_cut_planes import DetectCutPlanesParams
 from .generate_synthetic import GenerateSyntheticParams
-from .gs_build import GsBuildParams
+from .gs_build import GsBuildParams, Gs4dBuildParams
 from .model_initializing import ModelInitializingParams
 from .segmentation import SegmentationParams
 
@@ -24,6 +24,7 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
     TaskType.MODEL_INITIALIZING: ModelInitializingParams,
     TaskType.CINEMATIC_BAKING: CinematicBakingParams,
     TaskType.GS_BUILD: GsBuildParams,
+    TaskType.GS4D_BUILD: Gs4dBuildParams,
     TaskType.SEGMENTATION: SegmentationParams,
     TaskType.DEPLOY_CASE: DeployCaseParams,
     TaskType.GENERATE_SYNTHETIC: GenerateSyntheticParams,
@@ -41,5 +42,6 @@ __all__ = [
     "GenerateSyntheticParams",
     "ModelInitializingParams",
     "GsBuildParams",
+    "Gs4dBuildParams",
     "SegmentationParams",
 ]

@@ -45,3 +45,13 @@ class GsBuildParams(TaskParamsBase):
         default=None,
         description="Run COLMAP dense MVS for splat init (adds 5–30 min).",
     )
+
+
+# 4D Gaussian Splatting (cardiac) builds reuse the same params surface as a
+# static gs_build — the per-phase training tasks are dispatched as GS4D_BUILD
+# (or GS_BUILD for the cold-start phase) and consume the identical field set,
+# including `warm_start_ply` for the 4D warm-chain. The alias lets the registry
+# and codegen surface a distinct name (Gs4dBuildParams) while sharing one
+# Pydantic model, so a future divergence is a one-line class split rather than
+# a cross-repo migration.
+Gs4dBuildParams = GsBuildParams

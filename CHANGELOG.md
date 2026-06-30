@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+**Fixes:**
+- Register `TaskType.GS4D_BUILD` in `TASK_PARAMS_SCHEMAS` (via the
+  `Gs4dBuildParams = GsBuildParams` alias). The enum member was added in
+  v0.10.0 but never registered, so `Worker.__init__` rejected any handler for
+  it — blocking the colmap-splat worker's 4D warm-chain. The alias shares one
+  Pydantic model so the 4D per-phase training tasks reuse the identical params
+  surface (`scene`, `warm_start_ply`, tuning knobs).
+- Fix duplicate-interface bug in `tools/gen_typescript.py`: when two registry
+  entries alias the same Pydantic model, `model_cls.__name__` is identical for
+  both, so the codegen emitted `export interface GsBuildParams` twice — a TS
+  compilation failure in upstream consumers. Each named interface is now
+  emitted exactly once; both keys still appear in `TaskParamsByType`.
+- Regenerate `artifacts/task-worker-types/index.ts` (was stale since v0.10.0 —
+  missing `gs4d_build` / `finalize_segment` from the TaskType enum).
+
 ## v0.10.0 — 2026-06-29
 
 4D Gaussian-splatting (cardiac) support for the task queue.

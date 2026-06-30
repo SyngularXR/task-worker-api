@@ -7,6 +7,7 @@ from task_worker_api.schemas import (
     CinematicBakingParams,
     DeployCaseParams,
     GsBuildParams,
+    Gs4dBuildParams,
 )
 
 
@@ -69,3 +70,22 @@ def test_gs_build_accepts_warm_start_ply():
 
 def test_gs_build_warm_start_ply_optional():
     assert GsBuildParams().warm_start_ply is None
+
+
+def test_gs4d_build_registered():
+    """GS4D_BUILD must be in the registry so Worker.__init__ doesn't reject a
+    handler for it (the colmap-splat worker reuses gs_build.run for 4D phases)."""
+    assert TaskType.GS4D_BUILD in TASK_PARAMS_SCHEMAS
+
+
+def test_gs4d_build_alias_shares_gs_build_model():
+    """Gs4dBuildParams is an alias for GsBuildParams — same class object, so
+    the 4D warm-chain reuses the identical params surface (scene, warm_start_ply,
+    tuning knobs). A future divergence is a one-line class split."""
+    assert Gs4dBuildParams is GsBuildParams
+    assert TASK_PARAMS_SCHEMAS[TaskType.GS4D_BUILD] is GsBuildParams
+
+
+def test_gs4d_build_accepts_warm_start_ply():
+    obj = Gs4dBuildParams(scene="/shared/p1/gs", warm_start_ply="/shared/p0/gs/gs_output/gs_p0.ply")
+    assert obj.warm_start_ply == "/shared/p0/gs/gs_output/gs_p0.ply"
