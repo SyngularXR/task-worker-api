@@ -7,6 +7,7 @@
 export type TaskType =
   | 'render'
   | 'gs_build'
+  | 'gs4d_build'
   | 'segmentation'
   | 'model_initializing'
   | 'apple_ml_gs'
@@ -15,11 +16,13 @@ export type TaskType =
   | 'deploy_case'
   | 'generate_synthetic'
   | 'finalize_synthetic'
+  | 'finalize_segment'
 ;
 
 export const TaskType = {
   RENDER: 'render' as const,
   GS_BUILD: 'gs_build' as const,
+  GS4D_BUILD: 'gs4d_build' as const,
   SEGMENTATION: 'segmentation' as const,
   MODEL_INITIALIZING: 'model_initializing' as const,
   APPLE_ML_GS: 'apple_ml_gs' as const,
@@ -28,6 +31,7 @@ export const TaskType = {
   DEPLOY_CASE: 'deploy_case' as const,
   GENERATE_SYNTHETIC: 'generate_synthetic' as const,
   FINALIZE_SYNTHETIC: 'finalize_synthetic' as const,
+  FINALIZE_SEGMENTATION: 'finalize_segment' as const,
 } as const;
 
 export enum TaskStatus {
@@ -122,6 +126,8 @@ export interface GsBuildParams {
   scene_path?: string;
   /** Scene id; defaults to dir basename. */
   scene_id?: string;
+  /** Prior-phase PLY to warm-start from (4D); absolute, on shared volume. */
+  warm_start_ply?: string;
   method?: string;
   iterations?: number;
   max_image_size?: number;
@@ -137,19 +143,55 @@ export interface GsBuildParams {
 }
 
 /**
- * Input for Neural-Canvas's segmentation handler.
+ * Input for Neural-Canvas's one-shot segmentation handler.
  */
 export interface SegmentationParams {
   /** NIfTI volume on the shared volume. */
   input_path: string;
-  /** Segmentation model: 'vista3d' or 'medsam3'. */
+  /** vista3d | medsam3 | medsam2 | openmap_* | totalsegmentator_* */
   model: string;
-  /** Target label names. */
-  labels?: Array<string>;
+  /** Durable shared dir the worker writes the mask into (server-minted). */
+  output_dir: string;
+  result_mask_id?: string;
+  result_mask_name?: string;
+  result_mask_color?: string;
   case_id?: number;
   dicom_id?: number;
-  /** Mask identifier for result mirror. */
+  /** Applied user mask id. */
   mask_id?: string;
+  /** 'primary' | 'native'. */
+  result_frame?: string;
+  min_volume_cm3?: number;
+  boundary_smoothing?: boolean;
+  boundary_smoothing_strength?: string;
+  bbox?: Array<number>;
+  prompt?: string;
+  axis?: number;
+  threshold?: number;
+  nms_iou?: number;
+  window_center?: number;
+  window_width?: number;
+  volume_threshold?: number;
+  merge_regions?: boolean;
+  fill_empty_slices?: boolean;
+  max_fill_gap?: number;
+  target?: string;
+  modality?: string;
+  label_prompt?: Array<number>;
+  intensity_refine?: boolean;
+  grow_max_distance?: number;
+  grow_shrink_voxels?: number;
+  grow_gradient_threshold?: number;
+  grow_intensity_sigma?: number;
+  grow_debug?: boolean;
+  smooth_edge?: boolean;
+  smooth_seeds?: boolean;
+  output_ext?: string;
+  fast?: boolean;
+  seed_slice?: number;
+  seed_box?: Array<number>;
+  medsam2_modality?: string;
+  labels?: Array<string>;
 }
 
 /**
@@ -189,6 +231,7 @@ export interface TaskParamsByType {
   'model_initializing': ModelInitializingParams;
   'cinematic_baking': CinematicBakingParams;
   'gs_build': GsBuildParams;
+  'gs4d_build': GsBuildParams;
   'segmentation': SegmentationParams;
   'deploy_case': DeployCaseParams;
   'generate_synthetic': GenerateSyntheticParams;

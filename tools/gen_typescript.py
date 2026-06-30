@@ -145,8 +145,18 @@ export interface TaskEnvelope {
 
 def _emit_schemas() -> str:
     parts = ["// Task param schemas ---------------------------------------", ""]
+    # Emit each named interface exactly once. Two TaskType keys can share one
+    # Pydantic model via an alias (e.g. GS4D_BUILD -> Gs4dBuildParams = GsBuildParams);
+    # model_cls.__name__ is identical for both, so emitting per-registry-entry
+    # would duplicate `export interface GsBuildParams` and break TS compilation.
+    # Track seen names so aliases render once; every key still appears in the
+    # TaskParamsByType map below.
+    seen_interfaces: set[str] = set()
     for tt, model_cls in TASK_PARAMS_SCHEMAS.items():
         interface_name = model_cls.__name__
+        if interface_name in seen_interfaces:
+            continue
+        seen_interfaces.add(interface_name)
         schema = model_cls.model_json_schema()
         defs = schema.get("$defs") or {}
         parts.append(_render_interface(interface_name, schema, defs))
