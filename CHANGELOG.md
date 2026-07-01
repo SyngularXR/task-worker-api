@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**New:**
+- `FakeBackendClient` now supports in-memory remote-mode file transfer.
+  `download_file` / `upload_file` no longer raise `NotImplementedError`:
+  stage virtual inputs with `queue_file(task_id, filename, content)` and
+  assert on the public `uploaded_files` dict (keyed by
+  `(task_id, filename) -> bytes`). Lets worker test suites (colmap-splat,
+  Neural-Canvas, Blender-CLI) exercise the `input_files` remote path
+  without `httpx.MockTransport`. Downloads of unstaged files raise
+  `FileNotFoundError`, mirroring a backend 404.
+
 **Fixes:**
 - Register `TaskType.GS4D_BUILD` in `TASK_PARAMS_SCHEMAS` (via the
   `Gs4dBuildParams = GsBuildParams` alias). The enum member was added in

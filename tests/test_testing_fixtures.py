@@ -140,19 +140,100 @@ async def test_queue_task_preserves_case_id_and_item_key():
 
 
 @pytest.mark.asyncio
-async def test_download_file_raises_not_implemented(tmp_path):
+async def test_download_file_writes_staged_content(tmp_path):
     fake = FakeBackendClient()
-    with pytest.raises(NotImplementedError):
-        await fake.download_file(1, "input.stl", tmp_path / "out.stl")
+    fake.queue_file(1, "input.stl", b"stl-bytes")
+    dest = tmp_path / "out.stl"
+    await fake.download_file(1, "input.stl", dest)
+    assert dest.read_bytes() == b"stl-bytes"
 
 
 @pytest.mark.asyncio
-async def test_upload_file_raises_not_implemented(tmp_path):
+async def test_download_file_creates_parent_dirs(tmp_path):
+    """prepare_inputs writes into work_dir/in/<filename>; dest may not exist yet."""
     fake = FakeBackendClient()
-    src = tmp_path / "out.stl"
-    src.write_bytes(b"data")
-    with pytest.raises(NotImplementedError):
-        await fake.upload_file(1, "output.stl", src)
+    fake.queue_file(1, "mesh.ply", b"ply-data")
+    dest = tmp_path / "in" / "mesh.ply"
+    await fake.download_file(1, "mesh.ply", dest)
+    assert dest.read_bytes() == b"ply-data"
+
+
+@pytest.mark.asyncio
+async def test_download_file_accepts_str_content(tmp_path):
+    fake = FakeBackendClient()
+    fake.queue_file(1, "notes.txt", "hello world")
+    dest = tmp_path / "notes.txt"
+    await fake.download_file(1, "notes.txt", dest)
+    assert dest.read_bytes() == b"hello world"
+
+
+@pytest.mark.asyncio
+async def test_download_file_raises_file_not_found_for_unstaged(tmp_path):
+    fake = FakeBackendClient()
+    with pytest.raises(FileNotFoundError):
+        await fake.download_file(1, "missing.stl", tmp_path / "out.stl")
+
+
+@pytest.mark.asyncio
+async def test_download_file_scoped_per_task(tmp_path):
+    """The same filename staged for task 1 must not be served for task 2."""
+    fake = FakeBackendClient()
+    fake.queue_file(1, "input.stl", b"task-one")
+    dest = tmp_path / "out.stl"
+    await fake.download_file(1, "input.stl", dest)
+    assert dest.read_bytes() == b"task-one"
+    with pytest.raises(FileNotFoundError):
+        await fake.download_file(2, "input.stl", dest)
+
+
+@pytest.mark.asyncio
+async def test_upload_file_captures_bytes(tmp_path):
+    fake = FakeBackendClient()
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"result-bytes")
+    await fake.upload_file(1, "output.stl", src)
+    assert fake.uploaded_files == {(1, "output.stl"): b"result-bytes"}
+
+
+@pytest.mark.asyncio
+async def test_upload_file_overwrites_on_resend(tmp_path):
+    fake = FakeBackendClient()
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"v1")
+    await fake.upload_file(1, "output.stl", src)
+    src.write_bytes(b"v2")
+    await fake.upload_file(1, "output.stl", src)
+    assert fake.uploaded_files[(1, "output.stl")] == b"v2"
+
+
+@pytest.mark.asyncio
+async def test_upload_file_scoped_per_task_and_filename(tmp_path):
+    fake = FakeBackendClient()
+    src_a = tmp_path / "a.stl"
+    src_a.write_bytes(b"aaa")
+    src_b = tmp_path / "b.stl"
+    src_b.write_bytes(b"bbb")
+    await fake.upload_file(1, "a.stl", src_a)
+    await fake.upload_file(2, "b.stl", src_b)
+    assert fake.uploaded_files == {
+        (1, "a.stl"): b"aaa",
+        (2, "b.stl"): b"bbb",
+    }
+
+
+@pytest.mark.asyncio
+async def test_roundtrip_download_then_upload(tmp_path):
+    """Exercises the full prepare_inputs→handler→upload_outputs remote path."""
+    fake = FakeBackendClient()
+    fake.queue_file(7, "scene.ply", b"scene-bytes")
+    downloaded = tmp_path / "scene.ply"
+    await fake.download_file(7, "scene.ply", downloaded)
+    assert downloaded.read_bytes() == b"scene-bytes"
+
+    produced = tmp_path / "preview.png"
+    produced.write_bytes(b"png-bytes")
+    await fake.upload_file(7, "preview.png", produced)
+    assert fake.uploaded_files[(7, "preview.png")] == b"png-bytes"
 
 
 @pytest.mark.asyncio
