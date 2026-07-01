@@ -25,6 +25,12 @@ class FakeBackendClient:
         self.failed_tasks: list[dict] = []
         self.progress_events: list[dict] = []
         self.cancelled_task_ids: set[int] = set()
+        # Virtual file store for remote-mode tests. Inputs staged via
+        # ``queue_file`` are keyed by (task_id, filename); downloads read
+        # from here. Uploads are captured in ``uploaded_files`` so test
+        # suites can assert on produced artifacts without mocking HTTP.
+        self._files: dict[tuple[int, str], bytes] = {}
+        self.uploaded_files: dict[tuple[int, str], bytes] = {}
 
     # ----- test-side API ------------------------------------------
 
@@ -52,6 +58,18 @@ class FakeBackendClient:
     def mark_cancelled(self, task_id: int) -> None:
         """Simulate a user cancel — next cancel poll will report cancelled."""
         self.cancelled_task_ids.add(task_id)
+
+    def queue_file(self, task_id: int, filename: str, content: "bytes | str") -> None:
+        """Stage a virtual input file for ``download_file`` to serve.
+
+        Remote-mode tests call this to seed the inputs a handler expects,
+        instead of mocking HTTP. ``content`` may be ``str`` (encoded utf-8)
+        or raw ``bytes``. A download for an unstaged (task_id, filename)
+        raises ``FileNotFoundError``, mirroring a 404 from the real backend.
+        """
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        self._files[(task_id, filename)] = content
 
     # ----- BackendClient protocol ---------------------------------
 
@@ -91,16 +109,29 @@ class FakeBackendClient:
         self.failed_tasks.append({"task_id": task_id, "error": error})
 
     async def download_file(self, task_id: int, filename: str, dest: Path) -> None:
-        raise NotImplementedError(
-            "FakeBackendClient has no file transfer — use local mode "
-            "(task.params.input_path) in tests."
-        )
+        """Serve a file previously staged via :meth:`queue_file`.
+
+        Writes the staged bytes to ``dest`` (matching the real backend's
+        stream-to-disk contract). Raises ``FileNotFoundError`` for an
+        unstaged (task_id, filename) — the in-memory analogue of a 404.
+        """
+        key = (task_id, filename)
+        if key not in self._files:
+            raise FileNotFoundError(
+                f"FakeBackendClient has no staged file for task {task_id} "
+                f"named {filename!r} — call queue_file() to seed it."
+            )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self._files[key])
 
     async def upload_file(self, task_id: int, filename: str, src: Path) -> None:
-        raise NotImplementedError(
-            "FakeBackendClient has no file transfer — use local mode "
-            "(task.params.input_path) in tests."
-        )
+        """Capture an uploaded artifact in :attr:`uploaded_files`.
+
+        Reads the source file bytes (as the real backend would receive
+        them) and stores them keyed by (task_id, filename) so test suites
+        can assert on produced outputs without a live HTTP endpoint.
+        """
+        self.uploaded_files[(task_id, filename)] = src.read_bytes()
 
     async def close(self) -> None:
         pass

@@ -458,6 +458,42 @@ This covers the full loop: schema validation, file staging, handler
 execution, completion reporting, heartbeat calls. No real HTTP, no
 real backend. Run it in normal `pytest`, no docker-compose needed.
 
+### Remote-mode (file transfer) tests
+
+The example above uses `input_path` (local mode). To test a handler
+that consumes `input_files` (remote mode — the SDK downloads inputs
+via `client.download_file` and uploads outputs via `client.upload_file`),
+stage virtual files with `queue_file` and assert on `uploaded_files`:
+
+```python
+@pytest.mark.asyncio
+async def test_remote_mode_happy_path(tmp_path):
+    fake = FakeBackendClient()
+    task = fake.queue_task(
+        task_type=TaskType.POINTCLOUD_PREVIEW,
+        params={"input_files": {"mesh": "input.ply"},
+                "width": 256, "height": 256},
+    )
+    fake.queue_file(task.id, "input.ply", b"ply\nformat ascii 1.0\nend_header\n")
+
+    worker = Worker(
+        backend_url="http://fake/api/v1", api_key="k", worker_id="t",
+        handlers={TaskType.POINTCLOUD_PREVIEW: pointcloud_preview.run},
+        work_dir=str(tmp_path / "work"),
+        client=fake,
+    )
+    await worker.run_one()
+
+    assert fake.failed_tasks == []
+    # Outputs are captured in uploaded_files keyed by (task_id, filename).
+    assert fake.uploaded_files[(task.id, "preview.png")] == b"<png bytes>"
+```
+
+`queue_file(task_id, filename, content)` accepts `bytes` or `str`.
+`download_file` for an unstaged `(task_id, filename)` raises
+`FileNotFoundError` (the in-memory analogue of a backend 404), so
+missing-input bugs surface the same way they would in production.
+
 For integration testing against a real backend, `task-worker-api`'s
 own repo has a docker-compose fixture at `tests/integration/` you
 can adapt.
