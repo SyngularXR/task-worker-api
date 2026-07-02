@@ -3,6 +3,14 @@
 ## Unreleased
 
 **New:**
+- Test coverage for `BackendClient._request` retry/backoff logic and the real
+  (non-Fake) `download_file`/`upload_file` HTTP paths (`tests/test_client_retry.py`).
+  The retry-on-transient-error contract — retry count, exponential backoff
+  scheduling, exhaustion re-raise, and non-retryable-error pass-through — was
+  previously untested. Also adds the first coverage of `run_hybrid`
+  (`tests/test_run_hybrid.py`): concurrent app+worker lifecycle, clean
+  cancellation when either side exits, and exception propagation semantics.
+
 - `FakeBackendClient` now supports in-memory remote-mode file transfer.
   `download_file` / `upload_file` no longer raise `NotImplementedError`:
   stage virtual inputs with `queue_file(task_id, filename, content)` and
