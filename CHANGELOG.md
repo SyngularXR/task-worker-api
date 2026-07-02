@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Fixes:**
+- `BackendClient.download_file` now retries on transient transport errors
+  (`httpx.TransportError` / `httpx.TimeoutException`) with the same
+  exponential backoff as every other backend call. It was the only API
+  method that streamed directly via `httpx.AsyncClient.stream`, bypassing
+  the retry loop in `_request`, so a network hiccup during file transfer
+  failed the task outright instead of recovering. Each retry attempt
+  re-opens the destination with `"wb"` (truncating), so a mid-stream
+  failure followed by a successful retry produces a correct file. The
+  shared backoff loop was extracted into `_retry` (used by both `_request`
+  and `download_file`); non-transient HTTP status errors (404/500) still
+  surface immediately without consuming retry budget.
+
 **New:**
 - Test coverage for `BackendClient._request` retry/backoff logic and the real
   (non-Fake) `download_file`/`upload_file` HTTP paths (`tests/test_client_retry.py`).
@@ -10,6 +23,9 @@
   previously untested. Also adds the first coverage of `run_hybrid`
   (`tests/test_run_hybrid.py`): concurrent app+worker lifecycle, clean
   cancellation when either side exits, and exception propagation semantics.
+  Now extended to cover the `download_file` retry path (transport error
+  recovery, timeout recovery, retry exhaustion, non-transient pass-through,
+  backoff scheduling, and clean-file-after-midstream-retry).
 
 - `FakeBackendClient` now supports in-memory remote-mode file transfer.
   `download_file` / `upload_file` no longer raise `NotImplementedError`:
