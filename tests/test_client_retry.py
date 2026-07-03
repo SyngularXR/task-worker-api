@@ -408,3 +408,165 @@ async def test_upload_file_raises_on_500(tmp_path):
     with pytest.raises(httpx.HTTPStatusError):
         await client.upload_file(9, "output.stl", src)
     await client.close()
+
+
+# -----------------------------------------------------------------------
+# upload_file retry — the file handle must be re-opened on each attempt.
+# Before the fix, open() was called once *outside* the retry loop; httpx
+# consumed the handle to EOF on the first attempt, so every retry sent
+# zero bytes (silent data corruption).
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_file_retries_on_transport_error_then_succeeds(tmp_path):
+    """A transient TransportError on the first upload attempt must not
+    bubble up if a later attempt succeeds, and the backend must receive
+    the full file body on the successful attempt."""
+    body = b"\x00\x01\x02" * 500
+    calls = {"n": 0}
+    received: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.TransportError("transient hiccup")
+        received.append(await request.aread())
+        return httpx.Response(200)
+
+    src = tmp_path / "output.stl"
+    src.write_bytes(body)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert calls["n"] == 3
+    # The successful attempt must have received the *full* body, not zero
+    # bytes (which is what the pre-fix exhausted-file-handle bug produced).
+    assert body in received[0]
+
+
+@pytest.mark.asyncio
+async def test_upload_file_retries_on_timeout_then_succeeds(tmp_path):
+    """TimeoutException during upload is retryable."""
+    body = b"payload"
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.TimeoutException("write timed out")
+        return httpx.Response(200)
+
+    src = tmp_path / "output.stl"
+    src.write_bytes(body)
+
+    client = _client_with_handler(handler, max_retries=3)
+    await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_upload_file_raises_after_exhausting_retries(tmp_path):
+    """When every upload attempt raises a transient error, the last
+    exception is re-raised."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.TransportError("persistent failure")
+
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"data")
+
+    client = _client_with_handler(handler, max_retries=3)
+    with pytest.raises(httpx.TransportError, match="persistent failure"):
+        await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_upload_file_does_not_retry_non_transient_http_status(tmp_path):
+    """A 500 response becomes an HTTPStatusError via raise_for_status, which
+    is NOT retryable — it must surface immediately without retry budget."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"data")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_file_uses_exponential_backoff(monkeypatch, tmp_path):
+    """The delay between upload retries must follow retry_backoff_s*2**n."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TransportError("keep failing")
+
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"data")
+
+    client = _client_with_handler(
+        handler, max_retries=4, retry_backoff_s=2.0,
+    )
+    with pytest.raises(httpx.TransportError):
+        await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert sleeps == [2.0 * 2**0, 2.0 * 2**1, 2.0 * 2**2]
+
+
+@pytest.mark.asyncio
+async def test_upload_file_sends_full_body_after_retry(tmp_path):
+    """The core regression test: after a transient failure on the first
+    attempt, the retried attempt must send the *complete* file body —
+    not zero bytes.  Before the fix, the file handle was opened once
+    outside the retry loop; httpx read it to EOF on attempt 1, so the
+    retry sent an empty body and the upload silently succeeded with
+    corrupt (empty) data."""
+    body = b"ABCDEFGH" * 64
+    calls = {"n": 0}
+    received_bodies: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Consume the request body (as httpx would) then fail, so the
+            # file handle is exhausted before the retry.
+            await request.aread()
+            raise httpx.TransportError("dropped after read")
+        received_bodies.append(await request.aread())
+        return httpx.Response(200)
+
+    src = tmp_path / "output.stl"
+    src.write_bytes(body)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert calls["n"] == 2
+    # The retried attempt must contain the full body — this fails with
+    # the old code because the exhausted file handle yields zero bytes.
+    assert body in received_bodies[0]
