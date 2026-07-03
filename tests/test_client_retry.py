@@ -374,6 +374,79 @@ async def test_download_file_writes_clean_file_after_midstream_retry(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_download_file_removes_partial_file_on_retry_exhaustion(tmp_path):
+    """When every download attempt fails, any partial file left at dest by a
+    mid-stream failure must be removed — callers should never see a
+    truncated/stale artifact from a failed download.
+
+    Simulates the real-world scenario: a transport error after the file was
+    opened and partially written.  MockTransport can't deliver partial bytes
+    then fail mid-stream, so we pre-seed dest with stale content (exactly what
+    a mid-stream failure would leave behind) and verify it's cleaned up when
+    the download ultimately fails.
+    """
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.TransportError("persistent failure")
+
+    client = _client_with_handler(handler, max_retries=3)
+    dest = tmp_path / "out.ply"
+    # Simulate a partial file left behind by a mid-stream failure on a prior
+    # call, or stale content from a previous run at the same path.
+    dest.write_bytes(b"STALE PARTIAL CONTENT")
+
+    with pytest.raises(httpx.TransportError, match="persistent failure"):
+        await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 3
+    # The stale/partial file must be removed — no truncated artifact left behind.
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_file_removes_dest_on_non_transient_error(tmp_path):
+    """A non-retryable error (e.g. 404) must also clean up dest — a prior
+    partial download or a pre-existing stale file at that path should not
+    survive a failed download_file call."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(404, text="not found")
+
+    client = _client_with_handler(handler, max_retries=4)
+    dest = tmp_path / "out.ply"
+    dest.write_bytes(b"STALE CONTENT FROM A PREVIOUS RUN")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.download_file(5, "missing.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 1
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_file_cleanup_does_not_affect_successful_download(tmp_path):
+    """The cleanup-on-failure path must not interfere with a successful
+    download: dest must contain the full body after a clean download."""
+    body = b"\x00\x01\x02" * 100
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "out.ply"
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert dest.read_bytes() == body
+
+
+@pytest.mark.asyncio
 async def test_upload_file_sends_multipart_put(tmp_path):
     """The real upload_file must PUT the file as multipart form data."""
     src = tmp_path / "output.stl"
