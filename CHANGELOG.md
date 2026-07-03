@@ -3,6 +3,18 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient.upload_file` now retries on transient transport errors
+  (`httpx.TransportError` / `httpx.TimeoutException`) with the same
+  exponential backoff as every other backend call. Previously the source
+  file was opened **once outside** the retry loop; httpx consumed the
+  handle to EOF on the first attempt's request construction, so every
+  retry silently sent zero bytes — a data-corruption bug that produced
+  empty/truncated uploads after a transient network hiccup. The fix moves
+  `open()` inside a per-attempt `_upload_once` closure (mirroring
+  `download_file`'s `_stream_once` pattern), so each retry gets a fresh
+  file handle starting at byte 0. Non-transient HTTP status errors
+  (404/500) still surface immediately without consuming retry budget.
+
 - `BackendClient.download_file` now retries on transient transport errors
   (`httpx.TransportError` / `httpx.TimeoutException`) with the same
   exponential backoff as every other backend call. It was the only API

@@ -239,10 +239,26 @@ class BackendClient:
     async def upload_file(
         self, task_id: int, filename: str, src: Path,
     ) -> None:
-        """PUT /tasks/{id}/files/{filename} — multipart upload."""
-        with open(src, "rb") as f:
-            files = {"file": (filename, f)}
-            resp = await self._request(
-                "PUT", f"/tasks/{task_id}/files/{filename}", files=files,
-            )
-            resp.raise_for_status()
+        """PUT /tasks/{id}/files/{filename} — multipart upload.
+
+        Retries on the same transient transport errors as every other
+        backend call (``httpx.TransportError`` /
+        ``httpx.TimeoutException``).  The source file is opened **inside**
+        the per-attempt closure, so each retry gets a fresh handle
+        starting at byte 0 — opening it once outside the loop would
+        exhaust the handle on the first attempt and send zero bytes on
+        every subsequent retry (silent data corruption).  A non-transient
+        HTTP status error (e.g. 404/500) is raised immediately without
+        consuming retry budget, matching :meth:`_request`.
+        """
+        path = f"/tasks/{task_id}/files/{filename}"
+
+        async def _upload_once() -> None:
+            with open(src, "rb") as f:
+                files = {"file": (filename, f)}
+                resp = await self._client.request(
+                    "PUT", path, files=files,
+                )
+                resp.raise_for_status()
+
+        await self._retry(_upload_once, method="PUT", path=path)
