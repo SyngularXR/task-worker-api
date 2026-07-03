@@ -3,6 +3,18 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient.download_file` now removes any partial file left at `dest`
+  when the download fails (retries exhausted or a non-retryable HTTP error).
+  Previously, a mid-stream transport failure could leave a truncated file on
+  disk — each retry truncated via `"wb"` so a *successful* retry was clean,
+  but if all retries failed the last partial content survived at `dest`,
+  silently corrupting downstream consumers that checked `dest.exists()`.
+  The cleanup uses `dest.unlink()` in a `try/except` so a missing or
+  already-removed file is a no-op. The existing contract documented in
+  `test_download_file_raises_after_exhausting_retries` ("dest must not be
+  left as a partial file") now holds for the real-world mid-stream failure
+  case, not only for stream-establishment failures.
+
 - `BackendClient.upload_file` now retries on transient transport errors
   (`httpx.TransportError` / `httpx.TimeoutException`) with the same
   exponential backoff as every other backend call. Previously the source
@@ -37,7 +49,10 @@
   cancellation when either side exits, and exception propagation semantics.
   Now extended to cover the `download_file` retry path (transport error
   recovery, timeout recovery, retry exhaustion, non-transient pass-through,
-  backoff scheduling, and clean-file-after-midstream-retry).
+  backoff scheduling, and clean-file-after-midstream-retry) and the
+  partial-file cleanup on failure (stale/partial `dest` removal on both
+  retry exhaustion and non-transient errors, plus a guard that successful
+  downloads are unaffected).
 
 - `FakeBackendClient` now supports in-memory remote-mode file transfer.
   `download_file` / `upload_file` no longer raise `NotImplementedError`:

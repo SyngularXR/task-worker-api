@@ -224,6 +224,10 @@ class BackendClient:
         partial one.  A non-transient HTTP status error (e.g. 404/500) is
         raised immediately without consuming retry budget, matching
         :meth:`_request`.
+
+        If every attempt fails (retries exhausted or a non-retryable error),
+        any partial file left at ``dest`` is removed so callers never see a
+        truncated/stale artifact from a failed download.
         """
         path = f"/tasks/{task_id}/files/{filename}"
 
@@ -234,7 +238,18 @@ class BackendClient:
                     async for chunk in resp.aiter_bytes():
                         f.write(chunk)
 
-        await self._retry(_stream_once, method="GET", path=path)
+        try:
+            await self._retry(_stream_once, method="GET", path=path)
+        except Exception:
+            # A mid-stream transport failure can leave a partial file at dest
+            # (each retry truncates via "wb", but the final failed attempt's
+            # partial content survives). Remove it so a failed download never
+            # leaves a truncated/stale artifact behind.
+            try:
+                dest.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+            raise
 
     async def upload_file(
         self, task_id: int, filename: str, src: Path,
