@@ -68,10 +68,15 @@ class BackendClient:
 
     # ----- core request with retry ------------------------------------
 
-    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        """Request with exponential-backoff retry on transient transport errors.
+    async def _retry(self, fn, *, method: str, path: str):
+        """Run ``await fn()`` with exponential-backoff retry on transient errors.
 
-        Uses no third-party retry library to keep SDK dependencies minimal.
+        Shared by :meth:`_request` (buffered) and :meth:`download_file`
+        (streaming).  ``fn`` is re-invoked from scratch on every attempt, so
+        callers that mutate state mid-attempt (e.g. opening a file for write)
+        must be idempotent — ``download_file`` opens ``dest`` with ``"wb"``
+        which truncates, so a retry starts a clean file.
+
         The backoff is deterministic and bounded — ``max_retries`` attempts
         with ``retry_backoff_s * 2**n`` seconds between each.
         """
@@ -80,7 +85,7 @@ class BackendClient:
         last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
-                return await self._client.request(method, path, **kwargs)
+                return await fn()
             except _RETRYABLE_EXCEPTIONS as e:
                 last_exc = e
                 if attempt == self.max_retries - 1:
@@ -93,6 +98,17 @@ class BackendClient:
                 await asyncio.sleep(delay)
         assert last_exc is not None  # retries exhausted
         raise last_exc
+
+    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Request with exponential-backoff retry on transient transport errors.
+
+        Uses no third-party retry library to keep SDK dependencies minimal.
+        """
+        return await self._retry(
+            lambda: self._client.request(method, path, **kwargs),
+            method=method,
+            path=path,
+        )
 
     # ----- task lifecycle --------------------------------------------
 
@@ -199,14 +215,26 @@ class BackendClient:
     async def download_file(
         self, task_id: int, filename: str, dest: Path,
     ) -> None:
-        """GET /tasks/{id}/files/{filename} — streams to disk in 1 MB chunks."""
-        async with self._client.stream(
-            "GET", f"/tasks/{task_id}/files/{filename}",
-        ) as resp:
-            resp.raise_for_status()
-            with open(dest, "wb") as f:
-                async for chunk in resp.aiter_bytes():
-                    f.write(chunk)
+        """GET /tasks/{id}/files/{filename} — streams to disk in 1 MB chunks.
+
+        Retries on the same transient transport errors as every other backend
+        call (``httpx.TransportError`` / ``httpx.TimeoutException``).  Each
+        attempt re-opens ``dest`` with ``"wb"`` (truncating), so a retry after
+        a mid-stream failure writes a clean file rather than appending to a
+        partial one.  A non-transient HTTP status error (e.g. 404/500) is
+        raised immediately without consuming retry budget, matching
+        :meth:`_request`.
+        """
+        path = f"/tasks/{task_id}/files/{filename}"
+
+        async def _stream_once() -> None:
+            async with self._client.stream("GET", path) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    async for chunk in resp.aiter_bytes():
+                        f.write(chunk)
+
+        await self._retry(_stream_once, method="GET", path=path)
 
     async def upload_file(
         self, task_id: int, filename: str, src: Path,

@@ -235,6 +235,144 @@ async def test_download_file_raises_on_404(tmp_path):
     await client.close()
 
 
+# -----------------------------------------------------------------------
+# download_file retry — transient errors now get the same backoff as every
+# other backend call (this was the gap: download_file used _client.stream
+# directly, bypassing _request's retry loop).
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_file_retries_on_transport_error_then_succeeds(tmp_path):
+    """A transient TransportError on the first download attempt must not
+    bubble up if a later attempt succeeds, and dest must hold the full body."""
+    body = b"\x00\x01\x02" * 500
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.TransportError("transient hiccup")
+        return httpx.Response(200, content=body)
+
+    client = _client_with_handler(handler, max_retries=4)
+    dest = tmp_path / "out" / "scene.ply"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 3
+    assert dest.read_bytes() == body
+
+
+@pytest.mark.asyncio
+async def test_download_file_retries_on_timeout_then_succeeds(tmp_path):
+    """TimeoutException during stream establishment is retryable."""
+    body = b"payload"
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.TimeoutException("read timed out")
+        return httpx.Response(200, content=body)
+
+    client = _client_with_handler(handler, max_retries=3)
+    dest = tmp_path / "out.ply"
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 2
+    assert dest.read_bytes() == body
+
+
+@pytest.mark.asyncio
+async def test_download_file_raises_after_exhausting_retries(tmp_path):
+    """When every download attempt raises a transient error, the last
+    exception is re-raised and dest must not be left as a partial file."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.TransportError("persistent failure")
+
+    client = _client_with_handler(handler, max_retries=3)
+    dest = tmp_path / "out.ply"
+    with pytest.raises(httpx.TransportError, match="persistent failure"):
+        await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 3
+    # No partial file left behind from a failed stream.
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_file_does_not_retry_non_transient_http_status(tmp_path):
+    """A 500 response becomes an HTTPStatusError via raise_for_status, which
+    is NOT retryable — it must surface immediately without retry budget."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.download_file(5, "scene.ply", tmp_path / "out.ply")
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_download_file_uses_exponential_backoff(monkeypatch, tmp_path):
+    """The delay between download retries must follow retry_backoff_s*2**n."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TransportError("keep failing")
+
+    client = _client_with_handler(
+        handler, max_retries=4, retry_backoff_s=2.0,
+    )
+    with pytest.raises(httpx.TransportError):
+        await client.download_file(5, "scene.ply", tmp_path / "out.ply")
+    await client.close()
+
+    assert sleeps == [2.0 * 2**0, 2.0 * 2**1, 2.0 * 2**2]
+
+
+@pytest.mark.asyncio
+async def test_download_file_writes_clean_file_after_midstream_retry(tmp_path):
+    """A transient error partway through streaming must not corrupt the
+    final file: the retry re-opens dest with 'wb' (truncating), so the
+    successful attempt writes the complete body from the start."""
+    body = b"ABCDEFGH" * 64
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate a connection drop mid-stream by raising a transport
+            # error; MockTransport raises before any bytes are delivered.
+            raise httpx.TransportError("dropped mid-stream")
+        return httpx.Response(200, content=body)
+
+    client = _client_with_handler(handler, max_retries=4)
+    dest = tmp_path / "out.ply"
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 2
+    assert dest.read_bytes() == body
+
+
 @pytest.mark.asyncio
 async def test_upload_file_sends_multipart_put(tmp_path):
     """The real upload_file must PUT the file as multipart form data."""
