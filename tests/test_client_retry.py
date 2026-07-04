@@ -15,6 +15,7 @@ HTTP paths, which were previously only tested via the in-memory test double.
 from __future__ import annotations
 
 import asyncio
+import random
 
 import httpx
 import pytest
@@ -32,11 +33,15 @@ def _client_with_handler(
     *,
     max_retries: int = 4,
     retry_backoff_s: float = 0.0,
+    retry_backoff_max_s: float | None = None,
+    retry_jitter: bool = False,
 ) -> BackendClient:
     """Build a real BackendClient backed by a MockTransport handler.
 
     ``retry_backoff_s`` defaults to 0 so the exponential-backoff sleeps are
     instant — the timing is verified separately via a mocked ``asyncio.sleep``.
+    Jitter defaults to False so timing-assertion tests stay deterministic; the
+    jitter behaviour itself is covered by dedicated _backoff_delay unit tests.
     """
     transport = httpx.MockTransport(handler)
     http = httpx.AsyncClient(
@@ -44,12 +49,19 @@ def _client_with_handler(
         transport=transport,
         headers={"Authorization": "Bearer x"},
     )
+    kwargs: dict = {
+        "max_retries": max_retries,
+        "retry_backoff_s": retry_backoff_s,
+        "retry_jitter": retry_jitter,
+    }
+    # Keep the SDK default (60s cap) unless a test explicitly overrides it.
+    if retry_backoff_max_s is not None:
+        kwargs["retry_backoff_max_s"] = retry_backoff_max_s
     return BackendClient(
         "http://fake/api/v1",
         "x",
         client=http,
-        max_retries=max_retries,
-        retry_backoff_s=retry_backoff_s,
+        **kwargs,
     )
 
 
@@ -907,3 +919,125 @@ async def test_upload_file_does_not_retry_500(tmp_path):
     await client.close()
 
     assert calls["n"] == 1
+
+
+# -----------------------------------------------------------------------
+# Backoff cap + jitter — without a cap, retry_backoff_s * 2**n grows without
+# bound: a supported max_retries=8 with the default base would sleep 256s on
+# the penultimate attempt, blocking the worker's event loop for ~10 minutes on
+# a single claim/complete call. Without jitter, the three fleet workers
+# (Neural-Canvas, Blender-CLI, colmap-splat) retry on the identical
+# deterministic schedule, re-overloading the backend the instant it recovers
+# (thundering herd). The cap bounds individual delays; jitter decorrelates
+# them. Both are additive and default-on; retry_jitter=False / an explicit
+# retry_backoff_max_s recover the legacy deterministic behaviour for tests.
+# -----------------------------------------------------------------------
+
+
+def test_backoff_delay_caps_exponential_growth():
+    """_backoff_delay must clamp to max_s once 2**n overtakes it."""
+    from task_worker_api.client import _backoff_delay
+
+    # base=2, attempt=7 → 2*128 = 256; cap at 30 → 30.
+    assert _backoff_delay(7, base_s=2.0, max_s=30.0, jitter=False) == 30.0
+    # attempt=2 → 2*4 = 8; under cap → unchanged.
+    assert _backoff_delay(2, base_s=2.0, max_s=30.0, jitter=False) == 8.0
+
+
+def test_backoff_delay_no_cap_when_max_is_none():
+    """max_s=None disables the cap — legacy unbounded behaviour."""
+    from task_worker_api.client import _backoff_delay
+
+    assert _backoff_delay(10, base_s=2.0, max_s=None, jitter=False) == 2048.0
+
+
+def test_backoff_delay_zero_base_yields_zero():
+    """A zero base (the test default) produces zero delay — no sleep spam."""
+    from task_worker_api.client import _backoff_delay
+
+    assert _backoff_delay(5, base_s=0.0, max_s=60.0, jitter=False) == 0.0
+
+
+def test_backoff_delay_jitter_stays_within_spread_band():
+    """Jittered delays must fall within [d*(1-0.25), d*(1+0.25)]."""
+    from task_worker_api.client import _JITTER_SPREAD, _backoff_delay
+
+    # attempt=2, base=2 → 2*4 = 8.0 un-jittered.
+    for _ in range(200):
+        d = _backoff_delay(2, base_s=2.0, max_s=60.0, jitter=True)
+        assert 8.0 * (1 - _JITTER_SPREAD) <= d <= 8.0 * (1 + _JITTER_SPREAD)
+
+
+def test_backoff_delay_jitter_is_deterministic_with_injected_rng():
+    """An injected rng makes jitter reproducible — used by the cap+retry test."""
+    from task_worker_api.client import _backoff_delay
+
+    rng = random.Random(1234)
+    d1 = _backoff_delay(2, base_s=2.0, max_s=60.0, jitter=True, rng=rng)
+    rng2 = random.Random(1234)
+    d2 = _backoff_delay(2, base_s=2.0, max_s=60.0, jitter=True, rng=rng2)
+    assert d1 == d2
+
+
+def test_backoff_delay_no_jitter_on_zero_delay():
+    """Jitter must not inflate a zero delay (base=0 → always 0, even jittered)."""
+    from task_worker_api.client import _backoff_delay
+
+    assert _backoff_delay(3, base_s=0.0, max_s=60.0, jitter=True) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_request_caps_backoff_at_max(monkeypatch):
+    """The cap must clamp each inter-attempt sleep to retry_backoff_max_s.
+
+    With base=2, max_retries=8, the un-capped schedule would be
+    [2, 4, 8, 16, 32, 64, 128] — the last two exceed a 30s cap. Jitter is
+    disabled so the assertion is exact.
+    """
+    from task_worker_api.client import _backoff_delay
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TransportError("keep failing")
+
+    client = _client_with_handler(
+        handler, max_retries=8, retry_backoff_s=2.0,
+        retry_backoff_max_s=30.0,
+    )
+    with pytest.raises(httpx.TransportError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    expected = [
+        _backoff_delay(n, 2.0, 30.0, False) for n in range(7)
+    ]
+    assert sleeps == expected
+    # The cap actually bit: the last two un-capped values (64, 128) are 30.
+    assert sleeps[-2:] == [30.0, 30.0]
+
+
+def test_init_rejects_non_positive_backoff_max():
+    """A non-positive retry_backoff_max_s is degenerate — fail fast."""
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
+        BackendClient("http://fake", "x", retry_backoff_max_s=0)
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
+        BackendClient("http://fake", "x", retry_backoff_max_s=-5)
+
+
+def test_init_accepts_none_backoff_max():
+    """retry_backoff_max_s=None disables the cap — valid (legacy behaviour)."""
+    client = BackendClient("http://fake", "x", retry_backoff_max_s=None)
+    assert client.retry_backoff_max_s is None
+
+
+def test_init_defaults_backoff_max_and_jitter():
+    """The new params default to a 60s cap and jitter on."""
+    client = BackendClient("http://fake", "x")
+    assert client.retry_backoff_max_s == 60.0
+    assert client.retry_jitter is True

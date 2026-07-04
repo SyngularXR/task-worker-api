@@ -8,6 +8,7 @@ the pre-SDK shape — this client consolidates three divergent copies
 from __future__ import annotations
 
 import logging
+import random
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -37,10 +38,59 @@ _RETRYABLE_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 # 4xx is excluded for the same reason (client error, retrying won't help).
 _TRANSIENT_STATUS_CODES = frozenset({502, 503, 504})
 
+# Default ceiling for a single retry delay. Without a cap, backoff grows as
+# ``retry_backoff_s * 2**n`` — unbounded. A worker configured with the
+# (supported) ``max_retries=8`` and the default ``retry_backoff_s=2.0`` would
+# wait 256s on the 7th retry, blocking its event loop for ~10 minutes on a
+# single claim/complete call. The cap keeps individual delays sane while still
+# allowing long total retry windows across many attempts. Consumers can raise
+# it via ``retry_backoff_max_s`` if they genuinely want longer waits.
+_DEFAULT_BACKOFF_MAX_S = 60.0
+
+# Jitter spread: each delay is multiplied by a uniform random factor in
+# ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
+# band — enough to decorrelate the fleet (Neural-Canvas, Blender-CLI,
+# colmap-splat all poll the same backend) without making delays unpredictable
+# enough to mask scheduling bugs in tests.
+_JITTER_SPREAD = 0.25
+
 
 def _is_transient_status(exc: httpx.HTTPStatusError) -> bool:
     """True iff a status error's code is a transiently-retryable gateway code."""
     return exc.response.status_code in _TRANSIENT_STATUS_CODES
+
+
+def _backoff_delay(
+    attempt: int,
+    base_s: float,
+    max_s: Optional[float],
+    jitter: bool,
+    *,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """Compute one retry delay: capped exponential backoff with optional jitter.
+
+    The base schedule is ``base_s * 2**attempt`` (deterministic, matching the
+    pre-existing contract). Two guards make it production-safe across a fleet:
+
+    - **Cap**: the delay is clamped to ``max_s`` so a high ``max_retries``
+      can't produce a single multi-minute sleep.
+    - **Jitter**: when enabled, the (capped) delay is multiplied by a uniform
+      random factor in ``[1 - _JITTER_SPREAD, 1 + _JITTER_SPREAD]``. The three
+      fleet workers share one backend; without jitter they'd all retry on the
+      identical deterministic schedule and re-overload it the instant it
+      recovers (thundering herd). Jitter decorrelates them.
+
+    ``rng`` is injectable so tests can assert on exact delays deterministically.
+    """
+    delay = base_s * (2**attempt)
+    if max_s is not None and delay > max_s:
+        delay = max_s
+    if jitter and delay > 0:
+        r = rng if rng is not None else random
+        factor = 1.0 + r.uniform(-_JITTER_SPREAD, _JITTER_SPREAD)
+        delay *= factor
+    return delay
 
 
 class BackendClient:
@@ -59,6 +109,8 @@ class BackendClient:
         timeout_s: float = 30.0,
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
+        retry_backoff_max_s: float = _DEFAULT_BACKOFF_MAX_S,
+        retry_jitter: bool = True,
         client: Optional[httpx.AsyncClient] = None,
         payload_logger: Optional["PayloadLogger"] = None,
     ):
@@ -76,6 +128,22 @@ class BackendClient:
             )
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
+        # Cap on a single inter-attempt delay. Exponential backoff without a
+        # cap grows without bound (2**n); a degenerate but supported config
+        # (high max_retries) would otherwise block the worker's event loop for
+        # minutes on one call. None disables the cap for consumers that want
+        # the legacy unbounded behaviour, but the default bounds it.
+        if retry_backoff_max_s is not None and retry_backoff_max_s <= 0:
+            raise ValueError(
+                f"retry_backoff_max_s must be > 0 (got {retry_backoff_max_s}); "
+                "pass None to disable the cap."
+            )
+        self.retry_backoff_max_s = retry_backoff_max_s
+        # Jitter decorrelates retries across the fleet so a shared transient
+        # outage doesn't produce a synchronized retry storm the instant the
+        # backend recovers. Default on; tests that assert on exact delays pass
+        # retry_jitter=False.
+        self.retry_jitter = retry_jitter
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url,
@@ -115,8 +183,11 @@ class BackendClient:
           errors (500, 4xx) surface immediately without consuming retry
           budget, matching the pre-existing non-transient pass-through contract.
 
-        The backoff is deterministic and bounded — ``max_retries`` attempts
-        with ``retry_backoff_s * 2**n`` seconds between each.
+        The backoff is exponential (``retry_backoff_s * 2**n``), capped at
+        ``retry_backoff_max_s`` so a high ``max_retries`` can't block the
+        worker for minutes on one call, and jittered (±25%) so the fleet's
+        workers don't retry in lockstep and re-overload the backend the
+        instant it recovers. ``max_retries`` attempts fire in total.
         """
         import asyncio
 
@@ -128,7 +199,10 @@ class BackendClient:
                 last_exc = e
                 if attempt == self.max_retries - 1:
                     break
-                delay = self.retry_backoff_s * (2**attempt)
+                delay = _backoff_delay(
+                    attempt, self.retry_backoff_s,
+                    self.retry_backoff_max_s, self.retry_jitter,
+                )
                 log.debug(
                     "transient %s on %s %s; retrying in %.1fs",
                     type(e).__name__, method, path, delay,
@@ -140,7 +214,10 @@ class BackendClient:
                 last_exc = e
                 if attempt == self.max_retries - 1:
                     break
-                delay = self.retry_backoff_s * (2**attempt)
+                delay = _backoff_delay(
+                    attempt, self.retry_backoff_s,
+                    self.retry_backoff_max_s, self.retry_jitter,
+                )
                 log.debug(
                     "transient HTTP %s on %s %s; retrying in %.1fs",
                     e.response.status_code, method, path, delay,
