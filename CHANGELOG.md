@@ -3,6 +3,21 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient` now retries transient 5xx gateway status codes (502/503/504)
+  with the same exponential backoff as transport errors. The backend sits
+  behind nginx; a 502/503/504 almost always means the Flask upstream restarted,
+  was momentarily overloaded, or the gateway timed out — a blip that clears in
+  seconds. Previously every `HTTPStatusError` (including these transient
+  gateway codes) surfaced immediately, failing the task on a momentary outage
+  that a single retry would have absorbed. 500 (the application's own error —
+  usually a logic bug or bad payload) and 4xx (client error) still surface
+  immediately without consuming retry budget, matching the existing
+  non-transient pass-through contract. The fix required moving
+  `raise_for_status()` *inside* the retry closure (it was previously called
+  after `_request` returned, so status errors never reached the retry loop);
+  `claim_next` now calls `_retry` directly with its own closure so it can still
+  treat 204/404 as success variants before any status check.
+
 - `BackendClient.__init__` now rejects `max_retries < 1` with a clear
   `ValueError` at construction. Previously, `max_retries=0` made the retry
   loop in `_retry` execute zero iterations, leaving `last_exc` as `None` and

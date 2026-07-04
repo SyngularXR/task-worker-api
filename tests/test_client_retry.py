@@ -678,3 +678,232 @@ def test_init_accepts_max_retries_one():
 
     result = asyncio.run(client._retry(_ok, method="GET", path="/t"))
     assert result == "done"
+
+
+# -----------------------------------------------------------------------
+# Transient 5xx gateway retry — the backend sits behind nginx; a 502/503/504
+# almost always means the Flask upstream restarted or is momentarily
+# overloaded. Previously every HTTPStatusError (including these transient
+# gateway codes) surfaced immediately, failing the task on a blip that clears
+# in seconds. Now 502/503/504 are retried with the same backoff as transport
+# errors; 500 and 4xx still surface immediately (500 = app logic error, 4xx =
+# client error — retrying won't help).
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 503, 504])
+async def test_request_retries_on_transient_gateway_status_then_succeeds(status):
+    """A 502/503/504 from the gateway is transient (upstream restart/overload)
+    and must be retried with backoff, not failed immediately."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(status, text="Bad Gateway")
+        return httpx.Response(204)
+
+    client = _client_with_handler(handler, max_retries=4)
+    result = await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert result is None  # 204 → no task
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_request_does_not_retry_500():
+    """A 500 is the application's own error (logic bug / bad payload), not a
+    transient outage — it must surface immediately without retry budget."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 422])
+async def test_request_does_not_retry_4xx(status):
+    """4xx client errors are never transient — retrying won't change the
+    outcome, so they must surface immediately without retry budget.
+
+    claim_next treats 404 as no-task (returns None); every other 4xx raises
+    HTTPStatusError. Either way only one attempt must fire."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(status, text="client error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    if status == 404:
+        result = await client.claim_next(
+            [TaskType.DETECT_CUT_PLANES], worker_id="w",
+        )
+        assert result is None
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.claim_next(
+                [TaskType.DETECT_CUT_PLANES], worker_id="w",
+            )
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_request_retries_5xx_then_raises_after_exhaustion():
+    """When every attempt returns a transient 5xx gateway code, the last
+    HTTPStatusError is re-raised to the caller."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, text="Service Unavailable")
+
+    client = _client_with_handler(handler, max_retries=3)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert calls["n"] == 3
+    assert exc_info.value.response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_request_5xx_uses_exponential_backoff(monkeypatch):
+    """The delay between 5xx retries must follow retry_backoff_s * 2**n,
+    the same schedule as transport-error retries."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="Bad Gateway")
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [2.0 * 2**0, 2.0 * 2**1, 2.0 * 2**2]
+
+
+@pytest.mark.asyncio
+async def test_download_file_retries_on_503_then_succeeds(tmp_path):
+    """A 503 during download establishment is transient and must be retried;
+    the successful retry writes the full body to dest."""
+    body = b"\x00\x01\x02" * 200
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(200, content=body)
+
+    client = _client_with_handler(handler, max_retries=4)
+    dest = tmp_path / "out.ply"
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 3
+    assert dest.read_bytes() == body
+
+
+@pytest.mark.asyncio
+async def test_download_file_does_not_retry_500(tmp_path):
+    """A 500 during download is not transient — it must surface immediately."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.download_file(5, "scene.ply", tmp_path / "out.ply")
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_download_file_5xx_exhaustion_removes_partial_file(tmp_path):
+    """When every download attempt returns a transient 5xx, the last
+    HTTPStatusError is re-raised and any partial/stale file at dest is
+    removed — same cleanup contract as transport-error exhaustion."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(502, text="Bad Gateway")
+
+    client = _client_with_handler(handler, max_retries=3)
+    dest = tmp_path / "out.ply"
+    dest.write_bytes(b"STALE CONTENT FROM A PREVIOUS RUN")
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert calls["n"] == 3
+    assert exc_info.value.response.status_code == 502
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_file_retries_on_503_then_succeeds(tmp_path):
+    """A 503 during upload is transient and must be retried; the successful
+    retry sends the full body."""
+    body = b"\x00\x01\x02" * 200
+    calls = {"n": 0}
+    received: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503, text="Service Unavailable")
+        received.append(await request.aread())
+        return httpx.Response(200)
+
+    src = tmp_path / "output.stl"
+    src.write_bytes(body)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert calls["n"] == 3
+    assert body in received[0]
+
+
+@pytest.mark.asyncio
+async def test_upload_file_does_not_retry_500(tmp_path):
+    """A 500 during upload is not transient — it must surface immediately."""
+    calls = {"n": 0}
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"data")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert calls["n"] == 1
