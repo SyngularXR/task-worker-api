@@ -643,3 +643,38 @@ async def test_upload_file_sends_full_body_after_retry(tmp_path):
     # The retried attempt must contain the full body — this fails with
     # the old code because the exhausted file handle yields zero bytes.
     assert body in received_bodies[0]
+
+
+# -----------------------------------------------------------------------
+# max_retries validation — a value < 1 made the retry loop in _retry
+# never execute, so last_exc stayed None and the post-loop assert fired
+# with an opaque AssertionError that crashed the worker. The guard now
+# fails fast at construction with a clear ValueError.
+# -----------------------------------------------------------------------
+
+
+def test_init_rejects_max_retries_zero():
+    """max_retries=0 means zero attempts — the loop never runs and the
+    post-loop guard would fire. Reject at construction instead."""
+    with pytest.raises(ValueError, match="max_retries must be >= 1"):
+        BackendClient("http://fake", "x", max_retries=0)
+
+
+def test_init_rejects_negative_max_retries():
+    """Negative max_retries is equally degenerate."""
+    with pytest.raises(ValueError, match="max_retries must be >= 1"):
+        BackendClient("http://fake", "x", max_retries=-3)
+
+
+def test_init_accepts_max_retries_one():
+    """max_retries=1 means exactly one attempt (no retries) — valid."""
+    client = BackendClient("http://fake", "x", max_retries=1)
+    assert client.max_retries == 1
+    # _retry must work: one attempt, success.
+    import asyncio
+
+    async def _ok():
+        return "done"
+
+    result = asyncio.run(client._retry(_ok, method="GET", path="/t"))
+    assert result == "done"

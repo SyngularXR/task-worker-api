@@ -3,6 +3,17 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient.__init__` now rejects `max_retries < 1` with a clear
+  `ValueError` at construction. Previously, `max_retries=0` made the retry
+  loop in `_retry` execute zero iterations, leaving `last_exc` as `None` and
+  tripping a bare `assert last_exc is not None` — an opaque `AssertionError`
+  that crashed the worker process. `max_retries` is the total number of
+  attempts (not retries on top of one), so `< 1` is degenerate and should
+  never reach the retry loop. The `_retry` method's post-loop `assert` was
+  also replaced with an explicit `RuntimeError` guard (a bare `assert` is
+  stripped under `python -O`, which would turn the crash into a silent
+  `None`-return). Every current consumer uses the default `max_retries=4`,
+  so the validation only fires on new misconfigurations.
 - `Worker.__init__` now validates that an externally-supplied `client`'s
   `base_url` is compatible with the worker's `backend_url` (equal, or one is
   a prefix of the other, ignoring trailing slashes). A mismatch silently
