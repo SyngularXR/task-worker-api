@@ -46,6 +46,16 @@ class BackendClient:
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        # max_retries is the total number of *attempts* (not retries-on-top-of-
+        # one). A value < 1 means the retry loop in _retry never executes, so
+        # last_exc stays None and the post-loop assert fires — an opaque
+        # AssertionError that crashes the worker. Fail fast at construction
+        # with a clear message instead.
+        if max_retries < 1:
+            raise ValueError(
+                f"max_retries must be >= 1 (got {max_retries}); "
+                "it is the total number of attempts, not retries on top of one."
+            )
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
         self._owns_client = client is None
@@ -96,7 +106,16 @@ class BackendClient:
                     type(e).__name__, method, path, delay,
                 )
                 await asyncio.sleep(delay)
-        assert last_exc is not None  # retries exhausted
+        # last_exc is guaranteed non-None here because __init__ rejects
+        # max_retries < 1, so the loop always executes at least once. The
+        # explicit guard avoids a bare assert (which is stripped under -O
+        # and produces an opaque AssertionError otherwise) and documents
+        # the invariant for readers.
+        if last_exc is None:  # pragma: no cover — unreachable per __init__ guard
+            raise RuntimeError(
+                f"_retry completed without an attempt or exception "
+                f"(max_retries={self.max_retries}); this is a bug."
+            )
         raise last_exc
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
