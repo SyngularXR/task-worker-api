@@ -24,6 +24,24 @@ log = logging.getLogger(__name__)
 # Transient error classes that get retried with exponential backoff.
 _RETRYABLE_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 
+# HTTP status codes that represent a *transiently* unavailable upstream and
+# therefore warrant a retry. The backend sits behind nginx; a 502/503/504 on
+# a worker request almost always means the Flask app restarted, the gateway
+# timed out, or the upstream connection was refused — a blip that clears in
+# seconds. Retrying these (instead of failing the task outright) lets a worker
+# ride through a backend redeploy or a momentary load spike.
+#
+# 500 is intentionally excluded: a 500 is the application's own error
+# response, which usually signals a logic bug or a bad payload, not a
+# transient outage — retrying it just burns budget and re-logs the same error.
+# 4xx is excluded for the same reason (client error, retrying won't help).
+_TRANSIENT_STATUS_CODES = frozenset({502, 503, 504})
+
+
+def _is_transient_status(exc: httpx.HTTPStatusError) -> bool:
+    """True iff a status error's code is a transiently-retryable gateway code."""
+    return exc.response.status_code in _TRANSIENT_STATUS_CODES
+
 
 class BackendClient:
     """Async HTTP client bound to one SynPusher backend URL + one worker key.
@@ -87,6 +105,16 @@ class BackendClient:
         must be idempotent — ``download_file`` opens ``dest`` with ``"wb"``
         which truncates, so a retry starts a clean file.
 
+        Retries two classes of transient failure:
+
+        - ``httpx.TransportError`` / ``httpx.TimeoutException`` — the request
+          never reached the backend or the connection dropped.
+        - ``httpx.HTTPStatusError`` whose status is a transient gateway code
+          (502/503/504) — the gateway is up but the upstream Flask app is
+          momentarily unavailable (restart, overload, deploy). Other status
+          errors (500, 4xx) surface immediately without consuming retry
+          budget, matching the pre-existing non-transient pass-through contract.
+
         The backoff is deterministic and bounded — ``max_retries`` attempts
         with ``retry_backoff_s * 2**n`` seconds between each.
         """
@@ -106,6 +134,18 @@ class BackendClient:
                     type(e).__name__, method, path, delay,
                 )
                 await asyncio.sleep(delay)
+            except httpx.HTTPStatusError as e:
+                if not _is_transient_status(e):
+                    raise
+                last_exc = e
+                if attempt == self.max_retries - 1:
+                    break
+                delay = self.retry_backoff_s * (2**attempt)
+                log.debug(
+                    "transient HTTP %s on %s %s; retrying in %.1fs",
+                    e.response.status_code, method, path, delay,
+                )
+                await asyncio.sleep(delay)
         # last_exc is guaranteed non-None here because __init__ rejects
         # max_retries < 1, so the loop always executes at least once. The
         # explicit guard avoids a bare assert (which is stripped under -O
@@ -119,15 +159,25 @@ class BackendClient:
         raise last_exc
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        """Request with exponential-backoff retry on transient transport errors.
+        """Request with exponential-backoff retry on transient errors.
 
-        Uses no third-party retry library to keep SDK dependencies minimal.
+        Retries ``httpx.TransportError`` / ``httpx.TimeoutException`` and
+        transient 5xx gateway status codes (502/503/504); other HTTP status
+        errors surface immediately. Uses no third-party retry library to keep
+        SDK dependencies minimal.
+
+        ``raise_for_status()`` runs *inside* the retry closure so a transient
+        5xx is seen by ``_retry`` and retried. ``claim_next`` does not use this
+        method — it calls ``_retry`` directly with its own closure so it can
+        treat 204/404 as success variants before any status check.
         """
-        return await self._retry(
-            lambda: self._client.request(method, path, **kwargs),
-            method=method,
-            path=path,
-        )
+
+        async def _do_request() -> httpx.Response:
+            resp = await self._client.request(method, path, **kwargs)
+            resp.raise_for_status()
+            return resp
+
+        return await self._retry(_do_request, method=method, path=path)
 
     # ----- task lifecycle --------------------------------------------
 
@@ -145,17 +195,31 @@ class BackendClient:
         types_str = ",".join(
             t.value if hasattr(t, "value") else str(t) for t in task_types
         )
-        resp = await self._request(
-            "GET", "/tasks/next",
-            params={"types": types_str, "worker_id": worker_id},
-        )
+        path = "/tasks/next"
+        params = {"types": types_str, "worker_id": worker_id}
+
+        # claim_next treats 204 (no task) and 404 (older backend without the
+        # /tasks/next route) as success variants, so it can't reuse _request's
+        # blanket raise_for_status. It calls _retry directly with a closure
+        # that returns the response for 204/404 and raises for everything else
+        # — so a transient 502/503/504 is still retried here, matching every
+        # other backend call.
+        async def _claim_once() -> Optional[httpx.Response]:
+            resp = await self._client.request(
+                "GET", path, params=params,
+            )
+            if resp.status_code in (204, 404):
+                return resp
+            resp.raise_for_status()
+            return resp
+
+        resp = await self._retry(_claim_once, method="GET", path=path)
         if resp.status_code == 204:
             return None
         if resp.status_code == 404:
             # Older backends without /tasks/next return 404; treat as no-task.
             log.warning("backend %s has no /tasks/next", self.base_url)
             return None
-        resp.raise_for_status()
 
         try:
             body = resp.json()
@@ -204,7 +268,6 @@ class BackendClient:
         resp = await self._request(
             "PUT", f"/tasks/{task_id}/progress", json=body,
         )
-        resp.raise_for_status()
         return resp.json() or {}
 
     async def get_cancel_status(self, task_id: int) -> dict:
@@ -212,22 +275,19 @@ class BackendClient:
         resp = await self._request(
             "GET", f"/tasks/{task_id}/cancel-status",
         )
-        resp.raise_for_status()
         return resp.json() or {}
 
     async def complete(self, task_id: int, result: dict) -> None:
         """PUT /tasks/{id}/complete — final success payload."""
-        resp = await self._request(
+        await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
         )
-        resp.raise_for_status()
 
     async def fail(self, task_id: int, error: str) -> None:
         """PUT /tasks/{id}/fail — final failure payload."""
-        resp = await self._request(
+        await self._request(
             "PUT", f"/tasks/{task_id}/fail", json={"error": error},
         )
-        resp.raise_for_status()
 
     # ----- file transfer (remote mode workers) ----------------------
 
@@ -236,13 +296,13 @@ class BackendClient:
     ) -> None:
         """GET /tasks/{id}/files/{filename} — streams to disk in 1 MB chunks.
 
-        Retries on the same transient transport errors as every other backend
-        call (``httpx.TransportError`` / ``httpx.TimeoutException``).  Each
-        attempt re-opens ``dest`` with ``"wb"`` (truncating), so a retry after
-        a mid-stream failure writes a clean file rather than appending to a
-        partial one.  A non-transient HTTP status error (e.g. 404/500) is
-        raised immediately without consuming retry budget, matching
-        :meth:`_request`.
+        Retries on the same transient errors as every other backend call
+        (``httpx.TransportError`` / ``httpx.TimeoutException``, plus transient
+        5xx gateway status codes 502/503/504).  Each attempt re-opens ``dest``
+        with ``"wb"`` (truncating), so a retry after a mid-stream failure
+        writes a clean file rather than appending to a partial one.  A
+        non-transient HTTP status error (e.g. 404/500) is raised immediately
+        without consuming retry budget, matching :meth:`_request`.
 
         If every attempt fails (retries exhausted or a non-retryable error),
         any partial file left at ``dest`` is removed so callers never see a
@@ -275,15 +335,15 @@ class BackendClient:
     ) -> None:
         """PUT /tasks/{id}/files/{filename} — multipart upload.
 
-        Retries on the same transient transport errors as every other
-        backend call (``httpx.TransportError`` /
-        ``httpx.TimeoutException``).  The source file is opened **inside**
-        the per-attempt closure, so each retry gets a fresh handle
-        starting at byte 0 — opening it once outside the loop would
-        exhaust the handle on the first attempt and send zero bytes on
-        every subsequent retry (silent data corruption).  A non-transient
-        HTTP status error (e.g. 404/500) is raised immediately without
-        consuming retry budget, matching :meth:`_request`.
+        Retries on the same transient errors as every other backend call
+        (``httpx.TransportError`` / ``httpx.TimeoutException``, plus transient
+        5xx gateway status codes 502/503/504).  The source file is opened
+        **inside** the per-attempt closure, so each retry gets a fresh handle
+        starting at byte 0 — opening it once outside the loop would exhaust
+        the handle on the first attempt and send zero bytes on every
+        subsequent retry (silent data corruption).  A non-transient HTTP
+        status error (e.g. 404/500) is raised immediately without consuming
+        retry budget, matching :meth:`_request`.
         """
         path = f"/tasks/{task_id}/files/{filename}"
 
