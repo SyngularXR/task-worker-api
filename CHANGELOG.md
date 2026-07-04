@@ -3,6 +3,20 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient` retry backoff is now capped and jittered. The exponential
+  schedule (`retry_backoff_s * 2**n`) grew without bound: a supported
+  `max_retries=8` with the default `retry_backoff_s=2.0` would sleep 256s on
+  the penultimate attempt, blocking the worker's event loop for ~10 minutes on
+  a single `claim_next` / `complete` call. A new `retry_backoff_max_s`
+  parameter (default `60.0`) clamps each inter-attempt delay; pass `None` to
+  recover the legacy unbounded behaviour. A new `retry_jitter` parameter
+  (default `True`) applies ±25% random jitter to each delay, decorrelating
+  retries across the fleet — Neural-Canvas, Blender-CLI, and colmap-splat all
+  poll the same backend, so without jitter they retry in lockstep and
+  re-overload it the instant it recovers (thundering herd). Both parameters
+  are additive and backward-compatible; existing consumers see no behavioural
+  change at the default `max_retries=4` (delays 2/4/8s stay well under the cap,
+  and jitter only spreads them within ±25%).
 - `BackendClient` now retries transient 5xx gateway status codes (502/503/504)
   with the same exponential backoff as transport errors. The backend sits
   behind nginx; a 502/503/504 almost always means the Flask upstream restarted,
