@@ -158,6 +158,35 @@ class Worker:
                 "update task-worker-api or register one locally"
             )
 
+        # Fail fast on misconfiguration: when an external client is supplied,
+        # its base URL must match (equal or be a prefix of) the worker's
+        # backend_url. A mismatch silently routes every request to the wrong
+        # endpoint — claim, complete, and file transfer all hit a host that
+        # doesn't know this worker_id, so tasks are claimed-but-never-completed
+        # or completed-against-the-wrong-tenant. Real BackendClient always
+        # carries base_url; test doubles (FakeBackendClient) may not, and are
+        # skipped — they don't make real HTTP calls, so URL provenance is moot.
+        client_base_url = getattr(self._client, "base_url", None)
+        if client_base_url is not None:
+            client_norm = str(client_base_url).rstrip("/")
+            worker_norm = self.backend_url.rstrip("/")
+            if not (
+                client_norm == worker_norm
+                or worker_norm.startswith(client_norm + "/")
+                or client_norm.startswith(worker_norm + "/")
+            ):
+                log.warning(
+                    "backend_url %r and client base_url %r disagree; "
+                    "requests will hit the wrong endpoint.",
+                    self.backend_url, client_base_url,
+                )
+                raise ProtocolError(
+                    f"backend_url {self.backend_url!r} and the supplied "
+                    f"client's base_url {client_base_url!r} are not "
+                    f"compatible; the client must target the same backend. "
+                    f"Pass a client whose base_url matches backend_url."
+                )
+
     def _build_payload_logger(self) -> PayloadLogger:
         """Construct a PayloadLogger from env + shared_volume_path.
 

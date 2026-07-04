@@ -3,6 +3,19 @@
 ## Unreleased
 
 **Fixes:**
+- `Worker.__init__` now validates that an externally-supplied `client`'s
+  `base_url` is compatible with the worker's `backend_url` (equal, or one is
+  a prefix of the other, ignoring trailing slashes). A mismatch silently
+  routed every request — claim, complete, file transfer — to the wrong
+  endpoint: tasks were claimed-but-never-completed or completed against the
+  wrong tenant, with no error until an operator noticed the missing activity.
+  The guard logs a warning and raises `ProtocolError` at construction time,
+  surfacing the misconfiguration at boot. The check is skipped for clients
+  without a `base_url` attribute (e.g. `FakeBackendClient`), which make no
+  real HTTP calls, so the test double remains a true drop-in. Every current
+  consumer that passes `client=` passes one with a matching base URL, so the
+  validation only fires on new misconfigurations.
+
 - `BackendClient.download_file` now removes any partial file left at `dest`
   when the download fails (retries exhausted or a non-retryable HTTP error).
   Previously, a mid-stream transport failure could leave a truncated file on
