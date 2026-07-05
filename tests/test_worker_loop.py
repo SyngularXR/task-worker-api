@@ -17,6 +17,7 @@ from task_worker_api import (
     Worker,
 )
 from task_worker_api.schemas import TASK_PARAMS_SCHEMAS, DetectCutPlanesParams
+from task_worker_api.testing import FakeBackendClient
 
 
 @pytest.mark.asyncio
@@ -305,3 +306,145 @@ async def test_worker_writes_typed_record_even_on_schema_rejection(
     assert entry["params"]["input_file"] == "oops"
     # And the task itself was failed:
     assert len(fake_client.failed_tasks) == 1
+
+
+# ----- terminal-report failure visibility -----------------------------------
+#
+# The finally block in _run_one wraps the terminal complete()/fail() call in
+# try/except. BackendClient retries transient errors inside _retry, so an
+# exception reaching that except means retries were exhausted (backend down
+# longer than the retry window) or a non-transient error surfaced. Previously
+# the except was a bare `pass`, silently swallowing the failure: a task whose
+# handler succeeded and whose outputs uploaded fine, but whose complete()
+# call failed, was left in_progress on the backend with zero operator
+# visibility. The fix logs at ERROR (naming the task, the terminal method,
+# and the outcome) without re-raising — the polling loop must keep running
+# other tasks. These tests pin that contract.
+
+
+class _FlakyCompleteClient(FakeBackendClient):
+    """FakeBackendClient whose ``complete`` raises, simulating a terminal
+    report that fails after the BackendClient's own retries are exhausted."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def complete(self, task_id: int, result: dict) -> None:
+        raise self._exc
+
+
+class _FlakyFailClient(FakeBackendClient):
+    """FakeBackendClient whose ``fail`` raises, simulating the same on the
+    failure path."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def fail(self, task_id: int, error: str) -> None:
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_worker_logs_error_when_complete_report_fails(
+    make_worker, tmp_path, caplog,
+):
+    """A handler that succeeds but whose complete() call fails (backend down
+    past the retry window) must not crash the worker, and must be logged at
+    ERROR so the operator sees the task was never recorded as complete."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    flaky = _FlakyCompleteClient(RuntimeError("backend unreachable"))
+    flaky.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    with caplog.at_level("ERROR"):
+        worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    # The worker did not crash and did not record the completion.
+    assert flaky.completed_tasks == []
+    # An ERROR log surfaced the lost terminal report.
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(error_records) == 1
+    msg = error_records[0].getMessage()
+    assert "terminal complete report failed" in msg
+    assert "backend unreachable" in msg
+
+
+@pytest.mark.asyncio
+async def test_worker_logs_error_when_fail_report_fails(
+    make_worker, tmp_path, caplog,
+):
+    """A handler that raises, but whose fail() call also fails, must not crash
+    the worker and must be logged at ERROR — the handler error is otherwise
+    lost and the task stays in_progress with no trace."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    flaky = _FlakyFailClient(RuntimeError("backend unreachable"))
+    flaky.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        raise RuntimeError("handler boom")
+
+    with caplog.at_level("ERROR"):
+        worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    # The worker did not crash and did not record the failure.
+    assert flaky.failed_tasks == []
+    # Two ERROR records: one for the handler exception, one for the lost
+    # terminal report. The terminal-report one must name the fail method.
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    terminal_records = [
+        r for r in error_records if "terminal fail report failed" in r.getMessage()
+    ]
+    assert len(terminal_records) == 1
+    assert "backend unreachable" in terminal_records[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_worker_continues_polling_after_terminal_report_failure(
+    make_worker, tmp_path,
+):
+    """A failed terminal report on one task must not strand subsequent tasks:
+    the worker's polling loop must keep running. We verify by running two
+    tasks back-to-back where the first's complete() fails but the second's
+    backend is healthy."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+
+    # First client: complete() raises.
+    flaky = _FlakyCompleteClient(RuntimeError("transient outage"))
+    flaky.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
+    # First task: handler succeeds, complete() fails — must not raise.
+    await worker.run_one()
+    assert flaky.completed_tasks == []
+
+    # Swap in a healthy client for the second task and confirm the loop
+    # still processes it end-to-end. This exercises the non-raising contract:
+    # if the first failure had escaped, run_one() would have raised and this
+    # second cycle would never run.
+    healthy = FakeBackendClient()
+    healthy.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+    worker._client = healthy
+    await worker.run_one()
+    assert len(healthy.completed_tasks) == 1
+
