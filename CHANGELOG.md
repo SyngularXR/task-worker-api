@@ -3,6 +3,20 @@
 ## Unreleased
 
 **Fixes:**
+- `Worker._run_one` now logs at `ERROR` when the terminal `complete()` /
+  `fail()` call fails after the `BackendClient`'s own retries are exhausted.
+  Previously the `finally` block wrapped that call in a bare
+  `except Exception: pass`, silently swallowing the failure: a task whose
+  handler succeeded and whose outputs uploaded cleanly, but whose
+  `complete()` call failed (backend down longer than the retry window, or a
+  non-transient HTTP error), was left `in_progress` on the backend with zero
+  operator visibility — the sweeper would eventually mark it stale, but no
+  log line ever explained why. The fix surfaces the task id, the terminal
+  method (`complete`/`fail`), the lost outcome, and the exception at `ERROR`
+  level. The non-raising contract is preserved: a single failed terminal
+  report must not kill the polling loop and strand every subsequent task.
+  No public API change; existing consumers see new log lines only on the
+  failure path that was previously silent.
 - `BackendClient` retry backoff is now capped and jittered. The exponential
   schedule (`retry_backoff_s * 2**n`) grew without bound: a supported
   `max_retries=8` with the default `retry_backoff_s=2.0` would sleep 256s on

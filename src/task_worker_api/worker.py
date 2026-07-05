@@ -428,6 +428,29 @@ class Worker:
             # otherwise report the handler outcome. The guard makes this
             # exactly-once even against the watchdog's hard-exit path.
             if guard.claim():
+                # Determine the terminal method + payload up front so the
+                # except handler can log *which* report failed and on which
+                # task — a bare ``except: pass`` here was silently swallowing
+                # failures of the complete()/fail() call itself. BackendClient
+                # already retries transient transport/5xx errors inside
+                # _retry, so an exception reaching this block means retries
+                # were exhausted (backend down longer than the retry window)
+                # or a non-transient error surfaced. Either way the backend
+                # never learns the task's terminal status: a completed task
+                # stays "in_progress" until the sweeper marks it stale, and
+                # the operator had zero visibility. Surface it at ERROR so
+                # it's not invisible, while keeping the non-raising contract
+                # (the polling loop must keep running other tasks).
+                # ``terminal`` mirrors the branch the try-block will take, so
+                # the except handler can name the call that failed even when
+                # the exception fires before the method returns. ``fired`` wins
+                # over outcome because a timeout overrides a late completion.
+                if fired:
+                    terminal = "fail"
+                elif outcome[0] == "complete":
+                    terminal = "complete"
+                else:
+                    terminal = "fail"
                 try:
                     if fired:
                         await self._client.fail(
@@ -445,8 +468,21 @@ class Worker:
                         await self._client.fail(task.id, outcome[1])
                         if outcome[1] == "cancelled by user":
                             log.info("task %s cancelled by user", task.id)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as report_exc:  # noqa: BLE001
+                    # The terminal status call itself failed after exhausting
+                    # the client's own retries. Log at ERROR (not WARNING) —
+                    # this is a task whose handler outcome is *lost*: the
+                    # backend will leave it in_progress and eventually sweep
+                    # it as stale. The handler result was computed but never
+                    # delivered, so an operator needs to know which task and
+                    # which terminal method failed. We intentionally do NOT
+                    # re-raise: a single failed terminal report must not
+                    # kill the polling loop and strand every subsequent task.
+                    log.error(
+                        "task %s: terminal %s report failed after retries; "
+                        "backend did not record outcome=%r: %s",
+                        task.id, terminal, outcome[1], report_exc,
+                    )
             shutil.rmtree(task_dir, ignore_errors=True)
 
 
