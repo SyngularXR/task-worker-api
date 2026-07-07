@@ -96,6 +96,7 @@ class Worker:
         heartbeat_interval_s: float = 10.0,
         cancel_poll_interval_s: float = 2.0,
         request_timeout_s: float = 30.0,
+        file_timeout_s: float = 300.0,
         task_timeout_s: float = DEFAULT_TASK_TIMEOUT_S,
         task_timeouts: Optional[dict] = None,
         timeout_grace_s: float = 15.0,
@@ -126,6 +127,7 @@ class Worker:
         if client is None:
             self._client = BackendClient(
                 backend_url, api_key, timeout_s=request_timeout_s,
+                file_timeout_s=file_timeout_s,
                 payload_logger=self._payload_logger,
             )
         else:

@@ -138,3 +138,38 @@ def test_worker_init_skips_url_check_for_client_without_base_url(make_worker):
     # backend_url="http://fake/api/v1"; construction must succeed.
     worker = make_worker()
     assert worker.backend_url == "http://fake/api/v1"
+
+
+async def test_worker_init_threads_file_timeout_to_client():
+    """When Worker constructs its own BackendClient (no client= passed),
+    file_timeout_s must be forwarded so large file transfers get the
+    longer deadline rather than the 30s general request timeout."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+        file_timeout_s=600.0,
+    )
+    try:
+        assert worker._client._file_timeout is not None
+        assert worker._client._file_timeout.read == 600.0
+    finally:
+        await worker._client.close()
+
+
+async def test_worker_init_default_file_timeout_is_300():
+    """The default file_timeout_s (300s) must reach the BackendClient when
+    the Worker constructs one itself — a strict improvement over the old
+    single 30s timeout for every operation."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+    )
+    try:
+        assert worker._client._file_timeout is not None
+        assert worker._client._file_timeout.read == 300.0
+    finally:
+        await worker._client.close()
