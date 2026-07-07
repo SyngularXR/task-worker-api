@@ -148,6 +148,18 @@
   without `httpx.MockTransport`. Downloads of unstaged files raise
   `FileNotFoundError`, mirroring a backend 404.
 
+- Dedicated unit tests for `ProgressReporter` (`tests/test_progress.py`),
+  `CancelGuard` (`tests/test_cancel.py`), and the `watchdog` /proc-parsing
+  + Phase-2-SIGKILL + sync_fail-exception paths (`tests/test_watchdog.py`).
+  Previously these three modules had the lowest coverage in the package
+  (`progress` 71%, `cancel` 74%, `watchdog` 61%) with no dedicated test
+  files — they were exercised only indirectly through `Worker.run_one`
+  integration tests, leaving the heartbeat loop, cancel-poll error
+  tolerance, on_cancel hook exception handling, `/proc/<pid>/stat` parsing,
+  descendant-tree walk, PID-reuse skip logic, and the SIGKILL escalation
+  ladder untested. Overall package coverage rose from 88% to 95%;
+  `progress` and `cancel` are now 100%, `watchdog` 97%.
+
 **Fixes:**
 - Register `TaskType.GS4D_BUILD` in `TASK_PARAMS_SCHEMAS` (via the
   `Gs4dBuildParams = GsBuildParams` alias). The enum member was added in

@@ -173,3 +173,224 @@ def test_hard_exit_skips_sync_fail_if_guard_already_claimed():
     wd._thread.join(timeout=5)
     assert sync_fail == []          # guard was taken; no duplicate report
     assert len(hard_exit) == 1      # still hard-exits to recover the worker
+
+
+# ----- Phase 2 escalation (SIGKILL survivors) -------------------------------
+#
+# When SIGTERM doesn't free the loop within the grace window, the watchdog
+# re-enumerates and SIGKILLs the survivors before escalating to hard-exit.
+
+
+def test_sigkill_phase_when_sigterm_does_not_free_loop():
+    kill_calls, hard_exit = [], []
+    before = set()
+    after = {(11, "200")}
+    wd = _make_wd(timeout_s=0.05, grace_s=0.02,
+                  list_fn=lambda pid: after, kill_calls=kill_calls,
+                  hard_exit_calls=hard_exit, children_before=before)
+    wd.start()
+    wd._thread.join(timeout=5)   # never stopped → full ladder
+
+    assert wd.fired is True
+    assert len(kill_calls) == 2
+    assert kill_calls[0][1] == _SIGTERM
+    assert kill_calls[1][1] == _SIGKILL
+    assert kill_calls[0][0] == {(11, "200")}
+    assert kill_calls[1][0] == {(11, "200")}
+    assert len(hard_exit) == 1   # still hard-exits after SIGKILL
+
+
+def test_sync_fail_exception_does_not_block_hard_exit(caplog):
+    """If the injected sync_fail raises, the watchdog must log it and still
+    call on_hard_exit — otherwise the worker is stranded."""
+    hard_exit = []
+
+    def _boom_fail(err):
+        raise RuntimeError("fail channel broken")
+
+    wd = TaskWatchdog(
+        timeout_s=0.05, grace_s=0.02,
+        guard=TerminalGuard(),
+        sync_fail=_boom_fail,
+        on_hard_exit=lambda: hard_exit.append(True),
+        children_before=set(),
+        list_descendants_fn=lambda pid: set(),
+        kill_fn=lambda procs, sig: None,
+        tick_s=0.01,
+        worker_pid=1234,
+    )
+    with caplog.at_level("WARNING"):
+        wd.start()
+        wd._thread.join(timeout=5)
+
+    assert wd.fired is True
+    assert len(hard_exit) == 1
+    assert any("sync_fail failed" in r.message for r in caplog.records)
+
+
+# ----- _read_stat / list_descendants / kill_procs unit tests ----------------
+#
+# These exercise the /proc parsing logic without a real Linux process tree,
+# by monkeypatching open / os.listdir / os.kill.
+
+
+def test_read_stat_parses_ppid_and_starttime(monkeypatch):
+    """A well-formed /proc/<pid>/stat line must yield (ppid, starttime)."""
+    from task_worker_api import watchdog
+
+    # field 1 = pid (already known), field 2 = comm (can have spaces/parens),
+    # field 3 = state, field 4 = ppid ... field 22 = starttime.
+    # We craft a line where comm contains a closing paren + spaces to verify
+    # the rfind(")") split logic.
+    fake_line = "42 (my (proc) name) S 1 0 0 0 -1 4194304 100 0 0 0 1 2 0 0 20 0 1 0 9876543 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+
+    import builtins
+    real_open = builtins.open
+
+    class _FakeFile:
+        def __init__(self, text):
+            self._text = text
+
+        def read(self):
+            return self._text
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    def _fake_open(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith("/proc/") and path.endswith("/stat"):
+            return _FakeFile(fake_line)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+    result = watchdog._read_stat(42)
+    assert result == (1, "9876543")
+
+
+def test_read_stat_returns_none_on_oserror(monkeypatch):
+    """A missing or unreadable /proc/<pid>/stat must return None, not raise."""
+    from task_worker_api import watchdog
+
+    import builtins
+
+    def _fake_open(path, *args, **kwargs):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+    assert watchdog._read_stat(999) is None
+
+
+def test_read_stat_returns_none_on_malformed_line(monkeypatch):
+    """A line with no closing paren must return None, not crash."""
+    from task_worker_api import watchdog
+
+    import builtins
+
+    class _FakeFile:
+        def __init__(self, text):
+            self._text = text
+
+        def read(self):
+            return self._text
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    def _fake_open(path, *args, **kwargs):
+        return _FakeFile("no parens here at all")
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+    assert watchdog._read_stat(1) is None
+
+
+def test_list_descendants_walks_proc_tree(monkeypatch):
+    """list_descendants builds a parent→child map from /proc and returns the
+    full descendant set of the given pid."""
+    from task_worker_api import watchdog
+
+    # Simulate: pid 1 (init) → pid 100 → pid 101, 102.
+    # _read_stat returns (ppid, starttime).
+    stats = {
+        1: (0, "1"),
+        100: (1, "100"),
+        101: (100, "101"),
+        102: (100, "102"),
+        200: (1, "200"),  # sibling of 100, not a descendant of 100
+    }
+    monkeypatch.setattr(watchdog.os.path, "isdir", lambda p: p == "/proc")
+    monkeypatch.setattr(watchdog.os, "listdir", lambda d: ["1", "100", "101", "102", "200"])
+    monkeypatch.setattr(watchdog, "_read_stat", lambda pid: stats.get(pid))
+
+    descendants = watchdog.list_descendants(100)
+    pids = {pid for pid, _ in descendants}
+    assert pids == {101, 102}
+
+
+def test_list_descendants_empty_when_no_children(monkeypatch):
+    from task_worker_api import watchdog
+
+    stats = {1: (0, "1"), 50: (1, "50")}
+    monkeypatch.setattr(watchdog.os.path, "isdir", lambda p: p == "/proc")
+    monkeypatch.setattr(watchdog.os, "listdir", lambda d: ["1", "50"])
+    monkeypatch.setattr(watchdog, "_read_stat", lambda pid: stats.get(pid))
+
+    assert watchdog.list_descendants(999) == set()
+
+
+def test_list_descendants_returns_empty_on_listdir_oserror(monkeypatch):
+    """If os.listdir('/proc') raises, return an empty set (best-effort)."""
+    from task_worker_api import watchdog
+
+    monkeypatch.setattr(watchdog.os.path, "isdir", lambda p: p == "/proc")
+    monkeypatch.setattr(watchdog.os, "listdir", lambda d: (_ for _ in ()).throw(OSError("denied")))
+
+    assert watchdog.list_descendants(1) == set()
+
+
+def test_kill_procs_swallows_oserror(monkeypatch):
+    """os.kill raising OSError (process already exited) must be swallowed."""
+    from task_worker_api import watchdog
+
+    killed = []
+
+    def _fake_kill(pid, sig):
+        killed.append((pid, sig))
+        raise OSError("no such process")
+
+    # Make _read_stat return a matching starttime so the pid isn't skipped.
+    monkeypatch.setattr(watchdog, "_read_stat", lambda pid: (1, "999"))
+    monkeypatch.setattr(watchdog.os, "kill", _fake_kill)
+
+    # Should not raise.
+    watchdog.kill_procs({(42, "999")}, _SIGTERM)
+    assert killed == [(42, _SIGTERM)]
+
+
+def test_kill_procs_skips_pid_with_mismatched_starttime(monkeypatch):
+    """If the current starttime doesn't match (PID was reused), skip the kill."""
+    from task_worker_api import watchdog
+
+    killed = []
+    monkeypatch.setattr(watchdog, "_read_stat", lambda pid: (1, "different_time"))
+    monkeypatch.setattr(watchdog.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    watchdog.kill_procs({(42, "old_time")}, _SIGTERM)
+    assert killed == []  # skipped — starttime mismatch
+
+
+def test_kill_procs_skips_missing_pid(monkeypatch):
+    """If _read_stat returns None (process gone), skip the kill."""
+    from task_worker_api import watchdog
+
+    killed = []
+    monkeypatch.setattr(watchdog, "_read_stat", lambda pid: None)
+    monkeypatch.setattr(watchdog.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    watchdog.kill_procs({(42, "999")}, _SIGTERM)
+    assert killed == []
