@@ -3,6 +3,24 @@
 ## Unreleased
 
 **Fixes:**
+- `upload_outputs` now cleans up partial output artifacts when publishing
+  fails partway through. Previously, if the Nth file copy/upload raised
+  after files 1..N-1 had already been published, the partial artifacts
+  were left behind as orphans: in local mode a half-populated staging dir
+  (`shared_volume_path/temp/{task_id}/`) lingered indefinitely (the
+  backend's sweeper only removes staging dirs for tasks it recorded as
+  *complete*, and a failed task is retried from scratch); in remote mode
+  the already-uploaded files sat on the backend with no trace. A failed
+  task is retried, and without cleanup the retried run would re-publish
+  over the partials — but if the retry also failed, or the task was
+  cancelled, the orphans accumulated. The fix removes the whole staging
+  dir on a local-mode copy failure (mirroring the
+  `BackendClient.download_file` partial-file cleanup contract), and logs
+  the orphaned remote-mode uploads at `WARNING` (there is no backend
+  "delete output file" endpoint, so they are surfaced for operator
+  reconciliation and overwritten on retry). The exception still
+  propagates so the task is marked failed and retried cleanly. No public
+  API change.
 - `Worker._run_one` now logs at `ERROR` when the terminal `complete()` /
   `fail()` call fails after the `BackendClient`'s own retries are exhausted.
   Previously the `finally` block wrapped that call in a bare
