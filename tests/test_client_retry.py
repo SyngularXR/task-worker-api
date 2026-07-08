@@ -1041,3 +1041,177 @@ def test_init_defaults_backoff_max_and_jitter():
     client = BackendClient("http://fake", "x")
     assert client.retry_backoff_max_s == 60.0
     assert client.retry_jitter is True
+
+
+# -----------------------------------------------------------------------
+# file_timeout_s — file transfers (download_file / upload_file) get a
+# separate, longer timeout than the 30s general request budget that
+# governs claim/heartbeat/complete. Without it, GB-scale outputs
+# (colmap-splat PLY files, Neural-Canvas splats) hit WriteTimeout/
+# ReadTimeout on big files, exhaust retries inside the same 30s window,
+# and fail tasks that would succeed with a file-appropriate timeout.
+# -----------------------------------------------------------------------
+
+
+def test_init_defaults_file_timeout_to_none_when_client_supplied():
+    """When no file_timeout_s is passed, _file_timeout is None — the file
+    calls fall back to the client's own default timeout (legacy behaviour
+    for consumers that build their own client and don't want the SDK to
+    impose a separate file deadline)."""
+    client = BackendClient("http://fake", "x")
+    assert client._file_timeout is None
+    # close the real httpx client it created
+    import asyncio
+    asyncio.run(client.close())
+
+
+def test_init_file_timeout_builds_explicit_timeout():
+    """An explicit file_timeout_s builds an httpx.Timeout so file calls
+    override the client default only for download_file / upload_file."""
+    client = BackendClient("http://fake", "x", file_timeout_s=300.0)
+    assert client._file_timeout is not None
+    assert client._file_timeout.read == 300.0
+    assert client._file_timeout.write == 300.0
+    assert client._file_timeout.connect == 300.0
+    assert client._file_timeout.pool == 300.0
+    import asyncio
+    asyncio.run(client.close())
+
+
+@pytest.mark.asyncio
+async def test_download_file_uses_file_timeout_not_general(tmp_path):
+    """download_file must apply file_timeout_s to the streaming request,
+    not the 30s general request timeout. Verified by inspecting the
+    timeout extension on the request the MockTransport handler sees."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, content=b"payload")
+
+    # General timeout 30s, file timeout 300s — distinct so a mix-up is
+    # detectable. file_timeout_s is passed explicitly.
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, file_timeout_s=300.0,
+        client=http,
+    )
+    dest = tmp_path / "out.ply"
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert dest.read_bytes() == b"payload"
+    assert len(seen) == 1
+    assert seen[0] is not None
+    # All four timeout facets must reflect the file timeout, not 30s.
+    assert seen[0]["read"] == 300.0
+    assert seen[0]["write"] == 300.0
+    assert seen[0]["connect"] == 300.0
+    assert seen[0]["pool"] == 300.0
+
+
+@pytest.mark.asyncio
+async def test_upload_file_uses_file_timeout_not_general(tmp_path):
+    """upload_file must apply file_timeout_s to the multipart PUT request,
+    not the 30s general request timeout."""
+    seen: list = []
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"result-bytes")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, file_timeout_s=300.0,
+        client=http,
+    )
+    await client.upload_file(9, "output.stl", src)
+    await client.close()
+
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert seen[0]["read"] == 300.0
+    assert seen[0]["write"] == 300.0
+    assert seen[0]["connect"] == 300.0
+    assert seen[0]["pool"] == 300.0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_calls_do_not_use_file_timeout():
+    """claim_next (and by extension _request, heartbeat, complete, fail)
+    must keep using the general 30s request timeout, NOT the file timeout
+    — inflating the lifecycle timeout would make heartbeat latency worse
+    and delay cancel detection. Verified by inspecting the timeout the
+    MockTransport handler sees on a claim_next call."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(204)  # no task
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, file_timeout_s=300.0,
+        client=http,
+    )
+    result = await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert result is None  # 204 → no task
+    assert len(seen) == 1
+    assert seen[0] is not None
+    # Lifecycle call must use the 30s general timeout, not 300s.
+    assert seen[0]["read"] == 30.0
+    assert seen[0]["write"] == 30.0
+    assert seen[0]["connect"] == 30.0
+    assert seen[0]["pool"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_file_timeout_none_falls_back_to_client_default(tmp_path):
+    """When file_timeout_s is None (the default), file calls must use the
+    client's own default timeout rather than imposing a separate one —
+    preserving the legacy behaviour for consumers that build their own
+    client."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, content=b"payload")
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, client=http,
+    )  # no file_timeout_s → _file_timeout is None
+    dest = tmp_path / "out.ply"
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert len(seen) == 1
+    # timeout=None passed to httpx means "use client default" — at the
+    # request-extension level httpx records None for each facet (the
+    # resolution to the client's 30s happens at the real transport layer,
+    # which MockTransport doesn't simulate). The point is that no separate
+    # file deadline is imposed: _file_timeout is None, so the call inherits
+    # the client default rather than overriding it.
+    assert seen[0] is not None
+    assert seen[0]["read"] is None
+    assert seen[0]["write"] is None

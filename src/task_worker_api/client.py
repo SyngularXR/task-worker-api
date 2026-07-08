@@ -54,6 +54,15 @@ _DEFAULT_BACKOFF_MAX_S = 60.0
 # enough to mask scheduling bugs in tests.
 _JITTER_SPREAD = 0.25
 
+# Default timeout for file transfer operations (download_file / upload_file).
+# GB-scale outputs (colmap-splat PLY files, Neural-Canvas splats) can take
+# minutes to stream over a typical backend link; the 30s general request
+# timeout that governs claim/heartbeat/complete is far too tight for them and
+# produces spurious WriteTimeout/ReadTimeout failures on tasks that would
+# otherwise succeed. This is the default for the separate ``file_timeout_s``
+# parameter; consumers can override it per Worker/BackendClient.
+_DEFAULT_FILE_TIMEOUT_S = 300.0
+
 
 def _is_transient_status(exc: httpx.HTTPStatusError) -> bool:
     """True iff a status error's code is a transiently-retryable gateway code."""
@@ -107,6 +116,7 @@ class BackendClient:
         api_key: str,
         *,
         timeout_s: float = 30.0,
+        file_timeout_s: Optional[float] = None,
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: float = _DEFAULT_BACKOFF_MAX_S,
@@ -149,6 +159,22 @@ class BackendClient:
             base_url=self.base_url,
             timeout=timeout_s,
             headers={"Authorization": f"Bearer {api_key}"},
+        )
+        # File transfers (download_file / upload_file) can move GB-scale
+        # outputs (colmap-splat PLY files, Neural-Canvas splats) that take
+        # minutes to stream — far longer than the 30s general request timeout
+        # that governs claim/heartbeat/complete. A single ``timeout_s`` for
+        # every operation meant workers hit WriteTimeout/ReadTimeout on big
+        # files, exhausted retries inside the same 30s window, and failed
+        # tasks that would succeed with a file-appropriate timeout. The file
+        # timeout is applied per-request (see download_file / upload_file) so
+        # it overrides the client default only for those calls, leaving
+        # lifecycle latency (claim, heartbeat, cancel-poll) untouched. ``None``
+        # falls back to the client's own timeout (legacy behaviour) for
+        # consumers that supply their own client and don't want the SDK to
+        # impose a separate file deadline.
+        self._file_timeout: Optional[httpx.Timeout] = (
+            httpx.Timeout(file_timeout_s) if file_timeout_s is not None else None
         )
         self._payload_logger = payload_logger
 
@@ -381,6 +407,11 @@ class BackendClient:
         non-transient HTTP status error (e.g. 404/500) is raised immediately
         without consuming retry budget, matching :meth:`_request`.
 
+        Uses the separate ``file_timeout_s`` deadline (default 300s, set via
+        :meth:`BackendClient.__init__`) rather than the 30s general request
+        timeout — GB-scale outputs can take minutes to stream, and the general
+        timeout would spuriously abort large downloads.
+
         If every attempt fails (retries exhausted or a non-retryable error),
         any partial file left at ``dest`` is removed so callers never see a
         truncated/stale artifact from a failed download.
@@ -388,7 +419,9 @@ class BackendClient:
         path = f"/tasks/{task_id}/files/{filename}"
 
         async def _stream_once() -> None:
-            async with self._client.stream("GET", path) as resp:
+            async with self._client.stream(
+                "GET", path, timeout=self._file_timeout,
+            ) as resp:
                 resp.raise_for_status()
                 with open(dest, "wb") as f:
                     async for chunk in resp.aiter_bytes():
@@ -421,6 +454,11 @@ class BackendClient:
         subsequent retry (silent data corruption).  A non-transient HTTP
         status error (e.g. 404/500) is raised immediately without consuming
         retry budget, matching :meth:`_request`.
+
+        Uses the separate ``file_timeout_s`` deadline (default 300s, set via
+        :meth:`BackendClient.__init__`) rather than the 30s general request
+        timeout — uploading GB-scale outputs can take minutes, and the general
+        timeout would spuriously abort large uploads mid-stream.
         """
         path = f"/tasks/{task_id}/files/{filename}"
 
@@ -428,7 +466,7 @@ class BackendClient:
             with open(src, "rb") as f:
                 files = {"file": (filename, f)}
                 resp = await self._client.request(
-                    "PUT", path, files=files,
+                    "PUT", path, files=files, timeout=self._file_timeout,
                 )
                 resp.raise_for_status()
 

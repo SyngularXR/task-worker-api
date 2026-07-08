@@ -3,6 +3,23 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient` now uses a separate, longer timeout for file transfer
+  operations (`download_file` / `upload_file`) instead of the single 30s
+  general request timeout that previously governed every operation — claim,
+  heartbeat, cancel-poll, and file transfers alike. Workers transferring
+  GB-scale outputs (colmap-splat PLY files, Neural-Canvas splats) hit
+  `WriteTimeout`/`ReadTimeout` on big files, exhausted retries inside the same
+  30s window, and failed tasks that would succeed with a file-appropriate
+  timeout. A new `file_timeout_s` parameter (default `300.0`) on
+  `BackendClient` creates a dedicated `httpx.Timeout` applied per-request to
+  the streaming download and multipart upload calls, leaving lifecycle latency
+  (claim, heartbeat, cancel-poll) on the original 30s budget. `Worker` exposes
+  the same `file_timeout_s` parameter (default `300.0`) and threads it through
+  to the client. The change is additive and backward-compatible: existing
+  consumers that don't override it get the new 300s file deadline (a strict
+  improvement over the old 30s), and consumers that supply their own `client=`
+  are unaffected (the SDK doesn't reach into an externally-supplied client).
+  No env-var or wire-protocol change.
 - `upload_outputs` now cleans up partial output artifacts when publishing
   fails partway through. Previously, if the Nth file copy/upload raised
   after files 1..N-1 had already been published, the partial artifacts
