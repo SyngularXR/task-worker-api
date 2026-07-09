@@ -119,7 +119,7 @@ class BackendClient:
         file_timeout_s: Optional[float] = None,
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
-        retry_backoff_max_s: float = _DEFAULT_BACKOFF_MAX_S,
+        retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
         retry_jitter: bool = True,
         client: Optional[httpx.AsyncClient] = None,
         payload_logger: Optional["PayloadLogger"] = None,

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**Features:**
+- `Worker.__init__` now exposes the retry-tuning parameters
+  (`max_retries`, `retry_backoff_s`, `retry_backoff_max_s`, `retry_jitter`)
+  and threads them through to the `BackendClient` it constructs internally.
+  Previously these were only configurable via the undocumented `client=`
+  escape hatch — most production deployments use `Worker(...)` directly and
+  were locked into the default 4-attempt / 2s-base / 60s-cap / jitter-on
+  policy with no way to adjust. Now a worker that talks to a backend that
+  restarts frequently can raise `max_retries`, or a latency-sensitive worker
+  with a low retry budget can lower it, all from the simple constructor. The
+  defaults are unchanged (matching `BackendClient`'s defaults exactly), so
+  existing consumers see no behaviour change. Consumers that supply their
+  own `client=` are unaffected — the SDK still never reaches into an
+  externally-supplied client. `BackendClient.retry_backoff_max_s`'s type
+  annotation is widened from `float` to `Optional[float]` to reflect that
+  `None` (disable the cap) was always a supported value; no runtime change.
+
 **Fixes:**
 - `Worker._run_one` now starts the progress heartbeat *before*
   `prepare_inputs` instead of after it. Remote-mode input staging
