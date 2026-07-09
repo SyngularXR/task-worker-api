@@ -3,6 +3,24 @@
 ## Unreleased
 
 **Fixes:**
+- `Worker._run_one` now starts the progress heartbeat *before*
+  `prepare_inputs` instead of after it. Remote-mode input staging
+  (`prepare_inputs` downloading `task.params.input_files` via
+  `BackendClient.download_file`) can take minutes for GB-scale inputs —
+  colmap-splat PLY files, Neural-Canvas splats. Until now the heartbeat
+  only began once staging finished, so the task row's `updated_at` stayed
+  frozen at claim time for the entire download. If the backend's
+  stale-task sweeper ran with a threshold shorter than the download
+  duration, it marked the task stale and reclaimed it while the worker
+  was still fetching — the worker then processed and completed a task the
+  backend no longer owned, causing duplicate processing or silent result
+  loss. Starting the heartbeat first means the backend receives
+  continuous progress/heartbeat ticks throughout input staging. The
+  `finally` block already calls `progress.stop()`, so a failure inside
+  `prepare_inputs` still tears the heartbeat down cleanly (and a leaked
+  heartbeat task can't double-start the next task's reporter). No public
+  API change; existing consumers see only the improved liveness signal.
+
 - `BackendClient` now uses a separate, longer timeout for file transfer
   operations (`download_file` / `upload_file`) instead of the single 30s
   general request timeout that previously governed every operation — claim,

@@ -6,6 +6,7 @@ and cooperative cancel.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -17,7 +18,9 @@ from task_worker_api import (
     Worker,
 )
 from task_worker_api.schemas import TASK_PARAMS_SCHEMAS, DetectCutPlanesParams
+from task_worker_api.schemas._base import TaskParamsBase
 from task_worker_api.testing import FakeBackendClient
+from pydantic import ConfigDict
 
 
 @pytest.mark.asyncio
@@ -446,5 +449,131 @@ async def test_worker_continues_polling_after_terminal_report_failure(
     )
     worker._client = healthy
     await worker.run_one()
+    assert len(healthy.completed_tasks) == 1
+
+
+# ----- heartbeat-before-prepare_inputs ordering ------------------------------
+#
+# Remote-mode prepare_inputs downloads GB-scale input files (colmap-splat
+# PLYs, Neural-Canvas splats) that can take minutes. The heartbeat must be
+# ticking *during* that download or the backend's stale-task sweeper reclaims
+# the task while the worker is still fetching it. _run_one used to call
+# start_heartbeat() after prepare_inputs(); these tests pin the new order.
+#
+# The registered DetectCutPlanesParams schema uses extra="forbid" and requires
+# input_path, so it can't carry the ``input_files`` dict that triggers the
+# remote download path. We swap in a permissive schema for the test task type
+# (monkeypatch restores it after).
+
+
+class _PermissiveParams(TaskParamsBase):
+    model_config = ConfigDict(extra="allow")
+
+
+class _HeartbeatObservingClient(FakeBackendClient):
+    """Records how many progress (heartbeat) events had landed by the time
+    ``download_file`` ran, so a test can assert the heartbeat was already
+    active during input staging."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.progress_count_at_download: int | None = None
+
+    async def download_file(self, task_id, filename, dest):
+        # A real BackendClient.download_file suspends on network I/O while
+        # streaming bytes — that suspension is what lets the heartbeat task
+        # (created just before prepare_inputs) get dispatched by the event
+        # loop and tick. The FakeBackendClient writes bytes synchronously
+        # with no suspension, so without an explicit yield the heartbeat
+        # task never runs before download_file returns. Sleep briefly to
+        # model the I/O wait, then snapshot heartbeat activity.
+        await asyncio.sleep(0.05)
+        self.progress_count_at_download = len(self.progress_events)
+        await super().download_file(task_id, filename, dest)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_starts_before_prepare_inputs(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A remote-mode task (input_files) must have at least one heartbeat
+    tick recorded before download_file runs — i.e. start_heartbeat precedes
+    prepare_inputs. Without the reorder, progress_events is empty here and
+    the sweeper could reclaim the task mid-download."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    observer = _HeartbeatObservingClient()
+    task = observer.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"mesh": "scene.ply"}, "max_results": 1},
+    )
+    observer.queue_file(task.id, "scene.ply", b"pretend-PLY")
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    worker = make_worker(
+        client=observer,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        heartbeat_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    assert observer.progress_count_at_download is not None
+    assert observer.progress_count_at_download >= 1, (
+        "heartbeat must be active before prepare_inputs downloads inputs, "
+        "else the stale-task sweeper can reclaim the task mid-download"
+    )
+    assert len(observer.completed_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_stopped_after_prepare_inputs_failure(
+    make_worker, tmp_path, monkeypatch,
+):
+    """If prepare_inputs raises (e.g. a missing remote input / 404), the
+    heartbeat started ahead of it must still be torn down — the finally
+    block calls progress.stop() regardless of where the failure came from.
+    A leaked heartbeat task would outlive the task and double-start the next
+    one (start_heartbeat rejects a double start)."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    observer = _HeartbeatObservingClient()
+    observer.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        # input_files set but never staged via queue_file → download 404s.
+        params={"input_files": {"mesh": "missing.ply"}, "max_results": 1},
+    )
+
+    async def handler(ctx, params):  # pragma: no cover — never reached
+        return {"planes": []}
+
+    worker = make_worker(
+        client=observer,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        heartbeat_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    # The task failed (download raised FileNotFoundError) and was reported.
+    assert len(observer.failed_tasks) == 1
+    assert observer.progress_count_at_download is not None
+    assert observer.progress_count_at_download >= 1, (
+        "heartbeat must have started before the failed prepare_inputs"
+    )
+    # The heartbeat task object is cleared after stop(). A second run_one on
+    # the same worker must not blow up on a double start — which it would if
+    # stop() left the prior heartbeat task dangling. Run a healthy task next.
+    healthy = FakeBackendClient()
+    healthy.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"mesh": "ok.ply"}},
+    )
+    healthy.queue_file(healthy._queue[-1].id, "ok.ply", b"ok")
+    worker._client = healthy
+    ran = await worker.run_one()
+    assert ran is True
     assert len(healthy.completed_tasks) == 1
 
