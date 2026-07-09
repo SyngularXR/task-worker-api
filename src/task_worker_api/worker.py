@@ -332,7 +332,15 @@ class Worker:
             return None
 
     async def _run_one(self, task: ClaimedTask) -> None:
-        """Stage inputs → run handler under heartbeat + cancel guard → publish.
+        """Heartbeat → stage inputs → run handler under cancel guard → publish.
+
+        The heartbeat is started *before* ``prepare_inputs`` so the backend's
+        ``updated_at`` keeps ticking during the (potentially multi-minute)
+        remote input download. Without it, a long download of GB-scale
+        inputs (colmap-splat PLY files, Neural-Canvas splats) leaves the task
+        row unchanged since claim time, and the stale-task sweeper can
+        reclaim it while the worker is still fetching — the worker then
+        processes and completes a task the backend no longer owns.
 
         A per-task watchdog (when ``timeout`` > 0) enforces a wall-clock
         deadline off the event loop. Terminal reporting goes through a single
@@ -395,10 +403,17 @@ class Worker:
                     f"task.params failed schema validation on claim: {e}"
                 ) from e
 
+            # Start the heartbeat *before* staging inputs. Remote-mode
+            # prepare_inputs can spend minutes downloading GB-scale files
+            # (colmap-splat PLYs, Neural-Canvas splats); without heartbeat
+            # ticks during that window the backend's stale-task sweeper can
+            # reclaim the task while we're still fetching it. The finally
+            # block below always calls progress.stop(), so a failure in
+            # prepare_inputs still tears the heartbeat down cleanly.
+            await progress.start_heartbeat()
             file_ctx = await prepare_inputs(task, self._client, task_dir)
             ctx = TaskContext(task=task, files=file_ctx, progress=progress)
 
-            await progress.start_heartbeat()
             async with CancelGuard(
                 self._client, task.id,
                 poll_interval_s=self.cancel_poll_interval_s,
