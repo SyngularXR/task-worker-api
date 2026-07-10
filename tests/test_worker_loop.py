@@ -577,3 +577,108 @@ async def test_heartbeat_stopped_after_prepare_inputs_failure(
     assert ran is True
     assert len(healthy.completed_tasks) == 1
 
+
+# ----- cancel-guard-before-prepare_inputs ordering ---------------------------
+#
+# The CancelGuard must be active *during* prepare_inputs, not just after it.
+# Remote-mode prepare_inputs downloads GB-scale inputs (colmap-splat PLYs,
+# Neural-Canvas splats) that can take minutes; a user cancel during that
+# window must be detected and abort the download — not burn bandwidth to
+# completion before discovering the cancel. _run_one used to start the guard
+# only after prepare_inputs returned; these tests pin the new order.
+
+
+class _CancelDuringDownloadClient(FakeBackendClient):
+    """FakeBackendClient that marks the task cancelled after the first
+    download, so the cancel poll (running concurrently via CancelGuard)
+    picks it up and sets the event before the second download starts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._download_count = 0
+
+    async def download_file(self, task_id, filename, dest):
+        # Yield to the event loop so the CancelGuard's poll task can run
+        # and observe the cancelled state we set below.
+        await asyncio.sleep(0.02)
+        await super().download_file(task_id, filename, dest)
+        self._download_count += 1
+        if self._download_count == 1:
+            # Simulate a user cancel arriving after the first file lands.
+            self.cancelled_task_ids.add(task_id)
+            # Yield long enough for the CancelGuard poll task (running on
+            # the same event loop) to wake, call get_cancel_status, and
+            # set the ``cancelled`` event before prepare_inputs re-checks
+            # it at the top of the download loop.
+            await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_cancel_guard_active_during_prepare_inputs(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A user cancel that arrives during prepare_inputs (while downloading
+    inputs) must cause the task to fail as 'cancelled by user' — not
+    download every remaining file and then run the handler."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelDuringDownloadClient()
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"a": "a.ply", "b": "b.ply"}, "max_results": 1},
+    )
+    client.queue_file(task.id, "a.ply", b"pretend-PLY-a")
+    client.queue_file(task.id, "b.ply", b"pretend-PLY-b")
+
+    async def handler(ctx, params):  # pragma: no cover — must not run
+        raise AssertionError("handler must not run when cancelled during download")
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        heartbeat_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    # The task was reported as cancelled, not completed.
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled" in client.failed_tasks[0]["error"].lower()
+    # The handler never ran (no output produced), and the second file was
+    # not downloaded because prepare_inputs aborted between downloads.
+    assert client._download_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_guard_before_prepare_inputs_no_false_cancel(
+    make_worker, tmp_path, monkeypatch,
+):
+    """When no cancel is requested, starting the guard before prepare_inputs
+    must not cause a spurious TaskCancelled — the task completes normally
+    with all inputs downloaded."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = FakeBackendClient()
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"a": "a.ply", "b": "b.ply"}, "max_results": 1},
+    )
+    client.queue_file(task.id, "a.ply", b"pretend-PLY-a")
+    client.queue_file(task.id, "b.ply", b"pretend-PLY-b")
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    assert len(client.completed_tasks) == 1
+    assert client.failed_tasks == []
+

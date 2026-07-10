@@ -20,6 +20,22 @@
   `None` (disable the cap) was always a supported value; no runtime change.
 
 **Fixes:**
+- `Worker._run_one` now starts the `CancelGuard` *before* `prepare_inputs`
+  and threads its `cancelled` event into the input-download loop. Remote-mode
+  `prepare_inputs` (downloading `task.params.input_files` via
+  `BackendClient.download_file`) can spend minutes streaming GB-scale inputs
+  — colmap-splat PLY files, Neural-Canvas splats. Until now the cancel guard
+  only started after staging finished, so a user cancel during that download
+  window was completely invisible: the worker burned bandwidth and runtime
+  downloading every remaining file, then ran the handler, and only discovered
+  the cancel afterwards. Now `prepare_inputs` accepts an optional
+  `cancelled: asyncio.Event` and checks it between batch downloads, raising
+  `TaskCancelled` immediately when the guard detects a cancel. The same guard
+  then stays active through the handler and upload phases as before. The
+  `cancelled` parameter is keyword-only and defaults to `None`, so existing
+  callers of `prepare_inputs` (including consumer repos that call it
+  directly) are unaffected — the cancel-check is simply skipped.
+
 - `Worker._run_one` now starts the progress heartbeat *before*
   `prepare_inputs` instead of after it. Remote-mode input staging
   (`prepare_inputs` downloading `task.params.input_files` via
