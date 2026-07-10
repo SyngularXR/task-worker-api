@@ -173,3 +173,99 @@ async def test_worker_init_default_file_timeout_is_300():
         assert worker._client._file_timeout.read == 300.0
     finally:
         await worker._client.close()
+
+
+# --- retry-tuning parameter threading --------------------------------------
+
+
+async def test_worker_init_threads_retry_params_to_client():
+    """When Worker constructs its own BackendClient (no client= passed),
+    the retry-tuning parameters (max_retries, retry_backoff_s,
+    retry_backoff_max_s, retry_jitter) must be forwarded so operators who
+    use the simple Worker(...) constructor can tune retry behaviour per
+    workload without manually constructing a BackendClient."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+        max_retries=8,
+        retry_backoff_s=1.5,
+        retry_backoff_max_s=120.0,
+        retry_jitter=False,
+    )
+    try:
+        assert worker._client.max_retries == 8
+        assert worker._client.retry_backoff_s == 1.5
+        assert worker._client.retry_backoff_max_s == 120.0
+        assert worker._client.retry_jitter is False
+    finally:
+        await worker._client.close()
+
+
+async def test_worker_init_default_retry_params_match_client_defaults():
+    """The default retry policy (4 attempts / 2s base / 60s cap / jitter on)
+    must reach the BackendClient when the Worker constructs one itself —
+    identical to what a directly-constructed BackendClient gets, so
+    upgrading to Worker(...) changes nothing about retry behaviour."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+    )
+    try:
+        assert worker._client.max_retries == 4
+        assert worker._client.retry_backoff_s == 2.0
+        assert worker._client.retry_backoff_max_s == 60.0
+        assert worker._client.retry_jitter is True
+    finally:
+        await worker._client.close()
+
+
+async def test_worker_init_retry_backoff_max_none_disables_cap():
+    """Passing retry_backoff_max_s=None must propagate to the client as None
+    (disabling the per-delay cap), matching BackendClient's documented
+    'pass None to disable the cap' contract."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+        retry_backoff_max_s=None,
+    )
+    try:
+        assert worker._client.retry_backoff_max_s is None
+    finally:
+        await worker._client.close()
+
+
+def test_worker_init_ignores_retry_params_when_client_supplied(make_worker, fake_client):
+    """When an external client is supplied, retry-tuning parameters are
+    irrelevant — the client is used as-is and the SDK doesn't reach in.
+    Passing them must not raise (they're simply ignored), preserving the
+    escape-hatch contract that an externally-supplied client is untouched."""
+    # max_retries etc. are accepted by the signature but never applied to
+    # the FakeBackendClient; construction must succeed.
+    worker = make_worker(
+        client=fake_client,
+        max_retries=2,
+        retry_backoff_s=0.5,
+        retry_jitter=False,
+    )
+    # FakeBackendClient has no retry attributes; the point is no crash.
+    assert worker._client is fake_client
+
+
+async def test_worker_init_rejects_max_retries_below_one():
+    """max_retries < 1 makes the BackendClient retry loop never execute,
+    crashing the worker with an opaque AssertionError. Worker must surface
+    the same ValueError at construction that BackendClient does."""
+    with pytest.raises(ValueError, match="max_retries must be >= 1"):
+        Worker(
+            backend_url="http://fake/api/v1",
+            api_key="k",
+            worker_id="w",
+            handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+            max_retries=0,
+        )
