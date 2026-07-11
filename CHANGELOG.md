@@ -20,6 +20,22 @@
   `None` (disable the cap) was always a supported value; no runtime change.
 
 **Fixes:**
+- `Worker._run_one` now keeps the `CancelGuard` active *during*
+  `upload_outputs` and threads its `cancelled` event into the output-upload
+  loop. Remote-mode `upload_outputs` (uploading `result["output_files"]`
+  via `BackendClient.upload_file`) can spend minutes streaming GB-scale
+  outputs — colmap-splat PLY files, Neural-Canvas splats. Until now the
+  cancel guard was torn down as soon as the handler returned, so a user
+  cancel during the upload window was completely invisible: the worker
+  burned bandwidth and runtime uploading every remaining file to a task
+  the user had already cancelled, then reported it complete. Now
+  `upload_outputs` accepts an optional `cancelled: asyncio.Event` (matching
+  the `prepare_inputs` contract) and checks it between batch uploads,
+  raising `TaskCancelled` immediately when the guard detects a cancel. The
+  `cancelled` parameter is keyword-only and defaults to `None`, so existing
+  callers of `upload_outputs` are unaffected — the cancel-check is simply
+  skipped.
+
 - `Worker._run_one` now starts the `CancelGuard` *before* `prepare_inputs`
   and threads its `cancelled` event into the input-download loop. Remote-mode
   `prepare_inputs` (downloading `task.params.input_files` via
