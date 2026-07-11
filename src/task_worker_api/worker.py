@@ -340,7 +340,7 @@ class Worker:
             return None
 
     async def _run_one(self, task: ClaimedTask) -> None:
-        """Heartbeat → stage inputs → run handler under cancel guard → publish.
+        """Heartbeat → stage inputs → run handler → publish.
 
         The heartbeat is started *before* ``prepare_inputs`` so the backend's
         ``updated_at`` keeps ticking during the (potentially multi-minute)
@@ -349,6 +349,15 @@ class Worker:
         row unchanged since claim time, and the stale-task sweeper can
         reclaim it while the worker is still fetching — the worker then
         processes and completes a task the backend no longer owns.
+
+        The CancelGuard is also started *before* ``prepare_inputs`` and its
+        ``cancelled`` event is threaded into the download loop. Remote-mode
+        ``prepare_inputs`` can spend minutes streaming GB-scale inputs; a
+        user cancel during that window must not wait for every remaining
+        file to finish — the guard's poll detects the cancel and
+        ``prepare_inputs`` raises ``TaskCancelled`` before downloading the
+        next file. The guard then stays active through the handler and
+        upload phases as before.
 
         A per-task watchdog (when ``timeout`` > 0) enforces a wall-clock
         deadline off the event loop. Terminal reporting goes through a single
@@ -419,13 +428,22 @@ class Worker:
             # block below always calls progress.stop(), so a failure in
             # prepare_inputs still tears the heartbeat down cleanly.
             await progress.start_heartbeat()
-            file_ctx = await prepare_inputs(task, self._client, task_dir)
-            ctx = TaskContext(task=task, files=file_ctx, progress=progress)
 
+            # Start the CancelGuard *before* prepare_inputs so a user cancel
+            # during the (potentially multi-minute) input download is
+            # detected instead of burning bandwidth to completion. The guard
+            # yields its ``cancelled`` event; prepare_inputs checks it
+            # between batch downloads and raises TaskCancelled. The same
+            # guard then covers the handler and upload phases.
             async with CancelGuard(
                 self._client, task.id,
                 poll_interval_s=self.cancel_poll_interval_s,
-            ):
+            ) as cancelled:
+                file_ctx = await prepare_inputs(
+                    task, self._client, task_dir, cancelled=cancelled,
+                )
+                ctx = TaskContext(task=task, files=file_ctx, progress=progress)
+
                 result = await handler(ctx, typed_params)
 
             output_files = (result or {}).get("output_files") or {}

@@ -304,3 +304,95 @@ async def test_prepare_inputs_remote_mode_downloads_all_inputs(tmp_path):
     assert (work_dir / "in" / "meta.json").read_bytes() == b"meta-bytes"
     assert file_ctx.all_paths["mesh"].name == "mesh.ply"
     assert file_ctx.all_paths["meta"].name == "meta.json"
+
+
+# ---------------------------------------------------------------------------#
+# prepare_inputs — cancel-during-download: a set ``cancelled`` event must
+# abort between batch downloads so a user cancel doesn't wait for every
+# remaining GB-scale file to finish streaming.
+# ---------------------------------------------------------------------------#
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_aborts_when_cancelled_between_downloads(tmp_path):
+    """When ``cancelled`` is set, prepare_inputs must raise TaskCancelled
+    before downloading the next file in the batch — not download all
+    remaining inputs to completion."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    work_dir = tmp_path / "work"
+    client = FakeBackendClient()
+    client.queue_file(42, "a.ply", b"aaa")
+    client.queue_file(42, "b.ply", b"bbb")
+    client.queue_file(42, "c.ply", b"ccc")
+
+    task = _claimed(42, params={"input_files": {"a": "a.ply", "b": "b.ply", "c": "c.ply"}})
+
+    cancelled = asyncio.Event()
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await prepare_inputs(task, client, work_dir, cancelled=cancelled)
+
+    # No file was downloaded — the event was set before the loop body ran.
+    assert not (work_dir / "in" / "a.ply").exists()
+    assert not (work_dir / "in" / "b.ply").exists()
+    assert not (work_dir / "in" / "c.ply").exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_aborts_mid_batch_when_cancel_set_after_first(tmp_path):
+    """A cancel detected after the first download must abort before the
+    second: the first file is on disk, but the remaining ones are not."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    work_dir = tmp_path / "work"
+
+    class _CancelAfterFirstClient(FakeBackendClient):
+        """Sets the cancel event right after the first download completes,
+        simulating a user cancel detected between batch downloads."""
+        def __init__(self, event: asyncio.Event) -> None:
+            super().__init__()
+            self._event = event
+            self._download_count = 0
+
+        async def download_file(self, task_id, filename, dest):
+            await super().download_file(task_id, filename, dest)
+            self._download_count += 1
+            if self._download_count == 1:
+                self._event.set()
+
+    client = _CancelAfterFirstClient(asyncio.Event())
+    client.queue_file(99, "a.ply", b"aaa")
+    client.queue_file(99, "b.ply", b"bbb")
+
+    task = _claimed(99, params={"input_files": {"a": "a.ply", "b": "b.ply"}})
+    cancelled = asyncio.Event()
+    client._event = cancelled
+
+    with pytest.raises(TaskCancelled):
+        await prepare_inputs(task, client, work_dir, cancelled=cancelled)
+
+    # First file downloaded, second aborted.
+    assert (work_dir / "in" / "a.ply").exists()
+    assert not (work_dir / "in" / "b.ply").exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_no_cancel_event_downloads_all(tmp_path):
+    """When ``cancelled`` is None (the default), prepare_inputs behaves
+    exactly as before — all files download regardless of cancel state.
+    This pins backward compatibility for callers that don't pass the event."""
+    work_dir = tmp_path / "work"
+    client = FakeBackendClient()
+    client.queue_file(7, "x.ply", b"xx")
+    client.queue_file(7, "y.ply", b"yy")
+
+    task = _claimed(7, params={"input_files": {"x": "x.ply", "y": "y.ply"}})
+    file_ctx = await prepare_inputs(task, client, work_dir)
+
+    assert (work_dir / "in" / "x.ply").exists()
+    assert (work_dir / "in" / "y.ply").exists()
+    assert set(file_ctx.all_paths.keys()) == {"x", "y"}

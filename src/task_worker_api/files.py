@@ -21,13 +21,15 @@ the backend's completed-task sweeper never reaches. Mirrors the
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from .context import ClaimedTask, FileContext
+from .errors import TaskCancelled
 
 if TYPE_CHECKING:  # pragma: no cover
     from .client import BackendClient
@@ -37,8 +39,19 @@ log = logging.getLogger(__name__)
 
 async def prepare_inputs(
     task: ClaimedTask, client: "BackendClient", work_dir: Path,
+    *,
+    cancelled: Optional[asyncio.Event] = None,
 ) -> FileContext:
-    """Materialise task inputs under ``work_dir/in/``. Returns a FileContext."""
+    """Materialise task inputs under ``work_dir/in/``. Returns a FileContext.
+
+    When ``cancelled`` is supplied (an ``asyncio.Event`` from a CancelGuard
+    started before this call), remote-mode batch downloads abort as soon as
+    the event is set: a multi-file input set for a GB-scale task can spend
+    minutes streaming, and a user cancel during that window should not wait
+    for every remaining file to finish downloading. The check is a no-op for
+    local mode (``input_path``) where ``shutil.copy2`` is a single blocking
+    call with no yield point for the event loop.
+    """
     in_dir = work_dir / "in"
     out_dir = work_dir / "out"
     in_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +77,10 @@ async def prepare_inputs(
     if input_files:
         paths: dict[str, Path] = {}
         for key, filename in input_files.items():
+            if cancelled is not None and cancelled.is_set():
+                raise TaskCancelled(
+                    f"task {task.id} cancelled by user during input download"
+                )
             dest = in_dir / filename
             await client.download_file(task.id, filename, dest)
             paths[key] = dest
