@@ -108,12 +108,24 @@ async def upload_outputs(
     file_ctx: FileContext,
     output_files: dict[str, str],
     shared_volume_path: "str | None",
+    *,
+    cancelled: Optional[asyncio.Event] = None,
 ) -> dict[str, str]:
     """Publish output_files and return the manifest for task.result.
 
     ``output_files`` is ``{logical_key: filename}`` produced by the handler;
     return map is either filenames (remote mode) or absolute paths
     (local mode).
+
+    When ``cancelled`` is supplied (an ``asyncio.Event`` from a CancelGuard
+    that stays active through the upload phase), remote-mode batch uploads
+    abort as soon as the event is set: uploading GB-scale outputs
+    (colmap-splat PLY files, Neural-Canvas splats) can take minutes, and a
+    user cancel during that window should not wait for every remaining file
+    to finish streaming to a task the user already cancelled. The check
+    runs between files, raising ``TaskCancelled`` before the next upload
+    starts — mirroring the cancel-during-download guard in
+    :func:`prepare_inputs`.
 
     If publishing fails partway through (the Nth upload/copy raises after
     files 1..N-1 succeeded), the partial artifacts are removed before the
@@ -135,6 +147,10 @@ async def upload_outputs(
         uploaded: list[str] = []
         try:
             for _, filename in output_files.items():
+                if cancelled is not None and cancelled.is_set():
+                    raise TaskCancelled(
+                        f"task {task.id} cancelled by user during output upload"
+                    )
                 src = file_ctx.output_dir / filename
                 await client.upload_file(task.id, filename, src)
                 uploaded.append(filename)
@@ -160,6 +176,10 @@ async def upload_outputs(
         manifest: dict[str, str] = {}
         try:
             for key, filename in output_files.items():
+                if cancelled is not None and cancelled.is_set():
+                    raise TaskCancelled(
+                        f"task {task.id} cancelled by user during output upload"
+                    )
                 src = file_ctx.output_dir / filename
                 dest = dest_dir / filename
                 shutil.copy2(src, dest)

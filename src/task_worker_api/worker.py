@@ -351,13 +351,16 @@ class Worker:
         processes and completes a task the backend no longer owns.
 
         The CancelGuard is also started *before* ``prepare_inputs`` and its
-        ``cancelled`` event is threaded into the download loop. Remote-mode
-        ``prepare_inputs`` can spend minutes streaming GB-scale inputs; a
-        user cancel during that window must not wait for every remaining
-        file to finish — the guard's poll detects the cancel and
-        ``prepare_inputs`` raises ``TaskCancelled`` before downloading the
-        next file. The guard then stays active through the handler and
-        upload phases as before.
+        ``cancelled`` event is threaded into both the download and upload
+        loops. Remote-mode ``prepare_inputs`` can spend minutes streaming
+        GB-scale inputs; a user cancel during that window must not wait for
+        every remaining file to finish — the guard's poll detects the cancel
+        and ``prepare_inputs`` raises ``TaskCancelled`` before downloading the
+        next file. The same guard stays active through the handler *and* the
+        ``upload_outputs`` phase: remote-mode uploads of GB-scale outputs
+        can likewise take minutes, and a cancel during output publishing
+        must abort between uploads rather than streaming every remaining
+        file to a task the user already cancelled.
 
         A per-task watchdog (when ``timeout`` > 0) enforces a wall-clock
         deadline off the event loop. Terminal reporting goes through a single
@@ -446,13 +449,24 @@ class Worker:
 
                 result = await handler(ctx, typed_params)
 
-            output_files = (result or {}).get("output_files") or {}
-            if output_files:
-                delivered = await upload_outputs(
-                    task, self._client, file_ctx, output_files,
-                    self.shared_volume_path,
-                )
-                result = {**result, "output_files": delivered}
+                # Publish outputs *inside* the CancelGuard so a user cancel
+                # during the (potentially multi-minute) output upload is
+                # detected instead of burning bandwidth to completion.
+                # Remote-mode upload_outputs can spend minutes streaming
+                # GB-scale outputs (colmap-splat PLYs, Neural-Canvas
+                # splats); a cancel during that window must not wait for
+                # every remaining file to finish uploading to a task the
+                # user already cancelled. upload_outputs checks the guard's
+                # ``cancelled`` event between uploads and raises
+                # TaskCancelled before the next file starts — mirroring the
+                # cancel-during-download guard in prepare_inputs.
+                output_files = (result or {}).get("output_files") or {}
+                if output_files:
+                    delivered = await upload_outputs(
+                        task, self._client, file_ctx, output_files,
+                        self.shared_volume_path, cancelled=cancelled,
+                    )
+                    result = {**result, "output_files": delivered}
             outcome = ("complete", result or {})
 
         except TaskCancelled:

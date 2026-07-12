@@ -396,3 +396,150 @@ async def test_prepare_inputs_no_cancel_event_downloads_all(tmp_path):
     assert (work_dir / "in" / "x.ply").exists()
     assert (work_dir / "in" / "y.ply").exists()
     assert set(file_ctx.all_paths.keys()) == {"x", "y"}
+
+
+# ---------------------------------------------------------------------------#
+# upload_outputs — cancel-during-upload: a set ``cancelled`` event must
+# abort between batch uploads so a user cancel doesn't wait for every
+# remaining GB-scale output file to finish streaming. Mirrors the
+# cancel-during-download guard in prepare_inputs.
+# ---------------------------------------------------------------------------#
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_remote_aborts_when_cancelled_before_first(tmp_path):
+    """When ``cancelled`` is already set, remote-mode upload_outputs must
+    raise TaskCancelled before uploading any file — not stream the first
+    file to a task the user already cancelled."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    (out_dir / "b.stl").write_bytes(b"bbb")
+
+    task = _claimed(51, params={"input_files": {"mesh": "in.ply"}})
+    file_ctx = _file_ctx(out_dir)
+    client = FakeBackendClient()
+
+    cancelled = asyncio.Event()
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await upload_outputs(
+            task, client, file_ctx,
+            output_files={"a": "a.stl", "b": "b.stl"},
+            shared_volume_path=None,
+            cancelled=cancelled,
+        )
+
+    # No file was uploaded — the event was set before the loop body ran.
+    assert (51, "a.stl") not in client.uploaded_files
+    assert (51, "b.stl") not in client.uploaded_files
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_remote_aborts_mid_batch_when_cancel_set_after_first(tmp_path):
+    """A cancel detected after the first upload must abort before the
+    second: the first file is on the backend, but the remaining ones are
+    not — not streamed to a cancelled task."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    (out_dir / "b.stl").write_bytes(b"bbb")
+    (out_dir / "c.stl").write_bytes(b"ccc")
+
+    task = _claimed(52, params={"input_files": {"mesh": "in.ply"}})
+    file_ctx = _file_ctx(out_dir)
+
+    class _CancelAfterFirstUpload(FakeBackendClient):
+        """Sets the cancel event right after the first upload completes,
+        simulating a user cancel detected between batch uploads."""
+        def __init__(self, event: asyncio.Event) -> None:
+            super().__init__()
+            self._event = event
+            self._upload_count = 0
+
+        async def upload_file(self, task_id, filename, src):
+            await super().upload_file(task_id, filename, src)
+            self._upload_count += 1
+            if self._upload_count == 1:
+                self._event.set()
+
+    cancelled = asyncio.Event()
+    client = _CancelAfterFirstUpload(cancelled)
+
+    with pytest.raises(TaskCancelled):
+        await upload_outputs(
+            task, client, file_ctx,
+            output_files={"a": "a.stl", "b": "b.stl", "c": "c.stl"},
+            shared_volume_path=None,
+            cancelled=cancelled,
+        )
+
+    # First file uploaded, second and third aborted.
+    assert (52, "a.stl") in client.uploaded_files
+    assert (52, "b.stl") not in client.uploaded_files
+    assert (52, "c.stl") not in client.uploaded_files
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_local_aborts_when_cancelled(tmp_path):
+    """Local-mode (shared-volume staging) upload_outputs must also honor a
+    set ``cancelled`` event — abort between copies and clean up the partial
+    staging dir, rather than copying every remaining file."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    (out_dir / "b.stl").write_bytes(b"bbb")
+
+    task = _claimed(53, params={"input_path": "/ignored"})
+    file_ctx = _file_ctx(out_dir)
+
+    cancelled = asyncio.Event()
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await upload_outputs(
+            task, FakeBackendClient(), file_ctx,
+            output_files={"a": "a.stl", "b": "b.stl"},
+            shared_volume_path=str(shared),
+            cancelled=cancelled,
+        )
+
+    # Cancel raised before the first copy → no staging dir created.
+    staging = shared / "temp" / "53"
+    assert not staging.exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_no_cancel_event_uploads_all(tmp_path):
+    """When ``cancelled`` is None (the default), upload_outputs behaves
+    exactly as before — all files upload regardless of cancel state.
+    This pins backward compatibility for callers that don't pass the event."""
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    (out_dir / "b.stl").write_bytes(b"bbb")
+
+    task = _claimed(54, params={"input_files": {"mesh": "in.ply"}})
+    file_ctx = _file_ctx(out_dir)
+    client = FakeBackendClient()
+
+    manifest = await upload_outputs(
+        task, client, file_ctx,
+        output_files={"a": "a.stl", "b": "b.stl"},
+        shared_volume_path=None,
+    )
+
+    assert set(manifest.keys()) == {"a", "b"}
+    assert (54, "a.stl") in client.uploaded_files
+    assert (54, "b.stl") in client.uploaded_files

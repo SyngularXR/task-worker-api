@@ -682,3 +682,115 @@ async def test_cancel_guard_before_prepare_inputs_no_false_cancel(
     assert len(client.completed_tasks) == 1
     assert client.failed_tasks == []
 
+
+# ----- cancel-guard-during-upload_outputs ordering ---------------------------
+#
+# The CancelGuard must stay active *during* upload_outputs, not just through
+# the handler. Remote-mode upload_outputs uploads GB-scale outputs (colmap-
+# splat PLYs, Neural-Canvas splats) that can take minutes; a user cancel
+# during that window must be detected and abort the upload — not burn
+# bandwidth streaming every remaining file to a task the user already
+# cancelled, then report it complete. _run_one used to call upload_outputs
+# *after* the CancelGuard block exited; these tests pin the fix.
+
+
+class _CancelDuringUploadClient(FakeBackendClient):
+    """FakeBackendClient that marks the task cancelled after the first
+    output upload, so the cancel poll (running concurrently via CancelGuard)
+    picks it up and sets the event before the second upload starts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._upload_count = 0
+
+    async def upload_file(self, task_id, filename, src):
+        await asyncio.sleep(0.02)
+        await super().upload_file(task_id, filename, src)
+        self._upload_count += 1
+        if self._upload_count == 1:
+            # Simulate a user cancel arriving after the first output lands.
+            self.cancelled_task_ids.add(task_id)
+            # Yield long enough for the CancelGuard poll task (running on
+            # the same event loop) to wake, call get_cancel_status, and
+            # set the ``cancelled`` event before upload_outputs re-checks
+            # it at the top of the upload loop.
+            await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_cancel_guard_active_during_upload_outputs(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A user cancel that arrives during upload_outputs (while uploading
+    outputs) must cause the task to fail as 'cancelled by user' — not
+    upload every remaining file and then report the task complete."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelDuringUploadClient()
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"mesh": "in.ply"}, "max_results": 1},
+    )
+    client.queue_file(task.id, "in.ply", b"pretend-PLY")
+
+    async def handler(ctx, params):
+        # Produce two output files so the cancel lands between uploads.
+        out = ctx.files.output_dir
+        (out / "a.stl").write_bytes(b"out-a")
+        (out / "b.stl").write_bytes(b"out-b")
+        return {"output_files": {"a": "a.stl", "b": "b.stl"}}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        heartbeat_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    # The task was reported as cancelled, not completed.
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled" in client.failed_tasks[0]["error"].lower()
+    # The first output uploaded, but the second was aborted — the cancel
+    # was detected between uploads, not after streaming everything.
+    assert client._upload_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_guard_during_upload_no_false_cancel(
+    make_worker, tmp_path, monkeypatch,
+):
+    """When no cancel is requested, keeping the guard active through
+    upload_outputs must not cause a spurious TaskCancelled — all outputs
+    upload and the task completes normally."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = FakeBackendClient()
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"mesh": "in.ply"}, "max_results": 1},
+    )
+    client.queue_file(task.id, "in.ply", b"pretend-PLY")
+
+    async def handler(ctx, params):
+        out = ctx.files.output_dir
+        (out / "a.stl").write_bytes(b"out-a")
+        (out / "b.stl").write_bytes(b"out-b")
+        return {"output_files": {"a": "a.stl", "b": "b.stl"}}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    assert len(client.completed_tasks) == 1
+    assert client.failed_tasks == []
+    # Both outputs delivered.
+    assert (task.id, "a.stl") in client.uploaded_files
+    assert (task.id, "b.stl") in client.uploaded_files
+
