@@ -1215,3 +1215,122 @@ async def test_file_timeout_none_falls_back_to_client_default(tmp_path):
     assert seen[0] is not None
     assert seen[0]["read"] is None
     assert seen[0]["write"] is None
+
+
+# -----------------------------------------------------------------------
+# cancel_timeout_s — get_cancel_status gets a dedicated short timeout
+# (default 5s) instead of the 30s general request timeout. The CancelGuard
+# polls /tasks/{id}/cancel-status every few seconds; under backend load a
+# single slow poll could block cancel detection for 30s (plus retry
+# backoff), keeping the worker blind to a user cancel. The short deadline
+# fails fast — CancelGuard catches the timeout and the next poll fires on
+# schedule. The 30s general timeout still governs claim/heartbeat/complete.
+# -----------------------------------------------------------------------
+
+
+def test_init_defaults_cancel_timeout_to_5s():
+    """The default cancel_timeout_s is 5s, short enough that a stalled
+    cancel-poll fails fast instead of blocking the CancelGuard for 30s."""
+    client = BackendClient("http://fake", "x")
+    assert client._cancel_timeout is not None
+    assert client._cancel_timeout.read == 5.0
+    assert client._cancel_timeout.write == 5.0
+    assert client._cancel_timeout.connect == 5.0
+    assert client._cancel_timeout.pool == 5.0
+    import asyncio
+    asyncio.run(client.close())
+
+
+def test_init_cancel_timeout_builds_explicit_timeout():
+    """An explicit cancel_timeout_s builds an httpx.Timeout so the
+    cancel-poll call overrides the client default only for get_cancel_status."""
+    client = BackendClient("http://fake", "x", cancel_timeout_s=3.0)
+    assert client._cancel_timeout is not None
+    assert client._cancel_timeout.read == 3.0
+    assert client._cancel_timeout.write == 3.0
+    assert client._cancel_timeout.connect == 3.0
+    assert client._cancel_timeout.pool == 3.0
+    import asyncio
+    asyncio.run(client.close())
+
+
+def test_init_cancel_timeout_none_falls_back_to_client_default():
+    """When cancel_timeout_s is None, _cancel_timeout is None — the
+    cancel-poll call falls back to the client's own default timeout (legacy
+    behaviour for consumers that build their own client and don't want the
+    SDK to impose a separate cancel deadline)."""
+    client = BackendClient("http://fake", "x", cancel_timeout_s=None)
+    assert client._cancel_timeout is None
+    import asyncio
+    asyncio.run(client.close())
+
+
+@pytest.mark.asyncio
+async def test_get_cancel_status_uses_cancel_timeout_not_general():
+    """get_cancel_status must apply cancel_timeout_s to the request, not
+    the 30s general request timeout. Verified by inspecting the timeout
+    extension on the request the MockTransport handler sees."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json={"cancelled": False})
+
+    # General timeout 30s, cancel timeout 5s — distinct so a mix-up is
+    # detectable. cancel_timeout_s is passed explicitly.
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, cancel_timeout_s=5.0,
+        client=http,
+    )
+    result = await client.get_cancel_status(7)
+    await client.close()
+
+    assert result == {"cancelled": False}
+    assert len(seen) == 1
+    assert seen[0] is not None
+    # All four timeout facets must reflect the cancel timeout, not 30s.
+    assert seen[0]["read"] == 5.0
+    assert seen[0]["write"] == 5.0
+    assert seen[0]["connect"] == 5.0
+    assert seen[0]["pool"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_calls_do_not_use_cancel_timeout():
+    """claim_next (and by extension _request, heartbeat, complete, fail)
+    must keep using the general 30s request timeout, NOT the cancel timeout
+    — shortening the lifecycle timeout would make heartbeat latency worse
+    and could spuriously abort a claim under momentary load. Verified by
+    inspecting the timeout the MockTransport handler sees on a claim_next
+    call when cancel_timeout_s is set to a distinct, shorter value."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(204)  # no task
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, cancel_timeout_s=5.0,
+        client=http,
+    )
+    result = await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert result is None  # 204 → no task
+    assert len(seen) == 1
+    assert seen[0] is not None
+    # Lifecycle call must use the 30s general timeout, not 5s.
+    assert seen[0]["read"] == 30.0
+    assert seen[0]["write"] == 30.0
+    assert seen[0]["connect"] == 30.0
+    assert seen[0]["pool"] == 30.0

@@ -175,6 +175,44 @@ async def test_worker_init_default_file_timeout_is_300():
         await worker._client.close()
 
 
+# --- cancel_timeout_s threading --------------------------------------------
+
+
+async def test_worker_init_threads_cancel_timeout_to_client():
+    """When Worker constructs its own BackendClient (no client= passed),
+    cancel_timeout_s must be forwarded so the CancelGuard's cancel-poll
+    gets the short deadline rather than the 30s general request timeout."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+        cancel_timeout_s=3.0,
+    )
+    try:
+        assert worker._client._cancel_timeout is not None
+        assert worker._client._cancel_timeout.read == 3.0
+    finally:
+        await worker._client.close()
+
+
+async def test_worker_init_default_cancel_timeout_is_5():
+    """The default cancel_timeout_s (5s) must reach the BackendClient when
+    the Worker constructs one itself — short enough that a stalled cancel-poll
+    fails fast instead of blocking the CancelGuard for 30s."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+    )
+    try:
+        assert worker._client._cancel_timeout is not None
+        assert worker._client._cancel_timeout.read == 5.0
+    finally:
+        await worker._client.close()
+
+
 # --- retry-tuning parameter threading --------------------------------------
 
 

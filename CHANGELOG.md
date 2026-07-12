@@ -20,6 +20,22 @@
   `None` (disable the cap) was always a supported value; no runtime change.
 
 **Fixes:**
+- `BackendClient.get_cancel_status` now uses a dedicated short timeout
+  (`cancel_timeout_s`, default 5s) instead of the 30s general request
+  timeout. The `CancelGuard` polls `/tasks/{id}/cancel-status` every few
+  seconds; under backend load or during a deploy, a single slow poll could
+  previously block the guard for 30s (plus retry backoff) — during which the
+  worker kept computing on a task the user had already cancelled. The short
+  deadline fails fast: `CancelGuard` catches the `TimeoutException`, the next
+  poll fires on schedule, and cancel detection drops from ~30s+ to ~5s. The
+  30s general timeout still governs claim, heartbeat, complete, and fail
+  unchanged. `Worker` exposes the same `cancel_timeout_s` parameter (default
+  `5.0`) and threads it through to the client. The change is additive and
+  backward-compatible: existing consumers get the new 5s cancel deadline (a
+  strict improvement in cancel responsiveness over the old 30s), and
+  consumers that supply their own `client=` are unaffected. `cancel_timeout_s`
+  also accepts `None` to fall back to the client's own timeout for consumers
+  that don't want a separate cancel deadline.
 - `Worker._run_one` now keeps the `CancelGuard` active *during*
   `upload_outputs` and threads its `cancelled` event into the output-upload
   loop. Remote-mode `upload_outputs` (uploading `result["output_files"]`
