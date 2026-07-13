@@ -40,6 +40,26 @@
   `None` (disable the cap) was always a supported value; no runtime change.
 
 **Fixes:**
+- `BackendClient` now applies a dedicated `lifecycle_timeout_s` (default 15s)
+  to `report_progress`, `complete`, and `fail`, instead of the 30s general
+  request timeout. These are the worker's terminal-ish status calls; under
+  backend load or during a deploy, a single stalled heartbeat or complete
+  call could previously block the polling loop for up to 30s × `max_retries`
+  (~120s with the default 4 attempts) — during which the worker couldn't
+  claim new work, poll for cancel, or respond to shutdown. The shorter
+  deadline fails fast: the retry loop still rides through transient blips
+  (4 × 15s = 60s total instead of 4 × 30s = 120s), but the polling loop
+  stays responsive under backend load. The 30s general timeout now governs
+  only `claim_next`. This completes the timeout-separation pattern
+  established by `cancel_timeout_s` (cancel-poll, 5s) and `file_timeout_s`
+  (file transfers, 300s). `Worker` exposes the same `lifecycle_timeout_s`
+  parameter (default `15.0`) and threads it through to the client. The
+  change is additive and backward-compatible: existing consumers get the
+  new 15s lifecycle deadline (a strict improvement in polling-loop
+  responsiveness over the old 30s), and consumers that supply their own
+  `client=` are unaffected. `lifecycle_timeout_s` also accepts `None` to
+  fall back to the client's own timeout for consumers that don't want a
+  separate lifecycle deadline.
 - `BackendClient.get_cancel_status` now uses a dedicated short timeout
   (`cancel_timeout_s`, default 5s) instead of the 30s general request
   timeout. The `CancelGuard` polls `/tasks/{id}/cancel-status` every few
