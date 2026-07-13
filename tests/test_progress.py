@@ -7,6 +7,7 @@ Covers the paths the worker-loop integration tests don't reach directly:
   - stop() is a no-op when never started and swallows loop errors
   - is_cancelled / raise_if_cancelled reflect the shared cancelled event
   - the background heartbeat loop emits periodic reports and tolerates errors
+  - link_cancelled() merges an external CancelGuard event into is_cancelled
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import asyncio
 import pytest
 
 from task_worker_api.errors import TaskCancelled
-from task_worker_api.progress import ProgressReporter
+from task_worker_api.progress import ProgressReporter, _SharedState
 from task_worker_api.testing import FakeBackendClient
 
 
@@ -177,3 +178,84 @@ async def test_heartbeat_loop_tolerates_transient_errors(caplog):
     # The loop survived the first error and kept ticking.
     assert client._calls >= 2
     assert len(client.progress_events) >= 1
+
+
+# ----- link_cancelled (external CancelGuard event) ---------------------------
+
+
+def test_is_cancelled_false_without_linked_event():
+    """Default: no external event linked, is_cancelled is False."""
+    pr = ProgressReporter(FakeBackendClient(), task_id=1)
+    assert pr.is_cancelled is False
+
+
+def test_link_cancelled_reflects_external_event():
+    """When an external event is linked and set, is_cancelled is True even
+    if the heartbeat has never reported cancel."""
+    pr = ProgressReporter(FakeBackendClient(), task_id=1)
+    ext = asyncio.Event()
+    pr.link_cancelled(ext)
+
+    assert pr.is_cancelled is False
+    ext.set()
+    assert pr.is_cancelled is True
+
+
+def test_link_cancelled_raise_if_cancelled_raises():
+    """raise_if_cancelled must fire when the linked external event is set,
+    without needing a heartbeat tick."""
+    pr = ProgressReporter(FakeBackendClient(), task_id=1)
+    ext = asyncio.Event()
+    pr.link_cancelled(ext)
+    ext.set()
+
+    with pytest.raises(TaskCancelled):
+        pr.raise_if_cancelled()
+
+
+def test_link_cancelled_none_unlinks():
+    """Passing None to link_cancelled unlinks a previously-linked event so
+    it no longer affects is_cancelled."""
+    pr = ProgressReporter(FakeBackendClient(), task_id=1)
+    ext = asyncio.Event()
+    pr.link_cancelled(ext)
+    ext.set()
+    assert pr.is_cancelled is True
+
+    pr.link_cancelled(None)
+    assert pr.is_cancelled is False
+
+
+def test_is_cancelled_true_when_either_event_set():
+    """is_cancelled is True if either the heartbeat's own event OR the
+    linked external event is set."""
+    pr = ProgressReporter(FakeBackendClient(), task_id=1)
+    ext = asyncio.Event()
+    pr.link_cancelled(ext)
+
+    # Heartbeat event set, external not → True
+    pr._state.cancelled.set()
+    assert pr.is_cancelled is True
+
+    # Reset heartbeat, set external → True
+    pr._state = _SharedState()  # fresh state, not cancelled
+    pr.link_cancelled(ext)
+    ext.set()
+    assert pr.is_cancelled is True
+
+    # Both unset → False
+    pr.link_cancelled(None)
+    pr._state = _SharedState()
+    assert pr.is_cancelled is False
+
+
+def test_link_cancelled_safe_before_or_after_start():
+    """link_cancelled can be called before start_heartbeat or after stop
+    without error — the link is independent of the heartbeat task
+    lifecycle."""
+    pr = ProgressReporter(FakeBackendClient(), task_id=1,
+                          heartbeat_interval_s=10.0)
+    # Before start — fine.
+    ext = asyncio.Event()
+    pr.link_cancelled(ext)
+    pr.link_cancelled(None)

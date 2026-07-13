@@ -3,6 +3,26 @@
 ## Unreleased
 
 **Features:**
+- `Worker._run_one` now links the `CancelGuard`'s `cancelled` event into
+  the `ProgressReporter` via the new `ProgressReporter.link_cancelled()`
+  method, so `ctx.progress.is_cancelled` and
+  `ctx.progress.raise_if_cancelled()` reflect cancel detection at the
+  guard's poll latency (`cancel_poll_interval_s`, default 2s) instead of
+  the heartbeat's (`heartbeat_interval_s`, default 10s). Previously the
+  `CancelGuard` polled `/tasks/{id}/cancel-status` on its own fast
+  schedule but its `cancelled` event was separate from
+  `ProgressReporter._state.cancelled` — the event that backs
+  `ctx.progress.is_cancelled`. Handlers that poll `is_cancelled` between
+  blocking ops (Neural-Canvas's segmentation pipeline, colmap-splat's
+  `gs_build` subprocess watcher) only learned of a cancel on the next
+  heartbeat tick, up to 10s after the guard already knew. Now the guard's
+  detection propagates immediately: the linked event is checked alongside
+  the heartbeat's own event in `is_cancelled`, so cooperative handlers
+  bail out at guard latency. The change is additive and
+  backward-compatible: `link_cancelled` defaults to `None` (no external
+  event), so existing `ProgressReporter` callers outside `Worker` see no
+  behaviour change; the heartbeat's own cancel-detection path is
+  unchanged and still works as a fallback.
 - `Worker.__init__` now exposes the retry-tuning parameters
   (`max_retries`, `retry_backoff_s`, `retry_backoff_max_s`, `retry_jitter`)
   and threads them through to the `BackendClient` it constructs internally.

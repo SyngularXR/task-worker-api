@@ -794,3 +794,128 @@ async def test_cancel_guard_during_upload_no_false_cancel(
     assert (task.id, "a.stl") in client.uploaded_files
     assert (task.id, "b.stl") in client.uploaded_files
 
+
+# ----- cancel-guard → progress.link_cancelled wiring ------------------------
+#
+# The CancelGuard polls /tasks/{id}/cancel-status on its own schedule
+# (cancel_poll_interval_s, default 2s). The ProgressReporter's
+# _state.cancelled event — which backs ctx.progress.is_cancelled — is
+# only set by the heartbeat's report_progress response (every
+# heartbeat_interval_s, default 10s). Without wiring the guard's event
+# into the reporter, a handler that polls ctx.progress.is_cancelled
+# (Neural-Canvas segmentation, colmap-splat gs_build) learns of a cancel
+# at heartbeat latency, not the guard's faster latency. _run_one now
+# calls progress.link_cancelled(cancelled) inside the CancelGuard block
+# so is_cancelled reflects the guard's detection immediately. These
+# tests pin that wiring.
+
+
+class _CancelGuardPropagationClient(FakeBackendClient):
+    """FakeBackendClient that marks the task cancelled after the first
+    cancel-status poll, but whose report_progress (heartbeat) never
+    reports cancelled. This isolates the CancelGuard → ProgressReporter
+    link: if is_cancelled flips, it must be via the guard's event, not
+    the heartbeat."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel_poll_count = 0
+
+    async def get_cancel_status(self, task_id: int) -> dict:
+        self._cancel_poll_count += 1
+        if self._cancel_poll_count >= 1:
+            self.cancelled_task_ids.add(task_id)
+        return await super().get_cancel_status(task_id)
+
+    async def report_progress(
+        self, task_id, *, stage, current=0, total=0, kill_handle=None,
+    ) -> dict:
+        # Heartbeat deliberately does NOT report cancelled — the only
+        # path to is_cancelled is the linked CancelGuard event.
+        return {"cancelled": False}
+
+
+@pytest.mark.asyncio
+async def test_cancel_guard_propagates_to_progress_is_cancelled(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A handler that polls ctx.progress.is_cancelled must see it flip to
+    True when the CancelGuard detects the cancel — even when the heartbeat
+    never reports cancelled. Without progress.link_cancelled, the handler
+    would see is_cancelled stay False until the next heartbeat tick (or
+    forever, if the heartbeat response doesn't include cancelled)."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    saw_cancelled = asyncio.Event()
+
+    async def handler(ctx, params):
+        # Poll is_cancelled in a tight loop (simulating a cooperative
+        # handler between blocking ops). The CancelGuard polls at 0.01s;
+        # it should flip is_cancelled well before this loop exhausts.
+        for _ in range(100):
+            if ctx.progress.is_cancelled:
+                saw_cancelled.set()
+                raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
+            await asyncio.sleep(0.02)
+        return {}  # pragma: no cover — should never reach
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        heartbeat_interval_s=10.0,  # long: isolates the guard path
+    )
+    await worker.run_one()
+
+    assert saw_cancelled.is_set(), (
+        "handler must have seen ctx.progress.is_cancelled flip to True "
+        "via the CancelGuard's linked event, not just the heartbeat"
+    )
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled" in client.failed_tasks[0]["error"].lower()
+    # The cancel was detected via the guard, not the heartbeat.
+    assert client._cancel_poll_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_progress_is_cancelled_stays_false_without_cancel(
+    make_worker, tmp_path, monkeypatch,
+):
+    """When no cancel is requested, linking the CancelGuard event must not
+    cause a spurious is_cancelled — the handler completes normally."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = FakeBackendClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        # A handler that checks is_cancelled a few times before returning.
+        for _ in range(5):
+            assert ctx.progress.is_cancelled is False
+            await asyncio.sleep(0.01)
+        return {"planes": []}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    assert len(client.completed_tasks) == 1
+    assert client.failed_tasks == []
+
