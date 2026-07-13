@@ -444,6 +444,19 @@ class Worker:
                 self._client, task.id,
                 poll_interval_s=self.cancel_poll_interval_s,
             ) as cancelled:
+                # Link the CancelGuard's ``cancelled`` event into the
+                # ProgressReporter so handlers that poll
+                # ``ctx.progress.is_cancelled`` (Neural-Canvas's
+                # segmentation pipeline, colmap-splat's gs_build watcher)
+                # learn of a cancel at the guard's poll latency
+                # (cancel_poll_interval_s, default 2s) instead of the
+                # heartbeat's (heartbeat_interval_s, default 10s). The
+                # CancelGuard polls /tasks/{id}/cancel-status on its own
+                # schedule; without this link its faster detection is
+                # invisible to cooperative handlers that check
+                # is_cancelled between blocking ops but don't hit an
+                # await point where the guard raises TaskCancelled.
+                progress.link_cancelled(cancelled)
                 file_ctx = await prepare_inputs(
                     task, self._client, task_dir, cancelled=cancelled,
                 )

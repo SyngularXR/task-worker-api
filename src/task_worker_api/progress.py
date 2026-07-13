@@ -53,6 +53,12 @@ class ProgressReporter:
         self._interval = heartbeat_interval_s
         self._state = _SharedState()
         self._task: Optional[asyncio.Task] = None
+        # Optional external cancel event (from a CancelGuard). When linked,
+        # is_cancelled / raise_if_cancelled also observe this event so a
+        # handler polling ctx.progress.is_cancelled learns of a cancel at
+        # the guard's poll latency (cancel_poll_interval_s, default 2s)
+        # instead of the heartbeat's (heartbeat_interval_s, default 10s).
+        self._external_cancelled: Optional[asyncio.Event] = None
 
     async def update(self, stage: str, current: int = 0, total: int = 0) -> None:
         """Handler progress update. Updates shared state; the heartbeat
@@ -94,13 +100,35 @@ class ProgressReporter:
             pass
         self._task = None
 
+    def link_cancelled(self, event: Optional[asyncio.Event]) -> None:
+        """Link an external cancel event (typically from a CancelGuard).
+
+        After linking, :attr:`is_cancelled` and
+        :meth:`raise_if_cancelled` also observe ``event`` in addition to
+        the heartbeat's own ``_state.cancelled``. The CancelGuard polls
+        ``/tasks/{id}/cancel-status`` every ``cancel_poll_interval_s``
+        (default 2s) — faster than the heartbeat's
+        ``heartbeat_interval_s`` (default 10s) — so handlers that poll
+        ``ctx.progress.is_cancelled`` learn of a cancel at the guard's
+        latency instead of waiting for the next heartbeat tick.
+
+        Passing ``None`` unlinks a previously-linked event. Safe to call
+        before or after :meth:`start_heartbeat`.
+        """
+        self._external_cancelled = event
+
     @property
     def is_cancelled(self) -> bool:
-        return self._state.cancelled.is_set()
+        if self._state.cancelled.is_set():
+            return True
+        return (
+            self._external_cancelled is not None
+            and self._external_cancelled.is_set()
+        )
 
     def raise_if_cancelled(self) -> None:
         """Handlers call this between blocking ops to bail out on cancel."""
-        if self._state.cancelled.is_set():
+        if self.is_cancelled:
             from .errors import TaskCancelled
             raise TaskCancelled(f"task {self._task_id} cancelled by user")
 
