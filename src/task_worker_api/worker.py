@@ -97,6 +97,7 @@ class Worker:
         cancel_poll_interval_s: float = 2.0,
         request_timeout_s: float = 30.0,
         file_timeout_s: float = 300.0,
+        cancel_timeout_s: float = 5.0,
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
@@ -132,6 +133,7 @@ class Worker:
             self._client = BackendClient(
                 backend_url, api_key, timeout_s=request_timeout_s,
                 file_timeout_s=file_timeout_s,
+                cancel_timeout_s=cancel_timeout_s,
                 max_retries=max_retries,
                 retry_backoff_s=retry_backoff_s,
                 retry_backoff_max_s=retry_backoff_max_s,

@@ -117,6 +117,7 @@ class BackendClient:
         *,
         timeout_s: float = 30.0,
         file_timeout_s: Optional[float] = None,
+        cancel_timeout_s: Optional[float] = 5.0,
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
@@ -175,6 +176,21 @@ class BackendClient:
         # impose a separate file deadline.
         self._file_timeout: Optional[httpx.Timeout] = (
             httpx.Timeout(file_timeout_s) if file_timeout_s is not None else None
+        )
+        # Cancel polling (get_cancel_status) is a cheap read-only GET that the
+        # CancelGuard fires every ``cancel_poll_interval_s`` (default 2s). It
+        # used the 30s general request timeout, meaning a single slow poll
+        # under backend load could block the guard for 30s (plus retry backoff)
+        # — during which the worker kept computing on a task the user had
+        # already cancelled. A dedicated short deadline keeps cancel detection
+        # responsive: a stalled poll fails fast (caught by CancelGuard's
+        # try/except), the next poll fires on schedule, and the worker learns
+        # of the cancel within seconds instead of tens of seconds. The 30s
+        # general timeout still governs claim/heartbeat/complete/fail. ``None``
+        # falls back to the client's own timeout for consumers that don't want
+        # a separate cancel deadline.
+        self._cancel_timeout: Optional[httpx.Timeout] = (
+            httpx.Timeout(cancel_timeout_s) if cancel_timeout_s is not None else None
         )
         self._payload_logger = payload_logger
 
@@ -374,9 +390,19 @@ class BackendClient:
         return resp.json() or {}
 
     async def get_cancel_status(self, task_id: int) -> dict:
-        """GET /tasks/{id}/cancel-status — cheap read-only cancel check."""
+        """GET /tasks/{id}/cancel-status — cheap read-only cancel check.
+
+        Uses the dedicated ``cancel_timeout_s`` deadline (default 5s, set via
+        :meth:`BackendClient.__init__`) rather than the 30s general request
+        timeout. The CancelGuard polls this endpoint every few seconds; a
+        single slow poll under backend load would otherwise block cancel
+        detection for 30s (plus retry backoff), keeping the worker blind to a
+        user cancel. The short deadline fails fast — CancelGuard catches the
+        timeout and the next poll fires on schedule.
+        """
         resp = await self._request(
             "GET", f"/tasks/{task_id}/cancel-status",
+            timeout=self._cancel_timeout,
         )
         return resp.json() or {}
 
