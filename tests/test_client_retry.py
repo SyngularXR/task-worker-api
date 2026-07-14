@@ -693,21 +693,26 @@ def test_init_accepts_max_retries_one():
 
 
 # -----------------------------------------------------------------------
-# Transient 5xx gateway retry — the backend sits behind nginx; a 502/503/504
+# Transient gateway retry — the backend sits behind nginx; a 502/503/504
 # almost always means the Flask upstream restarted or is momentarily
 # overloaded. Previously every HTTPStatusError (including these transient
 # gateway codes) surfaced immediately, failing the task on a blip that clears
 # in seconds. Now 502/503/504 are retried with the same backoff as transport
-# errors; 500 and 4xx still surface immediately (500 = app logic error, 4xx =
-# client error — retrying won't help).
+# errors; 500 and non-429 4xx still surface immediately (500 = app logic
+# error, 4xx = client error — retrying won't help).
+#
+# 429 (Too Many Requests) is also retried: the shared backend rate-limits
+# lifecycle calls (complete/fail/progress) under fleet burst load, and
+# dropping the terminal status on a 429 would strand the task in_progress
+# until the sweeper reclaims it.
 # -----------------------------------------------------------------------
 
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [502, 503, 504])
+@pytest.mark.parametrize("status", [429, 502, 503, 504])
 async def test_request_retries_on_transient_gateway_status_then_succeeds(status):
-    """A 502/503/504 from the gateway is transient (upstream restart/overload)
-    and must be retried with backoff, not failed immediately."""
+    """A 429/502/503/504 from the backend is transient (rate-limit /
+    upstream restart/overload) and must be retried with backoff, not failed
+    immediately."""
     calls = {"n": 0}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1552,3 +1557,72 @@ async def test_lifecycle_timeout_none_falls_back_to_client_default():
     assert seen[0] is not None
     assert seen[0]["read"] is None
     assert seen[0]["write"] is None
+
+
+# -----------------------------------------------------------------------
+# 429 (Too Many Requests) retry — the shared backend serves 3+ workers and
+# can rate-limit a lifecycle call under burst load. A terminal complete/fail
+# that hits a 429 must be retried with backoff; otherwise the task is left
+# stuck in_progress until the sweeper reclaims it.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_complete_retries_on_429_then_succeeds():
+    """A 429 on a terminal complete call must be retried, not dropped.
+
+    This is the core reliability scenario: the backend rate-limits the
+    complete request, and the worker rides through it with backoff so the
+    task reaches its terminal status instead of being stranded in_progress.
+    """
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(429, text="Too Many Requests")
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.complete(7, {"output": "done"})
+    await client.close()
+
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_fail_retries_on_429_then_succeeds():
+    """A 429 on a terminal fail call must be retried with backoff so the
+    task reaches its failed status rather than being stranded in_progress."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return httpx.Response(429, text="Too Many Requests")
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.fail(7, "boom")
+    await client.close()
+
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_request_retries_429_then_raises_after_exhaustion():
+    """When every attempt returns 429, the last HTTPStatusError is re-raised
+    to the caller — the same exhaustion contract as 5xx gateway codes."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, text="Too Many Requests")
+
+    client = _client_with_handler(handler, max_retries=3)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert calls["n"] == 3
+    assert exc_info.value.response.status_code == 429

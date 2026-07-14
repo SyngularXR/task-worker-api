@@ -32,11 +32,18 @@ _RETRYABLE_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 # seconds. Retrying these (instead of failing the task outright) lets a worker
 # ride through a backend redeploy or a momentary load spike.
 #
+# 429 (Too Many Requests) is included because the shared backend serves 3+
+# workers (Neural-Canvas, Blender-CLI, colmap-splat); under burst load it can
+# rate-limit a lifecycle call (complete/fail/progress). Dropping the terminal
+# status on a 429 leaves the task stuck in_progress until the sweeper reclaims
+# it — retrying with backoff lets the worker self-heal instead.
+#
 # 500 is intentionally excluded: a 500 is the application's own error
 # response, which usually signals a logic bug or a bad payload, not a
 # transient outage — retrying it just burns budget and re-logs the same error.
-# 4xx is excluded for the same reason (client error, retrying won't help).
-_TRANSIENT_STATUS_CODES = frozenset({502, 503, 504})
+# Other 4xx codes are excluded for the same reason (client error, retrying
+# won't help).
+_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
 
 # Default ceiling for a single retry delay. Without a cap, backoff grows as
 # ``retry_backoff_s * 2**n`` — unbounded. A worker configured with the
@@ -65,7 +72,7 @@ _DEFAULT_FILE_TIMEOUT_S = 300.0
 
 
 def _is_transient_status(exc: httpx.HTTPStatusError) -> bool:
-    """True iff a status error's code is a transiently-retryable gateway code."""
+    """True iff a status error's code is a transiently-retryable code."""
     return exc.response.status_code in _TRANSIENT_STATUS_CODES
 
 
@@ -239,10 +246,12 @@ class BackendClient:
 
         - ``httpx.TransportError`` / ``httpx.TimeoutException`` — the request
           never reached the backend or the connection dropped.
-        - ``httpx.HTTPStatusError`` whose status is a transient gateway code
-          (502/503/504) — the gateway is up but the upstream Flask app is
-          momentarily unavailable (restart, overload, deploy). Other status
-          errors (500, 4xx) surface immediately without consuming retry
+        - ``httpx.HTTPStatusError`` whose status is a transient code
+          (429/502/503/504) — 429 means the backend rate-limited the call
+          (the shared backend serves the whole fleet), while 502/503/504 mean
+          the gateway is up but the upstream Flask app is momentarily
+          unavailable (restart, overload, deploy). Other status errors
+          (500, non-429 4xx) surface immediately without consuming retry
           budget, matching the pre-existing non-transient pass-through contract.
 
         The backoff is exponential (``retry_backoff_s * 2**n``), capped at
@@ -301,7 +310,7 @@ class BackendClient:
         """Request with exponential-backoff retry on transient errors.
 
         Retries ``httpx.TransportError`` / ``httpx.TimeoutException`` and
-        transient 5xx gateway status codes (502/503/504); other HTTP status
+        transient status codes (429/502/503/504); other HTTP status
         errors surface immediately. Uses no third-party retry library to keep
         SDK dependencies minimal.
 
@@ -341,7 +350,7 @@ class BackendClient:
         # /tasks/next route) as success variants, so it can't reuse _request's
         # blanket raise_for_status. It calls _retry directly with a closure
         # that returns the response for 204/404 and raises for everything else
-        # — so a transient 502/503/504 is still retried here, matching every
+        # — so a transient 429/502/503/504 is still retried here, matching every
         # other backend call.
         async def _claim_once() -> Optional[httpx.Response]:
             resp = await self._client.request(
@@ -468,7 +477,7 @@ class BackendClient:
 
         Retries on the same transient errors as every other backend call
         (``httpx.TransportError`` / ``httpx.TimeoutException``, plus transient
-        5xx gateway status codes 502/503/504).  Each attempt re-opens ``dest``
+        status codes 429/502/503/504).  Each attempt re-opens ``dest``
         with ``"wb"`` (truncating), so a retry after a mid-stream failure
         writes a clean file rather than appending to a partial one.  A
         non-transient HTTP status error (e.g. 404/500) is raised immediately
@@ -514,7 +523,7 @@ class BackendClient:
 
         Retries on the same transient errors as every other backend call
         (``httpx.TransportError`` / ``httpx.TimeoutException``, plus transient
-        5xx gateway status codes 502/503/504).  The source file is opened
+        status codes 429/502/503/504).  The source file is opened
         **inside** the per-attempt closure, so each retry gets a fresh handle
         starting at byte 0 — opening it once outside the loop would exhaust
         the handle on the first attempt and send zero bytes on every

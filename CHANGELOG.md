@@ -40,6 +40,18 @@
   `None` (disable the cap) was always a supported value; no runtime change.
 
 **Fixes:**
+- `BackendClient` now treats HTTP 429 (Too Many Requests) as a transient
+  status code alongside 502/503/504, retrying it with exponential backoff.
+  The shared backend serves 3+ workers (Neural-Canvas, Blender-CLI,
+  colmap-splat); under burst load it can rate-limit a lifecycle call
+  (complete/fail/progress). Previously a 429 on a terminal complete/fail
+  surfaced immediately, dropping the status update and leaving the task
+  stuck in_progress until the sweeper reclaimed it. Now the worker
+  self-heals through a rate-limit blip the same way it rides through a
+  gateway restart. The change is additive and backward-compatible: 429 was
+  not previously retried, so no consumer relied on it surfacing
+  immediately, and the exhaustion contract (re-raise the last
+  `HTTPStatusError`) is unchanged.
 - `BackendClient` now applies a dedicated `lifecycle_timeout_s` (default 15s)
   to `report_progress`, `complete`, and `fail`, instead of the 30s general
   request timeout. These are the worker's terminal-ish status calls; under
