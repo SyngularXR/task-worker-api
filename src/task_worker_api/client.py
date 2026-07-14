@@ -118,6 +118,7 @@ class BackendClient:
         timeout_s: float = 30.0,
         file_timeout_s: Optional[float] = None,
         cancel_timeout_s: Optional[float] = 5.0,
+        lifecycle_timeout_s: Optional[float] = 15.0,
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
@@ -186,11 +187,30 @@ class BackendClient:
         # responsive: a stalled poll fails fast (caught by CancelGuard's
         # try/except), the next poll fires on schedule, and the worker learns
         # of the cancel within seconds instead of tens of seconds. The 30s
-        # general timeout still governs claim/heartbeat/complete/fail. ``None``
-        # falls back to the client's own timeout for consumers that don't want
-        # a separate cancel deadline.
+        # general timeout still governs claim; report_progress/complete/fail
+        # have their own ``lifecycle_timeout_s`` deadline. ``None`` falls back
+        # to the client's own timeout for consumers that don't want a separate
+        # cancel deadline.
         self._cancel_timeout: Optional[httpx.Timeout] = (
             httpx.Timeout(cancel_timeout_s) if cancel_timeout_s is not None else None
+        )
+        # Lifecycle writes (report_progress / complete / fail) are the worker's
+        # terminal-ish status calls. They used the 30s general request timeout,
+        # so a temporarily-slow backend could block the polling loop for up to
+        # 30s × max_retries (~120s with the default 4 attempts) on a single
+        # heartbeat or complete call — during which the worker can't claim new
+        # work, poll for cancel, or respond to shutdown. A dedicated shorter
+        # deadline (default 15s) bounds that worst case: a stalled lifecycle
+        # call fails fast, the retry loop still rides through transient blips
+        # (4 × 15s = 60s total instead of 4 × 30s = 120s), and the polling
+        # loop stays responsive under backend load. This completes the
+        # timeout-separation pattern established by cancel_timeout_s
+        # (cancel-poll) and file_timeout_s (file transfers): the 30s general
+        # timeout now governs only claim_next. ``None`` falls back to the
+        # client's own timeout for consumers that don't want a separate
+        # lifecycle deadline.
+        self._lifecycle_timeout: Optional[httpx.Timeout] = (
+            httpx.Timeout(lifecycle_timeout_s) if lifecycle_timeout_s is not None else None
         )
         self._payload_logger = payload_logger
 
@@ -378,7 +398,15 @@ class BackendClient:
         total: int = 0,
         kill_handle: Optional[dict] = None,
     ) -> dict:
-        """PUT /tasks/{id}/progress — heartbeat + progress. Returns response body."""
+        """PUT /tasks/{id}/progress — heartbeat + progress. Returns response body.
+
+        Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s, set
+        via :meth:`BackendClient.__init__`) rather than the 30s general request
+        timeout. A heartbeat that stalls under backend load should fail fast
+        so the polling loop stays responsive and the next heartbeat fires on
+        schedule, rather than blocking the worker for up to 120s (30s × 4
+        retries) on a single slow progress call.
+        """
         body: dict[str, Any] = {
             "stage": stage, "current": current, "total": total,
         }
@@ -386,6 +414,7 @@ class BackendClient:
             body["kill_handle"] = kill_handle
         resp = await self._request(
             "PUT", f"/tasks/{task_id}/progress", json=body,
+            timeout=self._lifecycle_timeout,
         )
         return resp.json() or {}
 
@@ -407,15 +436,27 @@ class BackendClient:
         return resp.json() or {}
 
     async def complete(self, task_id: int, result: dict) -> None:
-        """PUT /tasks/{id}/complete — final success payload."""
+        """PUT /tasks/{id}/complete — final success payload.
+
+        Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s) so
+        a stalled complete call fails fast instead of blocking the polling
+        loop for up to 120s (30s × 4 retries) under backend load.
+        """
         await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
+            timeout=self._lifecycle_timeout,
         )
 
     async def fail(self, task_id: int, error: str) -> None:
-        """PUT /tasks/{id}/fail — final failure payload."""
+        """PUT /tasks/{id}/fail — final failure payload.
+
+        Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s) so
+        a stalled fail call fails fast instead of blocking the polling loop
+        for up to 120s (30s × 4 retries) under backend load.
+        """
         await self._request(
             "PUT", f"/tasks/{task_id}/fail", json={"error": error},
+            timeout=self._lifecycle_timeout,
         )
 
     # ----- file transfer (remote mode workers) ----------------------

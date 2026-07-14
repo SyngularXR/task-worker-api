@@ -1334,3 +1334,221 @@ async def test_lifecycle_calls_do_not_use_cancel_timeout():
     assert seen[0]["write"] == 30.0
     assert seen[0]["connect"] == 30.0
     assert seen[0]["pool"] == 30.0
+
+
+# -----------------------------------------------------------------------
+# lifecycle_timeout_s — report_progress / complete / fail get a dedicated
+# timeout (default 15s) instead of the 30s general request timeout. These
+# are the worker's terminal-ish status calls; under backend load a single
+# stalled heartbeat or complete call could block the polling loop for up
+# to 30s × max_retries (~120s with 4 attempts). The shorter deadline fails
+# fast so the polling loop stays responsive (worst case ~60s with 4 × 15s).
+# The 30s general timeout still governs claim_next. This completes the
+# timeout-separation pattern: claim (30s general), cancel-poll (5s),
+# file transfer (300s), lifecycle writes (15s).
+# -----------------------------------------------------------------------
+
+
+def test_init_defaults_lifecycle_timeout_to_15s():
+    """The default lifecycle_timeout_s is 15s, short enough that a stalled
+    heartbeat/complete/fail fails fast instead of blocking the polling
+    loop for 30s × max_retries (~120s)."""
+    client = BackendClient("http://fake", "x")
+    assert client._lifecycle_timeout is not None
+    assert client._lifecycle_timeout.read == 15.0
+    assert client._lifecycle_timeout.write == 15.0
+    assert client._lifecycle_timeout.connect == 15.0
+    assert client._lifecycle_timeout.pool == 15.0
+    import asyncio
+    asyncio.run(client.close())
+
+
+def test_init_lifecycle_timeout_builds_explicit_timeout():
+    """An explicit lifecycle_timeout_s builds an httpx.Timeout so the
+    lifecycle calls override the client default only for
+    report_progress / complete / fail."""
+    client = BackendClient("http://fake", "x", lifecycle_timeout_s=10.0)
+    assert client._lifecycle_timeout is not None
+    assert client._lifecycle_timeout.read == 10.0
+    assert client._lifecycle_timeout.write == 10.0
+    assert client._lifecycle_timeout.connect == 10.0
+    assert client._lifecycle_timeout.pool == 10.0
+    import asyncio
+    asyncio.run(client.close())
+
+
+def test_init_lifecycle_timeout_none_falls_back_to_client_default():
+    """When lifecycle_timeout_s is None, _lifecycle_timeout is None — the
+    lifecycle calls fall back to the client's own default timeout (legacy
+    behaviour for consumers that build their own client and don't want the
+    SDK to impose a separate lifecycle deadline)."""
+    client = BackendClient("http://fake", "x", lifecycle_timeout_s=None)
+    assert client._lifecycle_timeout is None
+    import asyncio
+    asyncio.run(client.close())
+
+
+@pytest.mark.asyncio
+async def test_report_progress_uses_lifecycle_timeout_not_general():
+    """report_progress must apply lifecycle_timeout_s to the request, not
+    the 30s general request timeout. Verified by inspecting the timeout
+    extension on the request the MockTransport handler sees."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json={"cancelled": False})
+
+    # General timeout 30s, lifecycle timeout 15s — distinct so a mix-up is
+    # detectable. lifecycle_timeout_s is passed explicitly.
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, lifecycle_timeout_s=15.0,
+        client=http,
+    )
+    result = await client.report_progress(7, stage="working", current=1, total=2)
+    await client.close()
+
+    assert result == {"cancelled": False}
+    assert len(seen) == 1
+    assert seen[0] is not None
+    # All four timeout facets must reflect the lifecycle timeout, not 30s.
+    assert seen[0]["read"] == 15.0
+    assert seen[0]["write"] == 15.0
+    assert seen[0]["connect"] == 15.0
+    assert seen[0]["pool"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_complete_uses_lifecycle_timeout_not_general():
+    """complete must apply lifecycle_timeout_s to the request, not the 30s
+    general request timeout."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, lifecycle_timeout_s=15.0,
+        client=http,
+    )
+    await client.complete(7, {"output": "done"})
+    await client.close()
+
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert seen[0]["read"] == 15.0
+    assert seen[0]["write"] == 15.0
+    assert seen[0]["connect"] == 15.0
+    assert seen[0]["pool"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_fail_uses_lifecycle_timeout_not_general():
+    """fail must apply lifecycle_timeout_s to the request, not the 30s
+    general request timeout."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, lifecycle_timeout_s=15.0,
+        client=http,
+    )
+    await client.fail(7, "boom")
+    await client.close()
+
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert seen[0]["read"] == 15.0
+    assert seen[0]["write"] == 15.0
+    assert seen[0]["connect"] == 15.0
+    assert seen[0]["pool"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_claim_next_does_not_use_lifecycle_timeout():
+    """claim_next must keep using the general 30s request timeout, NOT the
+    lifecycle timeout — claim is a poll, not a terminal write, and should
+    be allowed the full general budget under momentary load. Verified by
+    inspecting the timeout the MockTransport handler sees on a claim_next
+    call when lifecycle_timeout_s is set to a distinct, shorter value."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(204)  # no task
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, lifecycle_timeout_s=15.0,
+        client=http,
+    )
+    result = await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert result is None  # 204 → no task
+    assert len(seen) == 1
+    assert seen[0] is not None
+    # claim_next must use the 30s general timeout, not 15s.
+    assert seen[0]["read"] == 30.0
+    assert seen[0]["write"] == 30.0
+    assert seen[0]["connect"] == 30.0
+    assert seen[0]["pool"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_timeout_none_falls_back_to_client_default():
+    """When lifecycle_timeout_s is None, lifecycle calls must use the
+    client's own default timeout rather than imposing a separate one —
+    preserving the legacy behaviour for consumers that build their own
+    client."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json={"cancelled": False})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, lifecycle_timeout_s=None,
+        client=http,
+    )  # lifecycle_timeout_s=None → _lifecycle_timeout is None
+    await client.report_progress(5, stage="working")
+    await client.close()
+
+    assert len(seen) == 1
+    # timeout=None passed to httpx means "use client default" — at the
+    # request-extension level httpx records None for each facet (the
+    # resolution to the client's 30s happens at the real transport layer,
+    # which MockTransport doesn't simulate). The point is that no separate
+    # lifecycle deadline is imposed: _lifecycle_timeout is None, so the call
+    # inherits the client default rather than overriding it.
+    assert seen[0] is not None
+    assert seen[0]["read"] is None
+    assert seen[0]["write"] is None

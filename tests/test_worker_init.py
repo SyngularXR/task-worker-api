@@ -213,6 +213,45 @@ async def test_worker_init_default_cancel_timeout_is_5():
         await worker._client.close()
 
 
+# --- lifecycle_timeout_s threading -----------------------------------------
+
+
+async def test_worker_init_threads_lifecycle_timeout_to_client():
+    """When Worker constructs its own BackendClient (no client= passed),
+    lifecycle_timeout_s must be forwarded so heartbeat/complete/fail calls
+    get the shorter deadline rather than the 30s general request timeout."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+        lifecycle_timeout_s=10.0,
+    )
+    try:
+        assert worker._client._lifecycle_timeout is not None
+        assert worker._client._lifecycle_timeout.read == 10.0
+    finally:
+        await worker._client.close()
+
+
+async def test_worker_init_default_lifecycle_timeout_is_15():
+    """The default lifecycle_timeout_s (15s) must reach the BackendClient
+    when the Worker constructs one itself — short enough that a stalled
+    heartbeat/complete/fail fails fast instead of blocking the polling
+    loop for 30s × max_retries (~120s)."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+    )
+    try:
+        assert worker._client._lifecycle_timeout is not None
+        assert worker._client._lifecycle_timeout.read == 15.0
+    finally:
+        await worker._client.close()
+
+
 # --- retry-tuning parameter threading --------------------------------------
 
 
