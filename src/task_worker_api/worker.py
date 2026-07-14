@@ -94,6 +94,7 @@ class Worker:
         shared_volume_path: Optional[str] = None,
         poll_interval_s: float = 5.0,
         heartbeat_interval_s: float = 10.0,
+        heartbeat_warn_threshold: int = 3,
         cancel_poll_interval_s: float = 2.0,
         request_timeout_s: float = 30.0,
         file_timeout_s: float = 300.0,
@@ -120,6 +121,7 @@ class Worker:
         self.shared_volume_path = shared_volume_path
         self.poll_interval_s = poll_interval_s
         self.heartbeat_interval_s = heartbeat_interval_s
+        self.heartbeat_warn_threshold = heartbeat_warn_threshold
         self.cancel_poll_interval_s = cancel_poll_interval_s
         self.task_timeout_s = task_timeout_s
         self.task_timeouts = task_timeouts or {}
@@ -375,6 +377,7 @@ class Worker:
         progress = ProgressReporter(
             self._client, task.id,
             heartbeat_interval_s=self.heartbeat_interval_s,
+            heartbeat_warn_threshold=self.heartbeat_warn_threshold,
         )
 
         timeout_s = resolve_task_timeout(

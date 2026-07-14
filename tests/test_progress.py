@@ -180,6 +180,118 @@ async def test_heartbeat_loop_tolerates_transient_errors(caplog):
     assert len(client.progress_events) >= 1
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_escalates_to_warning_after_threshold(caplog):
+    """Sustained backend failures (>= heartbeat_warn_threshold, default 3)
+    must escalate from DEBUG to WARNING so a long-running worker (colmap-splat,
+    Neural-Canvas) surfaces an unreachable backend at the default log level
+    instead of silently masking it at DEBUG until the sweeper reclaims the
+    task. Each tick past the threshold re-warns so the outage stays loud."""
+
+    class _DeadClient(FakeBackendClient):
+        async def report_progress(self, task_id, *, stage, current=0, total=0,
+                                  kill_handle=None):
+            raise ConnectionError("backend unreachable")
+
+    client = _DeadClient()
+    pr = ProgressReporter(client, task_id=1, heartbeat_interval_s=0.01)
+    with caplog.at_level("DEBUG"):
+        await pr.start_heartbeat()
+        await asyncio.sleep(0.10)  # >= 3 ticks at 0.01s
+        await pr.stop()
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"
+                and "consecutive failures" in r.message]
+    debugs = [r for r in caplog.records if r.levelname == "DEBUG"
+              and "heartbeat failed" in r.message]
+    # At least one WARNING fired once the threshold was crossed.
+    assert warnings, "expected at least one WARNING after threshold"
+    # The first (threshold - 1) failures stayed at DEBUG.
+    assert debugs, "expected sub-threshold failures at DEBUG"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_resets_failure_count_on_success(caplog):
+    """A successful tick after failures must reset the consecutive-failure
+    counter, so a future failure sequence starts again from DEBUG rather than
+    accumulating toward a spurious WARNING from a prior blip."""
+
+    class _RecoveringClient(FakeBackendClient):
+        def __init__(self):
+            super().__init__()
+            self._calls = 0
+
+        async def report_progress(self, task_id, *, stage, current=0, total=0,
+                                  kill_handle=None):
+            self._calls += 1
+            # 2 failures (below default threshold of 3), then recover.
+            if self._calls <= 2:
+                raise ConnectionError("transient")
+            return await super().report_progress(
+                task_id, stage=stage, current=current, total=total,
+                kill_handle=kill_handle,
+            )
+
+    client = _RecoveringClient()
+    pr = ProgressReporter(client, task_id=1, heartbeat_interval_s=0.01)
+    with caplog.at_level("DEBUG"):
+        await pr.start_heartbeat()
+        await asyncio.sleep(0.08)  # 2 failures + several successes
+        await pr.stop()
+
+    # 2 failures < threshold(3) → no WARNING should have fired.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"
+                and "consecutive failures" in r.message]
+    assert not warnings, "sub-threshold failures must not warn"
+    # Counter reset: failures stayed DEBUG and successes followed.
+    assert client._calls >= 4
+    assert len(client.progress_events) >= 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_warn_threshold_is_configurable(caplog):
+    """heartbeat_warn_threshold must be tunable so a worker that wants every
+    failure surfaced (threshold=1) can get it, or one that tolerates more
+    churn can raise it. With threshold=1 the first failure already warns."""
+
+    class _DeadClient(FakeBackendClient):
+        async def report_progress(self, task_id, *, stage, current=0, total=0,
+                                  kill_handle=None):
+            raise ConnectionError("backend unreachable")
+
+    client = _DeadClient()
+    pr = ProgressReporter(
+        client, task_id=1,
+        heartbeat_interval_s=0.01,
+        heartbeat_warn_threshold=1,
+    )
+    with caplog.at_level("DEBUG"):
+        await pr.start_heartbeat()
+        await asyncio.sleep(0.05)
+        await pr.stop()
+
+    # threshold=1 → the very first failure is a WARNING, none at DEBUG.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"
+                and "consecutive failures" in r.message]
+    debugs = [r for r in caplog.records if r.levelname == "DEBUG"
+              and "heartbeat failed" in r.message]
+    assert warnings, "threshold=1 must warn on the first failure"
+    assert not debugs, "threshold=1 must leave no failure at DEBUG"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_warn_threshold_clamped_to_one():
+    """A threshold < 1 would never fire (failures can't reach 0 negatives),
+    silently disabling the escalation. Clamp to 1 so a misconfigured 0 still
+    surfaces outages rather than swallowing them."""
+
+    pr = ProgressReporter(
+        FakeBackendClient(), task_id=1,
+        heartbeat_warn_threshold=0,
+    )
+    assert pr._warn_threshold == 1
+
+
 # ----- link_cancelled (external CancelGuard event) ---------------------------
 
 
