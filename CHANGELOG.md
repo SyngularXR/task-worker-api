@@ -2,7 +2,28 @@
 
 ## Unreleased
 
-**Features:**
+**Fixes:**
+- `BackendClient` now exposes a `poll_cancel_status` method: a one-shot
+  GET `/tasks/{id}/cancel-status` with no retries and the dedicated
+  `cancel_timeout_s` deadline. The `CancelGuard` (which polls this
+  endpoint on its own `cancel_poll_interval_s` schedule, default 2s)
+  now uses `poll_cancel_status` instead of `get_cancel_status`.
+  Previously the guard's poll went through `get_cancel_status` →
+  `_request` → `_retry`, retrying up to `max_retries` (4) times with
+  exponential backoff. A degraded backend could blind the guard for
+  up to `max_retries` × `cancel_timeout_s` plus backoff sleeps (~50s
+  with default 4 attempts, 5s timeout, 2s base backoff) — during which
+  the worker kept computing and uploading outputs for a task the user
+  had already cancelled. The one-shot call fails fast (within
+  `cancel_timeout_s`, default 5s): transport errors and transient HTTP
+  status codes surface immediately, the guard catches them at DEBUG,
+  and the next poll fires on schedule. Cancel detection drops from
+  ~50s worst-case to `cancel_timeout_s` + `poll_interval_s` (default
+  5s + 2s = ~7s). The change is additive and backward-compatible:
+  `get_cancel_status` is unchanged (still retried via `_retry`), so
+  any external callers are unaffected; `poll_cancel_status` is a new
+  method. `FakeBackendClient` mirrors the new method so the test
+  double stays a complete drop-in.
 - `Worker._run_one` now links the `CancelGuard`'s `cancelled` event into
   the `ProgressReporter` via the new `ProgressReporter.link_cancelled()`
   method, so `ctx.progress.is_cancelled` and

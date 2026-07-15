@@ -1626,3 +1626,199 @@ async def test_request_retries_429_then_raises_after_exhaustion():
 
     assert calls["n"] == 3
     assert exc_info.value.response.status_code == 429
+
+
+# -----------------------------------------------------------------------
+# poll_cancel_status — one-shot cancel-poll with NO retries. The
+# CancelGuard polls /tasks/{id}/cancel-status on its own schedule
+# (cancel_poll_interval_s, default 2s). Previously it called
+# get_cancel_status → _request → _retry, which retries 4× with
+# exponential backoff; a degraded backend could blind the guard for
+# ~50s while the worker kept computing on a cancelled task. The new
+# method does a single GET with cancel_timeout_s and surfaces errors
+# immediately — the guard catches them and retries on its own next tick.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_does_not_retry_transport_error():
+    """A transient TransportError must surface immediately — exactly one
+    attempt, no backoff. The CancelGuard retries on its own poll interval."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.TransportError("transient hiccup")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.TransportError, match="transient hiccup"):
+        await client.poll_cancel_status(7)
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_does_not_retry_transient_5xx():
+    """A 503 must surface immediately — the guard retries on its own
+    schedule, not the client's backoff loop."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, text="Service Unavailable")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.poll_cancel_status(7)
+    await client.close()
+
+    assert calls["n"] == 1
+    assert exc_info.value.response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_does_not_retry_429():
+    """A 429 must surface immediately — same one-shot contract as 5xx."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, text="Too Many Requests")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.poll_cancel_status(7)
+    await client.close()
+
+    assert calls["n"] == 1
+    assert exc_info.value.response.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_does_not_retry_timeout():
+    """A TimeoutException must surface immediately — no backoff sleep."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.TimeoutException("read timed out")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.TimeoutException):
+        await client.poll_cancel_status(7)
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_no_backoff_sleeps(monkeypatch):
+    """The one-shot method must not schedule any backoff sleeps — the
+    guard owns the retry cadence."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TransportError("keep failing")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.TransportError):
+        await client.poll_cancel_status(7)
+    await client.close()
+
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_uses_cancel_timeout_not_general():
+    """poll_cancel_status must apply cancel_timeout_s to the request, not
+    the 30s general request timeout — same deadline as get_cancel_status."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json={"cancelled": False})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, cancel_timeout_s=5.0,
+        client=http,
+    )
+    result = await client.poll_cancel_status(7)
+    await client.close()
+
+    assert result == {"cancelled": False}
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert seen[0]["read"] == 5.0
+    assert seen[0]["write"] == 5.0
+    assert seen[0]["connect"] == 5.0
+    assert seen[0]["pool"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_returns_json_body():
+    """A successful one-shot poll returns the parsed JSON body."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"cancelled": True})
+
+    client = _client_with_handler(handler)
+    result = await client.poll_cancel_status(7)
+    await client.close()
+
+    assert result == {"cancelled": True}
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_raises_on_500():
+    """A 500 is non-transient — must surface immediately (one attempt)."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.poll_cancel_status(7)
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_poll_cancel_status_cancel_timeout_none_falls_back():
+    """When cancel_timeout_s is None, poll_cancel_status must use the
+    client's own default timeout — same legacy fallback as
+    get_cancel_status."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json={"cancelled": False})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, cancel_timeout_s=None,
+        client=http,
+    )
+    await client.poll_cancel_status(5)
+    await client.close()
+
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert seen[0]["read"] is None
+    assert seen[0]["write"] is None

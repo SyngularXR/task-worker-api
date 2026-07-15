@@ -15,6 +15,7 @@ import asyncio
 import pytest
 
 from task_worker_api.cancel import CancelGuard
+from task_worker_api.enums import TaskStatus
 from task_worker_api.errors import TaskCancelled
 from task_worker_api.testing import FakeBackendClient
 
@@ -121,3 +122,79 @@ async def test_guard_cancels_poll_task_on_clean_exit():
     # If the poll task weren't properly cancelled we'd see a "Task was
     # destroyed but it is pending!" warning. pytest-asyncio surfaces those
     # as errors on some configs; a clean pass means the finally block worked.
+
+
+@pytest.mark.asyncio
+async def test_guard_uses_poll_cancel_status_not_get_cancel_status():
+    """CancelGuard must call ``poll_cancel_status`` (one-shot, no retries)
+    rather than ``get_cancel_status`` (which goes through ``_retry`` with
+    exponential backoff). The guard has its own poll-interval retry, so
+    the client-level backoff chain only delays cancel detection — a
+    degraded backend could blind the guard for ~50s with the old path.
+    """
+    called_methods: list[str] = []
+
+    class _TrackingClient(FakeBackendClient):
+        async def get_cancel_status(self, task_id):
+            called_methods.append("get_cancel_status")
+            return await super().get_cancel_status(task_id)
+
+        async def poll_cancel_status(self, task_id):
+            called_methods.append("poll_cancel_status")
+            # Return directly — don't delegate to get_cancel_status (which
+            # would record itself in called_methods and muddle the assertion).
+            return {
+                "cancelled": task_id in self.cancelled_task_ids,
+                "status": int(
+                    TaskStatus.CANCELLED if task_id in self.cancelled_task_ids
+                    else TaskStatus.IN_PROGRESS
+                ),
+                "cancelled_reason": (
+                    "user" if task_id in self.cancelled_task_ids else None
+                ),
+            }
+
+    client = _TrackingClient()
+    client.mark_cancelled(1)
+
+    with pytest.raises(TaskCancelled):
+        async with CancelGuard(
+            client, task_id=1, poll_interval_s=0.01,
+        ) as cancelled:
+            await asyncio.wait_for(cancelled.wait(), timeout=2)
+
+    assert "poll_cancel_status" in called_methods
+    assert "get_cancel_status" not in called_methods
+
+
+@pytest.mark.asyncio
+async def test_guard_poll_error_uses_one_shot_no_retries():
+    """A transient error from poll_cancel_status must result in exactly one
+    call per poll cycle — the guard retries on its own schedule, not the
+    client's backoff loop. With the old get_cancel_status path, a
+    TransportError triggered 4 retry attempts with backoff sleeps before
+    the guard could move on.
+    """
+    call_count = {"n": 0}
+
+    class _AlwaysFailingClient(FakeBackendClient):
+        async def poll_cancel_status(self, task_id):
+            call_count["n"] += 1
+            raise ConnectionError("backend unreachable")
+
+    client = _AlwaysFailingClient()
+    with pytest.raises(asyncio.TimeoutError):
+        async with CancelGuard(
+            client, task_id=1, poll_interval_s=0.02,
+        ) as cancelled:
+            # Wait long enough for a few poll cycles, then time out.
+            await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+
+    # Each poll cycle = exactly 1 call (no retries). With 0.02s interval
+    # and 0.1s window, we expect ~3-5 calls. If _retry were active, each
+    # cycle would fire 4 calls (max_retries=4), giving ~12-20.
+    assert call_count["n"] <= 8, (
+        f"expected ~one call per poll cycle, got {call_count['n']} — "
+        "poll_cancel_status should not retry"
+    )
+    assert call_count["n"] >= 2, "expected at least 2 poll cycles"
