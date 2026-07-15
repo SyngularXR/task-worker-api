@@ -326,6 +326,22 @@
   emitted exactly once; both keys still appear in `TaskParamsByType`.
 - Regenerate `artifacts/task-worker-types/index.ts` (was stale since v0.10.0 —
   missing `gs4d_build` / `finalize_segment` from the TaskType enum).
+- `ProgressReporter._heartbeat_loop` now escalates heartbeat-failure logging
+  from DEBUG to WARNING after `heartbeat_warn_threshold` consecutive failures
+  (default 3, configurable via `Worker(..., heartbeat_warn_threshold=N)` and
+  `ProgressReporter(..., heartbeat_warn_threshold=N)`). A single failed
+  heartbeat tick — the `BackendClient` has already exhausted its own retries
+  by then — stays at DEBUG, since a transient blip during a long-running task
+  is noise an operator doesn't need. But a *sustained* outage means the
+  backend is unreachable and the task's `updated_at` is going stale, which
+  the sweeper will soon read as abandonment and reclaim — wasting compute that
+  is diagnosed minutes earlier once the failure is visible at the default
+  (WARNING) log level instead of masked at DEBUG. The counter resets to 0 on
+  the next successful tick, so a recovered backend doesn't keep warning. The
+  change is additive and backward-compatible: the new parameter defaults to
+  the prior-capable behaviour (DEBUG on failure) for the first (threshold−1)
+  ticks and only adds WARNING escalation beyond that; consumers that never
+  set `heartbeat_warn_threshold` see strictly more signal, never less.
 
 ## v0.10.0 — 2026-06-29
 

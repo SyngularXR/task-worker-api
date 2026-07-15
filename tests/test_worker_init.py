@@ -334,6 +334,44 @@ def test_worker_init_ignores_retry_params_when_client_supplied(make_worker, fake
     assert worker._client is fake_client
 
 
+# --- heartbeat_warn_threshold threading ------------------------------------
+
+
+async def test_worker_init_threads_heartbeat_warn_threshold():
+    """When Worker constructs its own BackendClient (no client= passed),
+    heartbeat_warn_threshold must be forwarded to the ProgressReporter it
+    builds per task so operators can tune the consecutive-failure count
+    that escalates heartbeat logging from DEBUG to WARNING."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+        heartbeat_warn_threshold=5,
+    )
+    try:
+        assert worker.heartbeat_warn_threshold == 5
+    finally:
+        await worker._client.close()
+
+
+async def test_worker_init_default_heartbeat_warn_threshold_is_3():
+    """The default heartbeat_warn_threshold (3) means a long-running
+    worker tolerates a couple of transient heartbeat blips at DEBUG before
+    escalating to WARNING — loud enough to catch a sustained backend
+    outage, quiet enough not to spam on a single restart."""
+    worker = Worker(
+        backend_url="http://fake/api/v1",
+        api_key="k",
+        worker_id="w",
+        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
+    )
+    try:
+        assert worker.heartbeat_warn_threshold == 3
+    finally:
+        await worker._client.close()
+
+
 async def test_worker_init_rejects_max_retries_below_one():
     """max_retries < 1 makes the BackendClient retry loop never execute,
     crashing the worker with an opaque AssertionError. Worker must surface

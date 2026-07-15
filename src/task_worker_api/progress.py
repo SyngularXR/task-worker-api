@@ -47,12 +47,18 @@ class ProgressReporter:
         task_id: int,
         *,
         heartbeat_interval_s: float = 10.0,
+        heartbeat_warn_threshold: int = 3,
     ):
         self._client = client
         self._task_id = task_id
         self._interval = heartbeat_interval_s
+        self._warn_threshold = max(1, heartbeat_warn_threshold)
         self._state = _SharedState()
         self._task: Optional[asyncio.Task] = None
+        # Consecutive heartbeat failures (reset to 0 on a successful tick).
+        # Used to escalate the per-tick failure log from DEBUG to WARNING
+        # once a sustained backend outage becomes unlikely to be transient.
+        self._heartbeat_failures = 0
         # Optional external cancel event (from a CancelGuard). When linked,
         # is_cancelled / raise_if_cancelled also observe this event so a
         # handler polling ctx.progress.is_cancelled learns of a cancel at
@@ -133,7 +139,17 @@ class ProgressReporter:
             raise TaskCancelled(f"task {self._task_id} cancelled by user")
 
     async def _heartbeat_loop(self) -> None:
-        """Background heartbeat — best-effort, tolerates transient errors."""
+        """Background heartbeat — best-effort, tolerates transient errors.
+
+        A single failed tick (the BackendClient has already exhausted its
+        own retries by this point) is logged at DEBUG: a transient blip
+        during a long-running task is noise an operator doesn't need.
+        But a *sustained* outage — N consecutive failures — means the
+        backend is unreachable and the task's ``updated_at`` is going
+        stale, which the sweeper will soon read as abandonment and
+        reclaim. That escalates to WARNING so the outage is visible in
+        production logs at the default level instead of masked at DEBUG.
+        """
         while True:
             try:
                 resp = await self._client.report_progress(
@@ -145,11 +161,20 @@ class ProgressReporter:
                 )
                 if resp.get("cancelled"):
                     self._state.cancelled.set()
+                self._heartbeat_failures = 0
             except Exception as e:  # noqa: BLE001
-                log.debug(
-                    "heartbeat failed for task %s: %s",
-                    self._task_id, e,
-                )
+                self._heartbeat_failures += 1
+                if self._heartbeat_failures >= self._warn_threshold:
+                    log.warning(
+                        "heartbeat failed for task %s (%d consecutive "
+                        "failures): %s",
+                        self._task_id, self._heartbeat_failures, e,
+                    )
+                else:
+                    log.debug(
+                        "heartbeat failed for task %s: %s",
+                        self._task_id, e,
+                    )
             try:
                 await asyncio.sleep(self._interval)
             except asyncio.CancelledError:
