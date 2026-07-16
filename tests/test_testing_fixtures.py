@@ -117,6 +117,29 @@ async def test_get_cancel_status_reflects_mark_cancelled():
 
 
 @pytest.mark.asyncio
+async def test_poll_cancel_status_reflects_mark_cancelled():
+    """poll_cancel_status mirrors BackendClient.poll_cancel_status on the
+    fake — same data as get_cancel_status (the fake doesn't simulate HTTP
+    retries)."""
+    fake = FakeBackendClient()
+    # Before cancel
+    status = await fake.poll_cancel_status(5)
+    assert status == {
+        "cancelled": False,
+        "status": int(TaskStatus.IN_PROGRESS),
+        "cancelled_reason": None,
+    }
+    # After cancel
+    fake.mark_cancelled(5)
+    status = await fake.poll_cancel_status(5)
+    assert status == {
+        "cancelled": True,
+        "status": int(TaskStatus.CANCELLED),
+        "cancelled_reason": "user",
+    }
+
+
+@pytest.mark.asyncio
 async def test_queue_task_assigns_incrementing_ids():
     fake = FakeBackendClient()
     t1 = fake.queue_task(task_type=TaskType.DETECT_CUT_PLANES, params={})

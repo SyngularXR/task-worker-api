@@ -437,11 +437,48 @@ class BackendClient:
         detection for 30s (plus retry backoff), keeping the worker blind to a
         user cancel. The short deadline fails fast — CancelGuard catches the
         timeout and the next poll fires on schedule.
+
+        .. note::
+            This method retries transient errors (transport errors and 429/
+            502/503/504) via the standard ``_retry`` loop. For the
+            CancelGuard's hot poll path, prefer :meth:`poll_cancel_status`,
+            which is a single-shot GET with no retries — the guard has its
+            own poll-interval retry and the client-level backoff chain
+            (up to ~50s with default settings) only delays cancel detection.
         """
         resp = await self._request(
             "GET", f"/tasks/{task_id}/cancel-status",
             timeout=self._cancel_timeout,
         )
+        return resp.json() or {}
+
+    async def poll_cancel_status(self, task_id: int) -> dict:
+        """One-shot GET /tasks/{id}/cancel-status — no retries, short timeout.
+
+        Unlike :meth:`get_cancel_status`, this method performs a *single*
+        HTTP request with no exponential-backoff retry. The
+        :class:`~task_worker_api.cancel.CancelGuard` polls this endpoint on
+        its own schedule (``cancel_poll_interval_s``, default 2s); layering
+        the client's ``_retry`` loop on top meant a degraded backend could
+        blind the guard for up to ``max_retries`` × ``cancel_timeout_s`` plus
+        backoff sleeps (~50s with default 4 attempts, 5s timeout, 2s base
+        backoff) — during which the worker kept computing on a cancelled
+        task. The one-shot call fails fast (within ``cancel_timeout_s``,
+        default 5s): transport errors and transient HTTP status codes surface
+        immediately so the guard catches them at DEBUG and retries on its own
+        next tick.
+
+        Non-transient HTTP status errors (4xx/500) are raised immediately,
+        matching :meth:`get_cancel_status`'s non-transient contract.
+
+        Uses the same dedicated ``cancel_timeout_s`` deadline as
+        :meth:`get_cancel_status`.
+        """
+        resp = await self._client.request(
+            "GET", f"/tasks/{task_id}/cancel-status",
+            timeout=self._cancel_timeout,
+        )
+        resp.raise_for_status()
         return resp.json() or {}
 
     async def complete(self, task_id: int, result: dict) -> None:

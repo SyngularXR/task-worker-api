@@ -38,6 +38,14 @@ async def CancelGuard(
 ):
     """Polls ``GET /tasks/{id}/cancel-status`` in the background.
 
+    Uses ``BackendClient.poll_cancel_status`` — a single-shot GET with no
+    client-level retries — so a degraded backend can only blind the guard
+    for one ``cancel_timeout_s`` window (default 5s) before the guard
+    retries on its own ``poll_interval_s`` schedule. Previously the guard
+    used ``get_cancel_status``, which goes through ``_retry`` (4 attempts
+    with exponential backoff); a slow backend could stall the guard for
+    ~50s while the worker kept computing on a cancelled task.
+
     When cancelled:
       - Calls ``on_cancel()`` synchronously. This runs on the guard's
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
@@ -45,16 +53,17 @@ async def CancelGuard(
       - Raises ``TaskCancelled`` in the guarded block at the next
         ``await`` point.
 
-    Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s).
-    Long C extension calls that don't yield to the event loop will see
-    the cancel only after they return.
+    Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
+    plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C
+    extension calls that don't yield to the event loop will see the cancel
+    only after they return.
     """
     cancelled = asyncio.Event()
 
     async def _poll():
         while not cancelled.is_set():
             try:
-                resp = await client.get_cancel_status(task_id)
+                resp = await client.poll_cancel_status(task_id)
                 if resp.get("cancelled"):
                     cancelled.set()
                     if on_cancel is not None:

@@ -102,6 +102,16 @@ class FakeBackendClient:
             "cancelled_reason": "user" if task_id in self.cancelled_task_ids else None,
         }
 
+    async def poll_cancel_status(self, task_id: int) -> dict:
+        """One-shot cancel-poll — mirrors ``BackendClient.poll_cancel_status``.
+
+        The fake doesn't simulate HTTP retries, so this delegates to
+        :meth:`get_cancel_status` (same data). Tests that need to assert
+        on the one-shot (no-retry) contract use ``httpx.MockTransport``
+        against the real ``BackendClient`` (see ``test_client_retry.py``).
+        """
+        return await self.get_cancel_status(task_id)
+
     async def complete(self, task_id: int, result: dict) -> None:
         self.completed_tasks.append({"task_id": task_id, "result": result})
 
