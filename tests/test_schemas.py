@@ -19,7 +19,54 @@ def test_cinematic_baking_roundtrip():
     schema = TASK_PARAMS_SCHEMAS[TaskType.CINEMATIC_BAKING]
     obj = schema(job_id="job1", input_path="/shared/preview.glb", base_name="skull")
     d = obj.model_dump()
-    assert d == {"job_id": "job1", "input_path": "/shared/preview.glb", "base_name": "skull"}
+    assert d == {
+        "job_id": "job1",
+        "input_path": "/shared/preview.glb",
+        "base_name": "skull",
+        "material_id": None,
+        "pattern_scale": None,
+    }
+
+
+def test_cinematic_baking_accepts_biomaterial_options():
+    obj = CinematicBakingParams(
+        job_id="job1",
+        input_path="/shared/preview.glb",
+        base_name="liver",
+        material_id="liver",
+        pattern_scale=1.25,
+    )
+    assert obj.material_id == "liver"
+    assert obj.pattern_scale == 1.25
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"), 0.09, 8.01])
+def test_cinematic_baking_rejects_invalid_pattern_scale(value):
+    with pytest.raises(Exception):
+        CinematicBakingParams(
+            job_id="j",
+            input_path="/p",
+            base_name="b",
+            material_id="liver",
+            pattern_scale=value,
+        )
+
+
+def test_cinematic_baking_pattern_scale_requires_material():
+    with pytest.raises(Exception, match="pattern_scale requires material_id"):
+        CinematicBakingParams(
+            job_id="j", input_path="/p", base_name="b", pattern_scale=1.0
+        )
+
+
+@pytest.mark.parametrize(
+    "material_id", ["", "Liver", "liver-red", " liver", "a" * 65]
+)
+def test_cinematic_baking_rejects_invalid_material_id(material_id):
+    with pytest.raises(Exception):
+        CinematicBakingParams(
+            job_id="j", input_path="/p", base_name="b", material_id=material_id
+        )
 
 
 def test_cinematic_baking_rejects_extra_field():
