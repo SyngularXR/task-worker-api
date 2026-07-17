@@ -55,13 +55,9 @@
       "mode": "polling",
       "mode_description": "Standalone Worker.run_forever() polling loop; no FastAPI side.",
       "task_types": [
-        "optimize",
-        "uv_unwrap",
-        "render",
-        "pipeline",
-        "cinematic_baking",
+        "detect_cut_planes",
         "model_initializing",
-        "detect_cut_planes"
+        "cinematic_baking"
       ],
       "sdk_pin": {
         "style": "wheel_url",
@@ -70,7 +66,7 @@
         "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },
       "env": {
-        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID", "WORKER_TASK_TYPES"],
+        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID"],
         "optional": [
           "SHARED_VOLUME_PATH",
           "WORKER_WORKDIR",
@@ -87,7 +83,7 @@
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility,graphics",
-      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; Blender-CLI keeps compatible local schema extensions until the v0.12.0 wheel is released and pinned. QRemeshify is an optional GPL-3.0-or-later external runtime mounted read-only; it is not bundled in the MIT worker image."
+      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; Blender-CLI keeps compatible local schema extensions until the v0.12.0 wheel is pinned. QRemeshify is an optional GPL-3.0-or-later external runtime mounted read-only; it is not bundled in the MIT worker image."
     },
     {
       "id": "assetbundle-builder-worker",
