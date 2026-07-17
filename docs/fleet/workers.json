@@ -77,13 +77,17 @@
           "WORKER_POLL_INTERVAL",
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
-          "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S"
+          "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S",
+          "QREMESHIFY_PATH",
+          "QREMESHIFY_MODE",
+          "QREMESHIFY_SCALE_FACTOR",
+          "QREMESHIFY_TIME_LIMIT"
         ]
       },
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility,graphics",
-      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id and pattern_scale; Blender-CLI keeps a local compatible schema extension until the v0.12.0 wheel is released and pinned."
+      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; Blender-CLI keeps compatible local schema extensions until the v0.12.0 wheel is released and pinned. QRemeshify is an optional GPL-3.0-or-later external runtime mounted read-only; it is not bundled in the MIT worker image."
     },
     {
       "id": "assetbundle-builder-worker",
