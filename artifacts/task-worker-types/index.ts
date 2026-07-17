@@ -114,6 +114,10 @@ export interface CinematicBakingParams {
   input_path: string;
   /** Filename stem for outputs; _finalized.glb appended. */
   base_name: string;
+  /** Optional worker material registry id. Omit for the deployment's Current/default material. */
+  material_id?: string;
+  /** Optional Bioform Pattern Scale override; requires material_id and must be supported by that material. */
+  pattern_scale?: number;
 }
 
 /**

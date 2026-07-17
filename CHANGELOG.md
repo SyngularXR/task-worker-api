@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Features:**
+- `CinematicBakingParams` now carries the optional Bioform material selection
+  contract used by Blender-CLI and SynPusher: a stable lowercase
+  `material_id`, plus a finite `pattern_scale` in `0.1..8.0` that is valid only
+  when a material is selected. Existing producers remain compatible because
+  both fields default to `None`; the generated TypeScript artifact exposes the
+  same optional fields.
+
 **Fixes:**
 - `BackendClient` now exposes a `poll_cancel_status` method: a one-shot
   GET `/tasks/{id}/cancel-status` with no retries and the dedicated

@@ -1,13 +1,13 @@
 {
   "$schema_version": "1.0.0",
   "fleet_version": "1.0.0",
-  "generated_at": "2026-04-26",
+  "generated_at": "2026-07-17",
   "description": "Machine-readable manifest of every task-worker-api consumer in the SyngularXR fleet. Source of truth for backend handler routing, deployment health checks, and SDK-upgrade automation. Fetch via the GitHub raw URL — see docs/fleet/README.md for the canonical link.",
   "sdk": {
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
-    "current_release": "v0.6.0",
-    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.6.0",
+    "current_release": "v0.12.0",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.12.0",
     "release_workflow": ".github/workflows/release.yml — publishes wheel + tag on every merge to main"
   },
   "workers": [
@@ -65,10 +65,9 @@
       ],
       "sdk_pin": {
         "style": "wheel_url",
-        "version": "v0.4.0",
+        "version": "v0.7.0",
         "file": "pyproject.toml",
-        "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl",
-        "upgrade_pending": "v0.5.0 dep-bump PR #29 open; main branch CI is currently red on unrelated pre-existing tests (Solid_Mat material rename, export_glb function rename) which need a separate fix."
+        "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },
       "env": {
         "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID", "WORKER_TASK_TYPES"],
@@ -84,7 +83,7 @@
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility,graphics",
-      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering."
+      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id and pattern_scale; Blender-CLI keeps a local compatible schema extension until the v0.12.0 wheel is released and pinned."
     },
     {
       "id": "assetbundle-builder-worker",
