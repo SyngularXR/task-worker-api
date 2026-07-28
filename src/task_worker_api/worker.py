@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import traceback
 import urllib.request
 from pathlib import Path
@@ -43,6 +44,7 @@ HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
 
 def _make_sync_fail(
     base_url: str, api_key: str, task_id: int, *, timeout_s: float = 3.0,
+    attempts: int = 3, retry_sleep_s: float = 2.0,
 ):
     """Build a synchronous ``fail(error)`` callable for the watchdog thread.
 
@@ -50,19 +52,34 @@ def _make_sync_fail(
     the watchdog's last-resort report uses plain stdlib urllib with an explicit
     short timeout — it must never become a second wedge. Matches the wire
     format of ``BackendClient.fail``: PUT /tasks/{id}/fail {"error": ...}.
+
+    Retries a few times with a short sleep (bounded ~15s total with the
+    defaults): this is the only report path for a watchdog-fired timeout, and
+    a single attempt against a momentarily unavailable backend (restart, DB
+    blip) would silently orphan the task as RUNNING until the sweeper.
     """
     url = f"{base_url.rstrip('/')}/tasks/{task_id}/fail"
 
     def _sync_fail(error: str) -> None:
         data = json.dumps({"error": error}).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=data, method="PUT",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-        )
-        urllib.request.urlopen(req, timeout=timeout_s).close()
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            req = urllib.request.Request(
+                url, data=data, method="PUT",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                urllib.request.urlopen(req, timeout=timeout_s).close()
+                return
+            except Exception as e:  # noqa: BLE001 — retried, re-raised on exhaustion
+                last_exc = e
+                if attempt < attempts - 1:
+                    time.sleep(retry_sleep_s)
+        assert last_exc is not None
+        raise last_exc
 
     return _sync_fail
 

@@ -1822,3 +1822,130 @@ async def test_poll_cancel_status_cancel_timeout_none_falls_back():
     assert seen[0] is not None
     assert seen[0]["read"] is None
     assert seen[0]["write"] is None
+
+
+# -----------------------------------------------------------------------
+# Terminal-report retry — complete/fail widen the transient set to include
+# 500 and raise the attempt budget to at least 6. A 500 on a terminal
+# report can mean the backend's own dependency died mid-write (e.g. a
+# Postgres I/O error); dropping the report orphans a fully computed
+# outcome as a RUNNING zombie until the sweeper. Both terminal routes are
+# idempotent guarded transitions, so re-PUTting is safe. All other calls
+# (claim/progress/files) keep 500 non-retryable.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fail_retries_on_500_then_succeeds():
+    """A 500 on PUT /tasks/{id}/fail is retried — the terminal report must
+    survive a backend whose DB hiccuped mid-write."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        assert request.url.path == "/api/v1/tasks/691/fail"
+        if calls["n"] < 3:
+            return httpx.Response(500, text="Internal Server Error")
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.fail(691, "boom")
+    await client.close()
+
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_complete_retries_on_500_then_succeeds():
+    """A 500 on PUT /tasks/{id}/complete is retried, same as fail()."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(500, text="Internal Server Error")
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.complete(7, {"output": "done"})
+    await client.close()
+
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fail_raises_after_exhausting_terminal_attempts():
+    """When every fail() attempt returns 500, the last HTTPStatusError is
+    re-raised after the raised terminal budget (max(max_retries, 6))."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="still dead")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.fail(691, "boom")
+    await client.close()
+
+    assert exc_info.value.response.status_code == 500
+    # Attempt floor: max(max_retries=4, 6) == 6.
+    assert calls["n"] == 6
+
+
+@pytest.mark.asyncio
+async def test_terminal_attempt_budget_respects_higher_max_retries():
+    """A consumer-configured max_retries above the floor wins: the terminal
+    budget is max(max_retries, 6), not a hard-coded 6."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="still dead")
+
+    client = _client_with_handler(handler, max_retries=8)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.complete(7, {"output": "x"})
+    await client.close()
+
+    assert calls["n"] == 8
+
+
+@pytest.mark.asyncio
+async def test_report_progress_still_does_not_retry_500():
+    """The 500 widening is terminal-only: report_progress keeps the
+    fail-fast contract (500 = app error; heartbeats must not block the
+    polling loop on retry budget)."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.report_progress(7, stage="working", current=1, total=2)
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fail_still_retries_transport_errors():
+    """The widened terminal budget also applies to transport errors — a
+    connection refused during a backend restart gets the full window."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 5:
+            raise httpx.TransportError("connection refused")
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4)
+    # 5 attempts needed; plain max_retries=4 would have exhausted, but the
+    # terminal floor of 6 rides through.
+    await client.fail(691, "boom")
+    await client.close()
+
+    assert calls["n"] == 5

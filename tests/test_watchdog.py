@@ -394,3 +394,80 @@ def test_kill_procs_skips_missing_pid(monkeypatch):
 
     watchdog.kill_procs({(42, "999")}, _SIGTERM)
     assert killed == []
+
+
+# ----- _make_sync_fail retry ------------------------------------------------
+# The watchdog's last-resort reporter is a sync urllib PUT — the only report
+# path for a watchdog-fired timeout. A single attempt against a momentarily
+# unavailable backend (restart, DB blip) silently orphaned the task as
+# RUNNING until the sweeper; it now retries a few times with a short sleep.
+
+
+def _fake_response():
+    class _Resp:
+        def close(self):
+            pass
+
+    return _Resp()
+
+
+def test_sync_fail_retries_then_succeeds(monkeypatch):
+    from task_worker_api import worker as worker_mod
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("connection refused")
+        return _fake_response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    sync_fail = worker_mod._make_sync_fail("http://fake/api/v1", "key", 691)
+    sync_fail("timeout: exceeded 1800s")
+
+    assert calls["n"] == 3
+    # A sleep between each failed attempt, none after success.
+    assert sleeps == [2.0, 2.0]
+
+
+def test_sync_fail_raises_after_exhausting_attempts(monkeypatch):
+    from task_worker_api import worker as worker_mod
+
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise OSError("still down")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: None)
+
+    sync_fail = worker_mod._make_sync_fail("http://fake/api/v1", "key", 691)
+    with pytest.raises(OSError, match="still down"):
+        sync_fail("timeout")
+
+    assert calls["n"] == 3
+
+
+def test_sync_fail_no_sleep_on_first_success(monkeypatch):
+    from task_worker_api import worker as worker_mod
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        return _fake_response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    sync_fail = worker_mod._make_sync_fail("http://fake/api/v1", "key", 5)
+    sync_fail("err")
+
+    assert calls["n"] == 1
+    assert sleeps == []
