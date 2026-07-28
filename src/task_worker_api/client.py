@@ -43,7 +43,18 @@ _RETRYABLE_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 # transient outage — retrying it just burns budget and re-logs the same error.
 # Other 4xx codes are excluded for the same reason (client error, retrying
 # won't help).
+#
+# Exception: terminal reports (``complete``/``fail``) opt in to retrying 500
+# via ``_retry``'s ``extra_transient`` parameter. A 500 there can also mean
+# the backend's own dependency died mid-write (e.g. Postgres I/O error), and
+# dropping the report orphans a fully computed outcome — the task stays
+# RUNNING until the sweeper reclaims it. Both terminal routes are idempotent
+# guarded transitions, so re-PUTting is safe.
 _TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
+
+# Extra transient set + attempt floor for terminal reports (see above).
+_TERMINAL_EXTRA_TRANSIENT = frozenset({500})
+_TERMINAL_MIN_ATTEMPTS = 6
 
 # Default ceiling for a single retry delay. Without a cap, backoff grows as
 # ``retry_backoff_s * 2**n`` — unbounded. A worker configured with the
@@ -71,9 +82,14 @@ _JITTER_SPREAD = 0.25
 _DEFAULT_FILE_TIMEOUT_S = 300.0
 
 
-def _is_transient_status(exc: httpx.HTTPStatusError) -> bool:
+def _is_transient_status(
+    exc: httpx.HTTPStatusError,
+    extra: frozenset = frozenset(),
+) -> bool:
     """True iff a status error's code is a transiently-retryable code."""
-    return exc.response.status_code in _TRANSIENT_STATUS_CODES
+    return exc.response.status_code in _TRANSIENT_STATUS_CODES or (
+        exc.response.status_code in extra
+    )
 
 
 def _backoff_delay(
@@ -233,7 +249,15 @@ class BackendClient:
 
     # ----- core request with retry ------------------------------------
 
-    async def _retry(self, fn, *, method: str, path: str):
+    async def _retry(
+        self,
+        fn,
+        *,
+        method: str,
+        path: str,
+        extra_transient: frozenset = frozenset(),
+        attempts: Optional[int] = None,
+    ):
         """Run ``await fn()`` with exponential-backoff retry on transient errors.
 
         Shared by :meth:`_request` (buffered) and :meth:`download_file`
@@ -258,17 +282,23 @@ class BackendClient:
         ``retry_backoff_max_s`` so a high ``max_retries`` can't block the
         worker for minutes on one call, and jittered (±25%) so the fleet's
         workers don't retry in lockstep and re-overload the backend the
-        instant it recovers. ``max_retries`` attempts fire in total.
+        instant it recovers. ``max_retries`` attempts fire in total, unless
+        the caller overrides the budget via ``attempts``.
+
+        ``extra_transient`` widens the transient status set for this call
+        only — used by ``complete``/``fail`` to also retry 500 (see the
+        ``_TRANSIENT_STATUS_CODES`` comment for the rationale).
         """
         import asyncio
 
+        total_attempts = attempts if attempts is not None else self.max_retries
         last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries):
+        for attempt in range(total_attempts):
             try:
                 return await fn()
             except _RETRYABLE_EXCEPTIONS as e:
                 last_exc = e
-                if attempt == self.max_retries - 1:
+                if attempt == total_attempts - 1:
                     break
                 delay = _backoff_delay(
                     attempt, self.retry_backoff_s,
@@ -280,10 +310,10 @@ class BackendClient:
                 )
                 await asyncio.sleep(delay)
             except httpx.HTTPStatusError as e:
-                if not _is_transient_status(e):
+                if not _is_transient_status(e, extra_transient):
                     raise
                 last_exc = e
-                if attempt == self.max_retries - 1:
+                if attempt == total_attempts - 1:
                     break
                 delay = _backoff_delay(
                     attempt, self.retry_backoff_s,
@@ -302,17 +332,29 @@ class BackendClient:
         if last_exc is None:  # pragma: no cover — unreachable per __init__ guard
             raise RuntimeError(
                 f"_retry completed without an attempt or exception "
-                f"(max_retries={self.max_retries}); this is a bug."
+                f"(attempts={total_attempts}); this is a bug."
             )
         raise last_exc
 
-    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        extra_transient: frozenset = frozenset(),
+        attempts: Optional[int] = None,
+        **kwargs,
+    ) -> httpx.Response:
         """Request with exponential-backoff retry on transient errors.
 
         Retries ``httpx.TransportError`` / ``httpx.TimeoutException`` and
         transient status codes (429/502/503/504); other HTTP status
         errors surface immediately. Uses no third-party retry library to keep
         SDK dependencies minimal.
+
+        ``extra_transient`` / ``attempts`` are forwarded to :meth:`_retry`
+        (terminal reports widen the transient set to include 500 and raise
+        the attempt budget); all other kwargs go to httpx.
 
         ``raise_for_status()`` runs *inside* the retry closure so a transient
         5xx is seen by ``_retry`` and retried. ``claim_next`` does not use this
@@ -325,7 +367,10 @@ class BackendClient:
             resp.raise_for_status()
             return resp
 
-        return await self._retry(_do_request, method=method, path=path)
+        return await self._retry(
+            _do_request, method=method, path=path,
+            extra_transient=extra_transient, attempts=attempts,
+        )
 
     # ----- task lifecycle --------------------------------------------
 
@@ -487,10 +532,18 @@ class BackendClient:
         Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s) so
         a stalled complete call fails fast instead of blocking the polling
         loop for up to 120s (30s × 4 retries) under backend load.
+
+        Terminal reports retry harder than other calls: 500 is treated as
+        transient (a dead backend dependency mid-write looks like a 500 here,
+        and dropping the report orphans the computed outcome) and the attempt
+        budget is raised to at least ``_TERMINAL_MIN_ATTEMPTS`` so the retry
+        window (~60s jittered) rides out a backend restart.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
             timeout=self._lifecycle_timeout,
+            extra_transient=_TERMINAL_EXTRA_TRANSIENT,
+            attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
         )
 
     async def fail(self, task_id: int, error: str) -> None:
@@ -499,10 +552,15 @@ class BackendClient:
         Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s) so
         a stalled fail call fails fast instead of blocking the polling loop
         for up to 120s (30s × 4 retries) under backend load.
+
+        Retries 500 with a raised attempt budget, same as :meth:`complete` —
+        see there for the rationale.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/fail", json={"error": error},
             timeout=self._lifecycle_timeout,
+            extra_transient=_TERMINAL_EXTRA_TRANSIENT,
+            attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
         )
 
     # ----- file transfer (remote mode workers) ----------------------
