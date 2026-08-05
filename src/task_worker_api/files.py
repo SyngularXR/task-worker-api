@@ -36,6 +36,94 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
+#: Bytes moved per ``_copyfile_async`` iteration. Each filesystem operation is
+#: offloaded from the event-loop thread; chunking adds cancellation points
+#: without making a multi-GB copy thread-dispatch-bound.
+_COPY_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+async def _copyfile_async(
+    src: Path,
+    dest: Path,
+    *,
+    cancelled: Optional[asyncio.Event] = None,
+    cancel_message: str = "cancelled by user during file copy",
+) -> None:
+    """``shutil.copy2`` equivalent with cancellable, off-loop I/O.
+
+    ``shutil.copy2`` is one blocking call: a multi-GB copy (Blender-CLI
+    ``.blend`` inputs, Neural-Canvas splats on a network-mounted shared
+    volume) freezes the event loop for its whole duration. The heartbeat
+    stops ticking — so the backend's stale-task sweeper can reclaim a task
+    the worker is actively copying in — and the ``CancelGuard`` poll
+    freezes, so a user cancel stays invisible until the copy finishes.
+
+    Opening, reading, writing, closing, and copying metadata all run through
+    :func:`asyncio.to_thread`, so a slow filesystem operation cannot block the
+    event loop. Chunk boundaries let ``cancelled`` abort mid-file instead of
+    only between files.
+
+    Metadata and error semantics match ``copy2``: ``copystat`` runs on
+    success, and a missing/unreadable ``src`` raises ``FileNotFoundError``
+    from ``open`` exactly as before. A same-file copy raises
+    :class:`shutil.SameFileError`. If this invocation opens ``dest`` for
+    writing, any partial destination is removed before an exception
+    propagates, mirroring the ``BackendClient.download_file`` cleanup
+    contract. Failures before that point leave a pre-existing destination
+    untouched.
+    """
+    fsrc = None
+    fdst = None
+    dest_touched = False
+    cancelled_before_read = (
+        cancelled is not None and cancelled.is_set()
+    )
+
+    def _samefile() -> bool:
+        return dest.exists() and os.path.samefile(src, dest)
+
+    try:
+        if await asyncio.to_thread(_samefile):
+            raise shutil.SameFileError(
+                f"{src!r} and {dest!r} are the same file"
+            )
+
+        fsrc = await asyncio.to_thread(open, src, "rb")
+        try:
+            fdst = await asyncio.to_thread(open, dest, "wb")
+            dest_touched = True
+            while True:
+                chunk = await asyncio.to_thread(fsrc.read, _COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                # Apply the state sampled before this read only after a
+                # non-empty chunk returns. This matches the old synchronous
+                # first iteration, while an exhausted source still wins over
+                # a cancel detected after its final write.
+                if cancelled_before_read:
+                    raise TaskCancelled(cancel_message)
+                await asyncio.to_thread(fdst.write, chunk)
+                cancelled_before_read = (
+                    cancelled is not None and cancelled.is_set()
+                )
+        finally:
+            try:
+                if fdst is not None:
+                    await asyncio.to_thread(fdst.close)
+            finally:
+                await asyncio.to_thread(fsrc.close)
+
+        await asyncio.to_thread(shutil.copystat, src, dest)
+    except BaseException:
+        if dest_touched:
+            # A partial copy would otherwise be picked up as a complete input
+            # by a retried task, or linger in the output staging directory.
+            try:
+                await asyncio.to_thread(dest.unlink)
+            except OSError:
+                pass
+        raise
+
 
 async def prepare_inputs(
     task: ClaimedTask, client: "BackendClient", work_dir: Path,
@@ -48,9 +136,10 @@ async def prepare_inputs(
     started before this call), remote-mode batch downloads abort as soon as
     the event is set: a multi-file input set for a GB-scale task can spend
     minutes streaming, and a user cancel during that window should not wait
-    for every remaining file to finish downloading. The check is a no-op for
-    local mode (``input_path``) where ``shutil.copy2`` is a single blocking
-    call with no yield point for the event loop.
+    for every remaining file to finish downloading. Local mode
+    (``input_path``) honours it too: the copy runs through
+    :func:`_copyfile_async`, which checks the event between chunks, so a
+    cancel aborts mid-file rather than after a multi-GB copy completes.
     """
     in_dir = work_dir / "in"
     out_dir = work_dir / "out"
@@ -66,7 +155,12 @@ async def prepare_inputs(
         if not src.is_file():
             raise FileNotFoundError(f"input_path not accessible: {src}")
         dest = in_dir / src.name
-        shutil.copy2(src, dest)
+        await _copyfile_async(
+            src, dest, cancelled=cancelled,
+            cancel_message=(
+                f"task {task.id} cancelled by user during input copy"
+            ),
+        )
         return FileContext(
             input_dir=in_dir,
             output_dir=out_dir,
@@ -125,7 +219,9 @@ async def upload_outputs(
     to finish streaming to a task the user already cancelled. The check
     runs between files, raising ``TaskCancelled`` before the next upload
     starts — mirroring the cancel-during-download guard in
-    :func:`prepare_inputs`.
+    :func:`prepare_inputs`. Local-mode staging copies go through
+    :func:`_copyfile_async`, so the event is also checked *within* a file:
+    a cancel aborts mid-copy instead of waiting out a multi-GB write.
 
     If publishing fails partway through (the Nth upload/copy raises after
     files 1..N-1 succeeded), the partial artifacts are removed before the
@@ -182,7 +278,12 @@ async def upload_outputs(
                     )
                 src = file_ctx.output_dir / filename
                 dest = dest_dir / filename
-                shutil.copy2(src, dest)
+                await _copyfile_async(
+                    src, dest, cancelled=cancelled,
+                    cancel_message=(
+                        f"task {task.id} cancelled by user during output copy"
+                    ),
+                )
                 manifest[key] = str(dest)
         except Exception:
             # A copy failed partway through — the staging dir holds a

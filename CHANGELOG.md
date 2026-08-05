@@ -363,6 +363,25 @@
   the prior-capable behaviour (DEBUG on failure) for the first (threshold−1)
   ticks and only adds WARNING escalation beyond that; consumers that never
   set `heartbeat_warn_threshold` see strictly more signal, never less.
+- Local-mode file copies in `prepare_inputs` and `upload_outputs` no longer
+  block the event loop. Both call sites used a single `shutil.copy2`, so a
+  multi-GB copy (Blender-CLI `.blend` inputs, Neural-Canvas splats on a
+  network-mounted shared volume) froze the loop for its entire duration: the
+  heartbeat stopped ticking, so the backend's stale-task sweeper could reclaim
+  a task the worker was actively copying in, and the `CancelGuard` poll froze
+  with it, so a user cancel stayed invisible until the copy finished. Copies
+  now run through a chunked helper that moves every filesystem operation off
+  the event-loop thread and re-checks the `cancelled` event between chunks, so
+  a slow read/write cannot freeze the heartbeat and a cancel aborts *mid-file*
+  rather than only between files. Public API is unchanged (the helper is
+  private): metadata semantics still match `copy2` via `copystat`, same-file
+  copies raise `SameFileError`, a missing source still raises
+  `FileNotFoundError` without deleting an existing destination, and any
+  destination opened by a failed copy is removed before the exception
+  propagates, mirroring the
+  `BackendClient.download_file` partial-file cleanup contract. The cancel
+  check runs after each read, so an already-complete copy is never discarded
+  by a cancel detected during its final yield.
 
 ## v0.12.0 — 2026-07-17
 
