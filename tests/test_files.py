@@ -543,3 +543,142 @@ async def test_upload_outputs_no_cancel_event_uploads_all(tmp_path):
     assert set(manifest.keys()) == {"a", "b"}
     assert (54, "a.stl") in client.uploaded_files
     assert (54, "b.stl") in client.uploaded_files
+
+
+# ---------------------------------------------------------------------------#
+# Local-mode copies are chunked and cancellable *mid-file*.
+#
+# A multi-GB local copy (Blender-CLI .blend inputs, Neural-Canvas splats on a
+# network-mounted shared volume) used to run as one blocking ``shutil.copy2``:
+# the event loop froze for the whole copy, so the heartbeat stopped ticking
+# (the backend's stale-task sweeper could reclaim a task still copying in) and
+# the CancelGuard froze with it (a user cancel stayed invisible until the copy
+# finished). The copy now yields between chunks and re-checks ``cancelled``.
+#
+# Each test shrinks ``_COPY_CHUNK_BYTES`` so a small file spans many chunks,
+# then sets the event after the copy has reached its first per-chunk yield —
+# a cancel arriving *during* the copy, not before it.
+# ---------------------------------------------------------------------------#
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_local_aborts_on_mid_copy_cancel(
+    tmp_path, monkeypatch,
+):
+    """A cancel that lands while a local-mode input copy is in flight must
+    raise TaskCancelled and leave no partial file behind — not run the copy
+    to completion first."""
+    import asyncio
+    from task_worker_api import files as files_mod
+    from task_worker_api.errors import TaskCancelled
+
+    monkeypatch.setattr(files_mod, "_COPY_CHUNK_BYTES", 4)
+
+    src = tmp_path / "big.blend"
+    src.write_bytes(b"x" * 4000)  # 1000 chunks
+    work_dir = tmp_path / "work"
+
+    task = _claimed(61, params={"input_path": str(src)})
+    cancelled = asyncio.Event()
+
+    copying = asyncio.create_task(
+        prepare_inputs(task, FakeBackendClient(), work_dir, cancelled=cancelled)
+    )
+    # Hand the loop to the copy; it suspends at its first per-chunk yield.
+    # (Under the old blocking copy2 this instead ran the copy to completion,
+    # and the cancel below arrived too late to be seen at all.)
+    await asyncio.sleep(0)
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await copying
+
+    assert not (work_dir / "in" / "big.blend").exists(), (
+        "partial input copy must be removed when a cancel aborts it mid-file"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_local_aborts_on_mid_copy_cancel(
+    tmp_path, monkeypatch,
+):
+    """Same for the local-mode staging copy in upload_outputs: a cancel
+    mid-copy raises TaskCancelled, and the existing partial-cleanup contract
+    still removes the whole staging dir."""
+    import asyncio
+    from task_worker_api import files as files_mod
+    from task_worker_api.errors import TaskCancelled
+
+    monkeypatch.setattr(files_mod, "_COPY_CHUNK_BYTES", 4)
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "big.ply").write_bytes(b"y" * 4000)  # 1000 chunks
+
+    task = _claimed(62, params={"input_path": "/ignored"})
+    file_ctx = _file_ctx(out_dir)
+    cancelled = asyncio.Event()
+
+    uploading = asyncio.create_task(
+        upload_outputs(
+            task, FakeBackendClient(), file_ctx,
+            output_files={"big": "big.ply"},
+            shared_volume_path=str(shared),
+            cancelled=cancelled,
+        )
+    )
+    await asyncio.sleep(0)
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await uploading
+
+    assert not (shared / "temp" / "62").exists(), (
+        "staging dir must be cleaned up when a cancel aborts a copy mid-file"
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_multi_chunk_copies_are_faithful_without_cancel_event(
+    tmp_path, monkeypatch,
+):
+    """Regression: with ``cancelled=None`` (the default) a multi-chunk copy
+    must still be a faithful ``copy2`` — every byte in order, and metadata
+    preserved via ``copystat`` — for both local-mode call sites."""
+    import os
+    from task_worker_api import files as files_mod
+
+    monkeypatch.setattr(files_mod, "_COPY_CHUNK_BYTES", 4)
+
+    # Non-uniform payload whose length isn't a chunk multiple, so a dropped
+    # or reordered chunk (or a lost tail) shows up as a byte mismatch.
+    payload = bytes(range(256)) * 5 + b"tail"
+    src = tmp_path / "in.blend"
+    src.write_bytes(payload)
+    os.utime(src, (1_000_000, 1_000_000))
+
+    work_dir = tmp_path / "work"
+    task = _claimed(63, params={"input_path": str(src)})
+
+    file_ctx = await prepare_inputs(task, FakeBackendClient(), work_dir)
+
+    dest = work_dir / "in" / "in.blend"
+    assert file_ctx.primary_path == dest
+    assert dest.read_bytes() == payload
+    assert dest.stat().st_mtime == src.stat().st_mtime, (
+        "copystat must run so the chunked copy keeps copy2's metadata semantics"
+    )
+
+    # Same for the staging copy on the way out.
+    (file_ctx.output_dir / "out.ply").write_bytes(payload)
+    shared = tmp_path / "shared"
+    manifest = await upload_outputs(
+        task, FakeBackendClient(), file_ctx,
+        output_files={"out": "out.ply"},
+        shared_volume_path=str(shared),
+    )
+
+    staged = shared / "temp" / "63" / "out.ply"
+    assert manifest == {"out": str(staged)}
+    assert staged.read_bytes() == payload
