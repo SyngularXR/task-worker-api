@@ -816,3 +816,56 @@ async def test_copyfile_async_copystat_failure_removes_copy(
         await files_mod._copyfile_async(src, dest)
 
     assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------#
+# Local-mode staging cleanup runs off the event loop.
+#
+# The staging dir holds the outputs published so far (colmap-splat PLYs,
+# Neural-Canvas splats), so a synchronous ``shutil.rmtree`` freezes the loop
+# for the whole delete — the heartbeat stops ticking and the CancelGuard poll
+# stalls while the failure is being reported. Same bug class as the blocking
+# local-mode copies; these cleanups were missed.
+# ---------------------------------------------------------------------------#
+
+
+@pytest.mark.asyncio
+async def test_local_mode_staging_cleanup_runs_off_the_event_loop(
+    tmp_path, monkeypatch,
+):
+    """The staging-dir rmtree must run in a worker thread, and must still
+    remove the dir — identical semantics, just off the loop."""
+    import shutil
+    import threading
+    from task_worker_api import files as files_mod
+
+    loop_thread = threading.current_thread()
+    rmtree_threads: list[threading.Thread] = []
+    real_rmtree = shutil.rmtree
+
+    def spy_rmtree(path, **kwargs):
+        rmtree_threads.append(threading.current_thread())
+        real_rmtree(path, **kwargs)
+
+    monkeypatch.setattr(files_mod.shutil, "rmtree", spy_rmtree)
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    # "b.stl" missing → the second copy raises, triggering the cleanup.
+
+    task = _claimed(71, params={"input_path": "/ignored"})
+
+    with pytest.raises(FileNotFoundError):
+        await upload_outputs(
+            task, FakeBackendClient(), _file_ctx(out_dir),
+            output_files={"a": "a.stl", "b": "b.stl"},
+            shared_volume_path=str(shared),
+        )
+
+    assert rmtree_threads, "staging dir was never cleaned up"
+    assert all(t is not loop_thread for t in rmtree_threads), (
+        "staging-dir rmtree ran on the event loop thread"
+    )
+    assert not (shared / "temp" / "71").exists()

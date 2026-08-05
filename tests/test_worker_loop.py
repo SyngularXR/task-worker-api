@@ -919,3 +919,53 @@ async def test_progress_is_cancelled_stays_false_without_cancel(
     assert len(client.completed_tasks) == 1
     assert client.failed_tasks == []
 
+
+
+# ----- per-task workdir cleanup ---------------------------------------------
+# The workdir holds the task's staged inputs *and* its outputs (colmap-splat
+# PLYs, Neural-Canvas splats). Deleting it synchronously froze the event loop
+# after every task: in hybrid mode the co-hosted FastAPI app stopped serving,
+# and in any mode the next claim (and the heartbeat/cancel poll of a task
+# still finishing elsewhere) waited out a GB-scale delete.
+
+
+@pytest.mark.asyncio
+async def test_task_workdir_cleanup_runs_off_the_event_loop(
+    make_worker, fake_client, queue_cut_planes_task, tmp_path, monkeypatch,
+):
+    """The per-task workdir rmtree must run in a worker thread, and must
+    still remove the dir — identical semantics, just off the loop."""
+    import shutil
+    import threading
+
+    from task_worker_api import worker as worker_mod
+
+    queue_cut_planes_task()
+
+    loop_thread = threading.current_thread()
+    rmtree_threads: list[threading.Thread] = []
+    real_rmtree = shutil.rmtree
+
+    def spy_rmtree(path, **kwargs):
+        rmtree_threads.append(threading.current_thread())
+        real_rmtree(path, **kwargs)
+
+    monkeypatch.setattr(worker_mod.shutil, "rmtree", spy_rmtree)
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    worker = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+    )
+    assert await worker.run_one() is True
+    assert len(fake_client.completed_tasks) == 1
+
+    assert rmtree_threads, "per-task workdir was never cleaned up"
+    assert all(t is not loop_thread for t in rmtree_threads), (
+        "per-task workdir rmtree ran on the event loop thread"
+    )
+    assert not list((tmp_path / "work").glob("task_*")), (
+        "per-task workdir must be removed after the task finishes"
+    )

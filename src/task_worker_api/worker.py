@@ -577,7 +577,13 @@ class Worker:
                         "backend did not record outcome=%r: %s",
                         task.id, terminal, outcome[1], report_exc,
                     )
-            shutil.rmtree(task_dir, ignore_errors=True)
+            # Off the event loop: a finished task's workdir holds its staged
+            # inputs *and* its outputs (colmap-splat PLYs, Neural-Canvas
+            # splats), so a synchronous rmtree freezes the loop for the whole
+            # delete — in hybrid mode that stalls the FastAPI app, and in any
+            # mode it delays the next claim. ``ignore_errors=True`` keeps this
+            # non-raising, so the semantics are unchanged.
+            await asyncio.to_thread(shutil.rmtree, task_dir, ignore_errors=True)
 
 
 async def run_hybrid(
