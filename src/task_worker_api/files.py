@@ -36,10 +36,9 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-#: Bytes moved per ``_copyfile_async`` iteration. Sized so a chunk on a slow
-#: network-mounted shared volume still completes in tens of milliseconds —
-#: small enough to keep the heartbeat ticking, large enough that a multi-GB
-#: copy isn't dominated by loop overhead.
+#: Bytes moved per ``_copyfile_async`` iteration. Each filesystem operation is
+#: offloaded from the event-loop thread; chunking adds cancellation points
+#: without making a multi-GB copy thread-dispatch-bound.
 _COPY_CHUNK_BYTES = 4 * 1024 * 1024
 
 
@@ -50,7 +49,7 @@ async def _copyfile_async(
     cancelled: Optional[asyncio.Event] = None,
     cancel_message: str = "cancelled by user during file copy",
 ) -> None:
-    """``shutil.copy2`` equivalent that yields to the event loop per chunk.
+    """``shutil.copy2`` equivalent with cancellable, off-loop I/O.
 
     ``shutil.copy2`` is one blocking call: a multi-GB copy (Blender-CLI
     ``.blend`` inputs, Neural-Canvas splats on a network-mounted shared
@@ -59,43 +58,71 @@ async def _copyfile_async(
     the worker is actively copying in — and the ``CancelGuard`` poll
     freezes, so a user cancel stays invisible until the copy finishes.
 
-    Copying in chunks with an ``await`` between them keeps both alive, and
-    lets ``cancelled`` abort mid-file instead of only between files.
+    Opening, reading, writing, closing, and copying metadata all run through
+    :func:`asyncio.to_thread`, so a slow filesystem operation cannot block the
+    event loop. Chunk boundaries let ``cancelled`` abort mid-file instead of
+    only between files.
 
     Metadata and error semantics match ``copy2``: ``copystat`` runs on
     success, and a missing/unreadable ``src`` raises ``FileNotFoundError``
-    from ``open`` exactly as before. Any partial ``dest`` is removed before
-    the exception propagates, mirroring the ``BackendClient.download_file``
-    partial-file cleanup contract.
+    from ``open`` exactly as before. A same-file copy raises
+    :class:`shutil.SameFileError`. If this invocation opens ``dest`` for
+    writing, any partial destination is removed before an exception
+    propagates, mirroring the ``BackendClient.download_file`` cleanup
+    contract. Failures before that point leave a pre-existing destination
+    untouched.
     """
+    fsrc = None
+    fdst = None
+    dest_touched = False
+    cancelled_before_read = (
+        cancelled is not None and cancelled.is_set()
+    )
+
+    def _samefile() -> bool:
+        return dest.exists() and os.path.samefile(src, dest)
+
     try:
-        with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
+        if await asyncio.to_thread(_samefile):
+            raise shutil.SameFileError(
+                f"{src!r} and {dest!r} are the same file"
+            )
+
+        fsrc = await asyncio.to_thread(open, src, "rb")
+        try:
+            fdst = await asyncio.to_thread(open, dest, "wb")
+            dest_touched = True
             while True:
-                chunk = fsrc.read(_COPY_CHUNK_BYTES)
+                chunk = await asyncio.to_thread(fsrc.read, _COPY_CHUNK_BYTES)
                 if not chunk:
                     break
-                # Checked after the read, so an exhausted source breaks out
-                # first: once the last chunk is written there is nothing left
-                # to abort, and a cancel detected during that final yield
-                # would otherwise throw away a copy that already finished.
-                if cancelled is not None and cancelled.is_set():
+                # Apply the state sampled before this read only after a
+                # non-empty chunk returns. This matches the old synchronous
+                # first iteration, while an exhausted source still wins over
+                # a cancel detected after its final write.
+                if cancelled_before_read:
                     raise TaskCancelled(cancel_message)
-                fdst.write(chunk)
-                # ponytail: the per-chunk read/write is still blocking, so
-                # the loop stalls for one chunk at a time rather than the
-                # whole file. If a shared volume ever gets slow enough that
-                # a single chunk blows the heartbeat interval, move the
-                # read/write pair to ``asyncio.to_thread``.
-                await asyncio.sleep(0)
+                await asyncio.to_thread(fdst.write, chunk)
+                cancelled_before_read = (
+                    cancelled is not None and cancelled.is_set()
+                )
+        finally:
+            try:
+                if fdst is not None:
+                    await asyncio.to_thread(fdst.close)
+            finally:
+                await asyncio.to_thread(fsrc.close)
+
+        await asyncio.to_thread(shutil.copystat, src, dest)
     except BaseException:
-        # Partial dest from a cancel/IO failure would otherwise be picked up
-        # as a complete input by a retried task, or linger in the staging dir.
-        try:
-            dest.unlink()
-        except OSError:
-            pass
+        if dest_touched:
+            # A partial copy would otherwise be picked up as a complete input
+            # by a retried task, or linger in the output staging directory.
+            try:
+                await asyncio.to_thread(dest.unlink)
+            except OSError:
+                pass
         raise
-    shutil.copystat(src, dest)
 
 
 async def prepare_inputs(

@@ -682,3 +682,137 @@ async def test_local_multi_chunk_copies_are_faithful_without_cancel_event(
     staged = shared / "temp" / "63" / "out.ply"
     assert manifest == {"out": str(staged)}
     assert staged.read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_copyfile_async_runs_filesystem_operations_off_loop(
+    tmp_path, monkeypatch,
+):
+    """Slow filesystem calls must run on a worker thread, not the loop."""
+    import builtins
+    import shutil
+    import threading
+    from task_worker_api import files as files_mod
+
+    src = tmp_path / "source.bin"
+    dest = tmp_path / "dest.bin"
+    src.write_bytes(b"payload")
+
+    loop_thread = threading.get_ident()
+    calls = []
+    real_open = builtins.open
+    real_copystat = shutil.copystat
+
+    class RecordingFile:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def read(self, *args):
+            calls.append(("read", threading.get_ident()))
+            return self._wrapped.read(*args)
+
+        def write(self, *args):
+            calls.append(("write", threading.get_ident()))
+            return self._wrapped.write(*args)
+
+        def close(self):
+            calls.append(("close", threading.get_ident()))
+            return self._wrapped.close()
+
+    def recording_open(path, mode):
+        calls.append(("open", threading.get_ident()))
+        return RecordingFile(real_open(path, mode))
+
+    def recording_copystat(source, destination):
+        calls.append(("copystat", threading.get_ident()))
+        return real_copystat(source, destination)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    monkeypatch.setattr(shutil, "copystat", recording_copystat)
+
+    await files_mod._copyfile_async(src, dest)
+
+    assert {name for name, _ in calls} == {
+        "open", "read", "write", "close", "copystat",
+    }
+    assert all(thread_id != loop_thread for _, thread_id in calls)
+    assert dest.read_bytes() == b"payload"
+
+
+@pytest.mark.asyncio
+async def test_copyfile_async_same_file_preserves_source(tmp_path):
+    """Copying a path onto itself raises without truncating its contents."""
+    import shutil
+    from task_worker_api import files as files_mod
+
+    src = tmp_path / "same.bin"
+    src.write_bytes(b"keep me")
+
+    with pytest.raises(shutil.SameFileError):
+        await files_mod._copyfile_async(src, src)
+
+    assert src.read_bytes() == b"keep me"
+
+
+@pytest.mark.asyncio
+async def test_copyfile_async_missing_source_preserves_destination(tmp_path):
+    """A failure before opening dest must not delete an existing file."""
+    from task_worker_api import files as files_mod
+
+    dest = tmp_path / "existing.bin"
+    dest.write_bytes(b"keep me")
+
+    with pytest.raises(FileNotFoundError):
+        await files_mod._copyfile_async(tmp_path / "missing.bin", dest)
+
+    assert dest.read_bytes() == b"keep me"
+
+
+@pytest.mark.asyncio
+async def test_copyfile_async_dest_open_failure_preserves_destination(
+    tmp_path, monkeypatch,
+):
+    """A failed destination open must not trigger partial-copy cleanup."""
+    import builtins
+    from task_worker_api import files as files_mod
+
+    src = tmp_path / "source.bin"
+    dest = tmp_path / "existing.bin"
+    src.write_bytes(b"source")
+    dest.write_bytes(b"keep me")
+    real_open = builtins.open
+
+    def fail_dest_open(path, mode):
+        if Path(path) == dest and mode == "wb":
+            raise OSError("destination open failed")
+        return real_open(path, mode)
+
+    monkeypatch.setattr(builtins, "open", fail_dest_open)
+
+    with pytest.raises(OSError, match="destination open failed"):
+        await files_mod._copyfile_async(src, dest)
+
+    assert dest.read_bytes() == b"keep me"
+
+
+@pytest.mark.asyncio
+async def test_copyfile_async_copystat_failure_removes_copy(
+    tmp_path, monkeypatch,
+):
+    """Metadata failure is still a failed copy and leaves no artifact."""
+    import shutil
+    from task_worker_api import files as files_mod
+
+    src = tmp_path / "source.bin"
+    dest = tmp_path / "dest.bin"
+    src.write_bytes(b"payload")
+
+    def fail_copystat(source, destination):
+        raise OSError("metadata copy failed")
+
+    monkeypatch.setattr(shutil, "copystat", fail_copystat)
+
+    with pytest.raises(OSError, match="metadata copy failed"):
+        await files_mod._copyfile_async(src, dest)
+
+    assert not dest.exists()

@@ -370,13 +370,15 @@
   heartbeat stopped ticking, so the backend's stale-task sweeper could reclaim
   a task the worker was actively copying in, and the `CancelGuard` poll froze
   with it, so a user cancel stayed invisible until the copy finished. Copies
-  now run through a chunked helper that yields to the loop between chunks and
-  re-checks the `cancelled` event, so a cancel aborts *mid-file* rather than
-  only between files — matching the guard that already covered remote-mode
-  batch downloads/uploads. Public API is unchanged (the helper is private):
-  metadata semantics still match `copy2` via `copystat`, a missing source
-  still raises `FileNotFoundError`, and any partial destination is removed
-  before the exception propagates, mirroring the
+  now run through a chunked helper that moves every filesystem operation off
+  the event-loop thread and re-checks the `cancelled` event between chunks, so
+  a slow read/write cannot freeze the heartbeat and a cancel aborts *mid-file*
+  rather than only between files. Public API is unchanged (the helper is
+  private): metadata semantics still match `copy2` via `copystat`, same-file
+  copies raise `SameFileError`, a missing source still raises
+  `FileNotFoundError` without deleting an existing destination, and any
+  destination opened by a failed copy is removed before the exception
+  propagates, mirroring the
   `BackendClient.download_file` partial-file cleanup contract. The cancel
   check runs after each read, so an already-complete copy is never discarded
   by a cancel detected during its final yield.
