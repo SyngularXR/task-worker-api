@@ -292,7 +292,13 @@ async def upload_outputs(
             # confuse the backend's sweep. The backend only sweeps staging
             # dirs for tasks it recorded as complete; a failed task's dir
             # would otherwise linger indefinitely.
-            shutil.rmtree(dest_dir, ignore_errors=True)
+            #
+            # Off-loop for the same reason the copies themselves are: the dir
+            # can hold GB-scale artifacts (colmap-splat PLYs, Neural-Canvas
+            # splats), and unlinking them synchronously would freeze the
+            # heartbeat and the CancelGuard poll while the failure is being
+            # reported. ``ignore_errors=True`` keeps this non-raising.
+            await asyncio.to_thread(shutil.rmtree, dest_dir, ignore_errors=True)
             raise
         return manifest
 

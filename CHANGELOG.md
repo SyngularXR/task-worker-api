@@ -382,6 +382,17 @@
   `BackendClient.download_file` partial-file cleanup contract. The cancel
   check runs after each read, so an already-complete copy is never discarded
   by a cancel detected during its final yield.
+- Directory cleanups no longer block the event loop either. Two sibling
+  `shutil.rmtree` calls were missed by the copy fix above: `Worker._run_one`
+  removing the per-task workdir after every task, and `upload_outputs`
+  removing the local-mode staging dir when a publish fails partway through.
+  Both delete directories that hold GB-scale artifacts (colmap-splat PLYs,
+  Neural-Canvas splats), and both ran synchronously on the loop — freezing the
+  co-hosted FastAPI app in hybrid mode (`run_hybrid`), delaying the next claim,
+  and stalling the heartbeat and `CancelGuard` poll of any work still in
+  flight. Both now run via `asyncio.to_thread` with identical semantics:
+  `ignore_errors=True` is preserved, so neither call raises, and the workdir /
+  staging dir is removed exactly as before.
 
 ## v0.12.0 — 2026-07-17
 
