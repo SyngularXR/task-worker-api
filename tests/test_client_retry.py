@@ -2020,7 +2020,15 @@ async def test_retry_after_http_date_replaces_backoff(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("header", ["soon", "", "2.5", "-5", "0", "not-a-date"])
+@pytest.mark.parametrize("header", [
+    "soon", "", "2.5", "-5", "0", "not-a-date",
+    # Oversized values: Python ints are unbounded, so these parse as ints and
+    # then overflow the conversion to a C double. The parser must absorb that
+    # — an escaping OverflowError would abort the request mid-schedule and
+    # replace the HTTPStatusError the caller is written to expect.
+    pytest.param("1" + "0" * 400, id="oversized-delta-seconds"),
+    pytest.param("Wed, 21 Oct " + "9" * 40 + " 07:28:00 GMT", id="oversized-year"),
+])
 async def test_retry_after_invalid_falls_back_to_backoff(monkeypatch, header):
     """An unparseable or non-positive Retry-After leaves the exponential
     schedule untouched — malformed input must never make retries *faster*."""
@@ -2159,3 +2167,8 @@ def test_retry_after_delay_parses_both_rfc_forms():
     assert _retry_after_delay(_resp({"Retry-After": "0"})) is None
     assert _retry_after_delay(_resp({"Retry-After": "-30"})) is None
     assert _retry_after_delay(_resp({"Retry-After": "later"})) is None
+    # Oversized numerics overflow float()/the datetime build; both are absorbed.
+    assert _retry_after_delay(_resp({"Retry-After": "1" + "0" * 400})) is None
+    assert _retry_after_delay(
+        _resp({"Retry-After": "Wed, 21 Oct " + "9" * 40 + " 07:28:00 GMT"}),
+    ) is None

@@ -19,8 +19,13 @@
   loop on one call) and buys no extra attempts. Absent, unparseable, or
   non-positive header (`Retry-After: 0`, a date already past) falls back
   to the existing capped-jittered exponential schedule, so behaviour
-  without the header is identical to before. Additive and
-  backward-compatible: no API, env-var, or wire-format change.
+  without the header is identical to before. Oversized numerics fall back
+  the same way: Python ints are unbounded, so `Retry-After: 1000…0` (or an
+  HTTP-date with a 40-digit year) parses as an int and overflows only on
+  the conversion to a C double — the parser absorbs that `OverflowError`
+  rather than letting it escape `_retry`, abort the request mid-schedule,
+  and replace the `HTTPStatusError` callers are written to expect.
+  Additive and backward-compatible: no API, env-var, or wire-format change.
 - `BackendClient` now exposes a `poll_cancel_status` method: a one-shot
   GET `/tasks/{id}/cancel-status` with no retries and the dedicated
   `cancel_timeout_s` deadline. The `CancelGuard` (which polls this

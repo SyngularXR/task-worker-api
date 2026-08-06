@@ -107,16 +107,24 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
     immediately": a ``Retry-After: 0`` or a date already in the past would
     otherwise let the whole attempt budget fire back-to-back in milliseconds,
     which is strictly worse for a backend that is already throttling us.
+
+    The header is remote input, so both parse paths also absorb
+    ``OverflowError``: Python ints are unbounded, so an oversized value
+    (``Retry-After: 1000...0``, or an HTTP-date with a 40-digit year) parses
+    as an int and then blows up on the conversion to a C double. Letting that
+    escape would abort the request outright and replace the ``HTTPStatusError``
+    the caller expects — an unparseable delay must degrade to our own schedule,
+    never to a crash.
     """
     raw = response.headers.get("retry-after")
     if raw is None:
         return None
     try:
         delay = float(int(raw.strip()))
-    except ValueError:
+    except (ValueError, OverflowError):
         try:
             when = parsedate_to_datetime(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         if when is None:  # pragma: no cover — pre-3.10 returned None, not raise
             return None
