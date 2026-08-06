@@ -2089,11 +2089,11 @@ async def test_retry_after_zero_retries_immediately(monkeypatch, header):
 
 @pytest.mark.asyncio
 async def test_retry_after_honoured_in_full_never_shortened(monkeypatch):
-    """A long-but-permitted Retry-After is slept in full, not shortened.
+    """A Retry-After under the ceiling is slept in full, not shortened.
 
-    Regression guard for the clamp this branch used to apply: retrying at the
-    ceiling instead of the server's instant lands inside the window the server
-    said was closed, so it burns an attempt that near-certainly fails.
+    Retrying before the instant the server named lands inside the window it
+    just said was closed, so it burns an attempt that near-certainly fails.
+    Only an over-ceiling window gets clamped (see the test below).
     """
     sleeps = _sleep_recorder(monkeypatch)
 
@@ -2111,16 +2111,15 @@ async def test_retry_after_honoured_in_full_never_shortened(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retry_after_beyond_ceiling_gives_up_rather_than_retrying_early(
-    monkeypatch,
-):
-    """When the server asks for longer than we're willing to wait, abandon
-    retries — do not retry early inside the window it named.
+async def test_retry_after_beyond_ceiling_clamps_but_keeps_retrying(monkeypatch):
+    """A Retry-After longer than retry_backoff_max_s is clamped to the
+    ceiling — it must never cost the call its remaining attempts.
 
-    Retrying at the ceiling would spend every remaining attempt inside a
-    still-open rate-limit window, which is the attempt-exhaustion failure this
-    feature exists to prevent. The caller sees the same HTTPStatusError it
-    already handles after exhaustion, just without the wasted requests.
+    Regression guard: retry_backoff_max_s caps a single *sleep*, and never
+    bounded how long the backend may take to recover. Treating an over-ceiling
+    window as "give up" turned a multi-attempt complete/fail report into an
+    immediate failure on the default 60s ceiling, stranding tasks in_progress
+    on any consumer that hadn't proactively raised the setting.
     """
     sleeps = _sleep_recorder(monkeypatch)
     calls = {"n": 0}
@@ -2136,14 +2135,44 @@ async def test_retry_after_beyond_ceiling_gives_up_rather_than_retrying_early(
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
     await client.close()
 
-    assert sleeps == []      # never slept a shortened (early) delay
-    assert calls["n"] == 1   # and never retried inside the named window
+    assert sleeps == [30.0, 30.0]  # capped sleep, not an early exit
+    assert calls["n"] == 3         # full attempt budget still spent
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_survives_over_ceiling_retry_after(monkeypatch):
+    """The reviewer's case end-to-end: a throttled complete() whose window is
+    longer than the ceiling still reports once the backend lets it through.
+
+    With the over-ceiling window treated as an abort, this call raised on the
+    first 429 and the finished task stayed in_progress until the sweeper
+    reclaimed it.
+    """
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:  # window outlasts one clamped sleep
+            return httpx.Response(
+                429, headers={"Retry-After": "120"}, text="Too Many Requests",
+            )
+        return httpx.Response(200)
+
+    client = _client_with_handler(
+        handler, max_retries=6, retry_backoff_s=2.0, retry_backoff_max_s=60.0,
+    )
+    await client.complete(7, {"output": "done"})
+    await client.close()
+
+    assert calls["n"] == 3
+    assert sleeps == [60.0, 60.0]
 
 
 @pytest.mark.asyncio
 async def test_retry_after_uncapped_client_honours_any_delay(monkeypatch):
-    """retry_backoff_max_s=None (cap disabled) honours the header verbatim
-    instead of giving up — the same opt-in the exponential schedule has."""
+    """retry_backoff_max_s=None (cap disabled) sleeps the full named window —
+    the same opt-in the exponential schedule has."""
     sleeps = _sleep_recorder(monkeypatch)
 
     async def handler(request: httpx.Request) -> httpx.Response:

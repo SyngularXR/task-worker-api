@@ -346,12 +346,10 @@ class BackendClient:
         header (delta-seconds or HTTP-date), that delay is honoured verbatim
         instead of the computed backoff — the server knows when its rate-limit
         window closes better than our schedule does — and ``Retry-After: 0``
-        retries immediately. The delay is never shortened, because retrying
-        before the named instant lands inside the closed window and burns an
-        attempt for nothing. If the server asks for longer than
-        ``retry_backoff_max_s``, this gives up and raises the status error
-        rather than retrying early. Honouring the header never buys extra
-        attempts.
+        retries immediately. The header is capped by ``retry_backoff_max_s``
+        like any other delay, and never costs the call an attempt: a window
+        longer than the ceiling is retried at the ceiling, not abandoned.
+        Honouring the header never buys extra attempts either.
 
         ``extra_transient`` widens the transient status set for this call
         only — used by ``complete``/``fail`` to also retry 500 (see the
@@ -398,40 +396,33 @@ class BackendClient:
                         attempt, self.retry_backoff_s,
                         self.retry_backoff_max_s, self.retry_jitter,
                     )
-                elif (
-                    self.retry_backoff_max_s is not None
-                    and retry_after > self.retry_backoff_max_s
-                ):
-                    # The server named an instant further out than this
-                    # client is willing to wait on one call. Clamping the
-                    # sleep down to the ceiling would retry *before* the
-                    # authorized instant: that attempt lands inside the
-                    # window the server just told us was closed, so it
-                    # near-certainly fails and only burns budget — the exact
-                    # attempt-exhaustion this whole branch exists to prevent.
-                    # Give up now instead and surface the status error, which
-                    # is what the caller already handles after exhaustion.
-                    # A consumer that wants to wait out longer windows raises
-                    # retry_backoff_max_s (or passes None to uncap it).
-                    log.warning(
-                        "HTTP %s on %s %s asked for Retry-After %.1fs, past "
-                        "the %.1fs retry_backoff_max_s ceiling; abandoning "
-                        "retries rather than retrying inside the window",
-                        e.response.status_code, method, path,
-                        retry_after, self.retry_backoff_max_s,
-                    )
-                    break
                 else:
-                    # Honour the server's instant exactly — never early. Not
-                    # jittered either: jitter is there to decorrelate the
-                    # fleet's *self-scheduled* retries, and a negative jitter
-                    # here would pull the retry back inside the window the
-                    # server asked us to wait out. Waiting longer than our own
+                    # Honour the server's instant exactly — never early, and
+                    # not jittered: jitter is there to decorrelate the fleet's
+                    # *self-scheduled* retries, and a negative jitter here
+                    # would pull the retry back inside the window the server
+                    # asked us to wait out. Waiting longer than our own
                     # schedule is the point; the sleep is async, so it stalls
                     # only this call (and, since the polling loop is
-                    # sequential, this worker's next claim) — hence the
-                    # ceiling above rather than an unbounded wait.
+                    # sequential, this worker's next claim).
                     delay = retry_after
+                    if (
+                        self.retry_backoff_max_s is not None
+                        and delay > self.retry_backoff_max_s
+                    ):
+                        # A window longer than we'll sleep in one go is still
+                        # capped at the ceiling — never turned into an early
+                        # exit. retry_backoff_max_s bounds a single sleep; it
+                        # has never bounded how long the backend may take to
+                        # recover, and spending it as an attempt budget would
+                        # make a throttled terminal report fail outright where
+                        # it previously kept trying (default ceiling 60s, so
+                        # any Retry-After above a minute would strand the
+                        # task). Clamped, the retries land at the ceiling
+                        # until the window closes: the same cadence as before
+                        # Retry-After was honoured at all, and the one that
+                        # still recovers.
+                        delay = self.retry_backoff_max_s
                 log.debug(
                     "transient HTTP %s on %s %s; retrying in %.1fs%s",
                     e.response.status_code, method, path, delay,
