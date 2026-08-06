@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -90,6 +92,41 @@ def _is_transient_status(
     return exc.response.status_code in _TRANSIENT_STATUS_CODES or (
         exc.response.status_code in extra
     )
+
+
+def _retry_after_delay(response: httpx.Response) -> Optional[float]:
+    """Parse a response's ``Retry-After`` header into a delay in seconds.
+
+    RFC 9110 allows two forms and both are accepted: delta-seconds
+    (``Retry-After: 30``) and an HTTP-date (``Retry-After: Wed, 21 Oct 2026
+    07:28:00 GMT``, converted to a delay relative to now).
+
+    Returns ``None`` when the header is absent, malformed, or resolves to a
+    non-positive delay — the caller then falls back to its own exponential
+    schedule. Non-positive is treated as "no guidance" rather than "retry
+    immediately": a ``Retry-After: 0`` or a date already in the past would
+    otherwise let the whole attempt budget fire back-to-back in milliseconds,
+    which is strictly worse for a backend that is already throttling us.
+    """
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        delay = float(int(raw.strip()))
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return None
+        if when is None:  # pragma: no cover — pre-3.10 returned None, not raise
+            return None
+        if when.tzinfo is None:
+            # An HTTP-date without a zone is still GMT per RFC 9110 (obs-date
+            # forms parse tz-naive); interpreting it as local time would skew
+            # the delay by the host's UTC offset.
+            when = when.replace(tzinfo=timezone.utc)
+        delay = (when - datetime.now(timezone.utc)).total_seconds()
+    return delay if delay > 0 else None
 
 
 def _backoff_delay(
@@ -285,6 +322,12 @@ class BackendClient:
         instant it recovers. ``max_retries`` attempts fire in total, unless
         the caller overrides the budget via ``attempts``.
 
+        When a retryable *status* response carries a parseable ``Retry-After``
+        header (delta-seconds or HTTP-date), that delay is used instead of the
+        computed backoff — the server knows when its rate-limit window closes
+        better than our schedule does. It is still clamped to
+        ``retry_backoff_max_s`` and does not buy extra attempts.
+
         ``extra_transient`` widens the transient status set for this call
         only — used by ``complete``/``fail`` to also retry 500 (see the
         ``_TRANSIENT_STATUS_CODES`` comment for the rationale).
@@ -315,13 +358,36 @@ class BackendClient:
                 last_exc = e
                 if attempt == total_attempts - 1:
                     break
-                delay = _backoff_delay(
-                    attempt, self.retry_backoff_s,
-                    self.retry_backoff_max_s, self.retry_jitter,
-                )
+                # A status response can name its own retry instant via
+                # Retry-After; honour it in preference to our schedule. On a
+                # 429 the backend's rate-limit window is authoritative, and
+                # spending the attempt budget on the SDK's own 2s/4s/8s
+                # schedule *inside* that window is how a terminal
+                # complete/fail report gets dropped — the task then sits
+                # in_progress until the sweeper reclaims it. Absent or
+                # unparseable header → the capped-jittered exponential
+                # schedule, exactly as before.
+                retry_after = _retry_after_delay(e.response)
+                if retry_after is None:
+                    delay = _backoff_delay(
+                        attempt, self.retry_backoff_s,
+                        self.retry_backoff_max_s, self.retry_jitter,
+                    )
+                else:
+                    # Retry-After is remote input: clamp it to the same
+                    # ceiling that bounds the exponential schedule so a
+                    # misconfigured (or hostile) header can't park the
+                    # worker's event loop for an hour on one call. Not
+                    # jittered — the server named an instant, and jitter
+                    # could pull the retry back inside the window it asked
+                    # us to wait out.
+                    delay = retry_after
+                    if self.retry_backoff_max_s is not None:
+                        delay = min(delay, self.retry_backoff_max_s)
                 log.debug(
-                    "transient HTTP %s on %s %s; retrying in %.1fs",
+                    "transient HTTP %s on %s %s; retrying in %.1fs%s",
                     e.response.status_code, method, path, delay,
+                    " (Retry-After)" if retry_after is not None else "",
                 )
                 await asyncio.sleep(delay)
         # last_exc is guaranteed non-None here because __init__ rejects

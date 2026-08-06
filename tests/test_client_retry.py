@@ -1949,3 +1949,213 @@ async def test_fail_still_retries_transport_errors():
     await client.close()
 
     assert calls["n"] == 5
+
+
+# -----------------------------------------------------------------------
+# Retry-After — a transient status response can name its own retry instant
+# (RFC 9110: delta-seconds or HTTP-date). The shared backend rate-limits
+# lifecycle calls under fleet burst load; answering a 429's Retry-After=N
+# with the SDK's own 2s/4s/8s schedule burns the attempt budget *inside*
+# the rate-limit window, so a terminal complete/fail report can exhaust all
+# 6 attempts while still throttled and strand the task in_progress until
+# the sweeper reclaims it. When the header is present and parseable the
+# inter-attempt delay is the server's; absent/unparseable falls back to the
+# capped-jittered exponential schedule (identical behaviour to before).
+# -----------------------------------------------------------------------
+
+
+def _sleep_recorder(monkeypatch) -> list:
+    """Patch asyncio.sleep to record delays instead of waiting."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return sleeps
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 503])
+async def test_retry_after_seconds_replaces_backoff(monkeypatch, status):
+    """A parseable delta-seconds Retry-After sets the inter-attempt delay,
+    overriding the 2/4/8 exponential schedule."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, headers={"Retry-After": "7"}, text="slow down")
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    # Would have been [2.0, 4.0, 8.0] without the header.
+    assert sleeps == [7.0, 7.0, 7.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_http_date_replaces_backoff(monkeypatch):
+    """The HTTP-date form is honoured too, converted to a delay from now."""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    sleeps = _sleep_recorder(monkeypatch)
+    when = format_datetime(
+        datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": when}, text="slow down")
+
+    client = _client_with_handler(handler, max_retries=2, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    # One sleep, ~30s (the header has whole-second resolution, so the delay
+    # lands just under 30 — never the 2.0 the backoff schedule would give).
+    assert len(sleeps) == 1
+    assert 28.0 <= sleeps[0] <= 30.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["soon", "", "2.5", "-5", "0", "not-a-date"])
+async def test_retry_after_invalid_falls_back_to_backoff(monkeypatch, header):
+    """An unparseable or non-positive Retry-After leaves the exponential
+    schedule untouched — malformed input must never make retries *faster*."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": header}, text="slow down")
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [2.0, 4.0, 8.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_absent_keeps_exponential_backoff(monkeypatch):
+    """No header → byte-identical behaviour to before this feature."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="Service Unavailable")
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [2.0, 4.0, 8.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_clamped_to_backoff_max(monkeypatch):
+    """Retry-After is remote input: an absurd value is clamped to
+    retry_backoff_max_s so one call can't park the event loop for an hour."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "3600"}, text="slow down")
+
+    client = _client_with_handler(
+        handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [30.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_does_not_extend_attempt_budget(monkeypatch):
+    """Honouring the header changes the *delay*, not the attempt count."""
+    _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "5"}, text="slow down")
+
+    client = _client_with_handler(handler, max_retries=3)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_waits_out_rate_limit_window(monkeypatch):
+    """The motivating case: a throttled complete() must wait the window the
+    backend named rather than burning its 6 attempts inside it."""
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(
+                429, headers={"Retry-After": "20"}, text="Too Many Requests",
+            )
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    await client.complete(7, {"output": "done"})
+    await client.close()
+
+    assert calls["n"] == 3
+    assert sleeps == [20.0, 20.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_ignored_for_transport_errors(monkeypatch):
+    """Transport errors have no response to read a header from — they keep
+    the exponential schedule unconditionally."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TransportError("connection refused")
+
+    client = _client_with_handler(handler, max_retries=3, retry_backoff_s=2.0)
+    with pytest.raises(httpx.TransportError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [2.0, 4.0]
+
+
+def test_retry_after_delay_parses_both_rfc_forms():
+    """Unit coverage for the parser: delta-seconds, HTTP-date, and every
+    'no guidance' case that must fall back to the exponential schedule."""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from task_worker_api.client import _retry_after_delay
+
+    def _resp(headers):
+        return httpx.Response(429, headers=headers)
+
+    assert _retry_after_delay(_resp({"Retry-After": "12"})) == 12.0
+    # Header lookup is case-insensitive and tolerates surrounding whitespace.
+    assert _retry_after_delay(_resp({"retry-after": " 12 "})) == 12.0
+
+    future = format_datetime(
+        datetime.now(timezone.utc) + timedelta(seconds=45), usegmt=True,
+    )
+    d = _retry_after_delay(_resp({"Retry-After": future}))
+    assert d is not None and 43.0 <= d <= 45.0
+
+    past = format_datetime(
+        datetime.now(timezone.utc) - timedelta(seconds=45), usegmt=True,
+    )
+    assert _retry_after_delay(_resp({"Retry-After": past})) is None
+    assert _retry_after_delay(_resp({})) is None
+    assert _retry_after_delay(_resp({"Retry-After": "0"})) is None
+    assert _retry_after_delay(_resp({"Retry-After": "-30"})) is None
+    assert _retry_after_delay(_resp({"Retry-After": "later"})) is None

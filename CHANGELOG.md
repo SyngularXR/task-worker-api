@@ -3,6 +3,24 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient._retry` now honours the HTTP `Retry-After` header on a
+  retryable status response (429/502/503/504, plus 500 on terminal
+  reports). Both RFC 9110 forms are accepted — delta-seconds and
+  HTTP-date — and the parsed value replaces the computed backoff for
+  that inter-attempt sleep. Previously every transient status was
+  retried on the SDK's own 2s/4s/8s schedule regardless of what the
+  server asked for: when the shared backend rate-limits lifecycle calls
+  under fleet burst load and answers 429 with `Retry-After: N`, the
+  schedule burned the whole attempt budget *inside* the rate-limit
+  window, so a terminal `complete`/`fail` report could exhaust all 6
+  attempts while still throttled and leave the task stranded
+  `in_progress` until the sweeper reclaimed it. The header is clamped to
+  `retry_backoff_max_s` (remote input must not park the worker's event
+  loop on one call) and buys no extra attempts. Absent, unparseable, or
+  non-positive header (`Retry-After: 0`, a date already past) falls back
+  to the existing capped-jittered exponential schedule, so behaviour
+  without the header is identical to before. Additive and
+  backward-compatible: no API, env-var, or wire-format change.
 - `BackendClient` now exposes a `poll_cancel_status` method: a one-shot
   GET `/tasks/{id}/cancel-status` with no retries and the dedicated
   `cancel_timeout_s` deadline. The `CancelGuard` (which polls this
