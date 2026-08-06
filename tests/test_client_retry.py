@@ -2021,7 +2021,9 @@ async def test_retry_after_http_date_replaces_backoff(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("header", [
-    "soon", "", "2.5", "-5", "0", "not-a-date",
+    # "-5" is malformed, not guidance: RFC 9110 delta-seconds is a
+    # non-negative integer. ("0" *is* guidance — see the test below.)
+    "soon", "", "2.5", "-5", "not-a-date",
     # Oversized values: Python ints are unbounded, so these parse as ints and
     # then overflow the conversion to a C double. The parser must absorb that
     # — an escaping OverflowError would abort the request mid-schedule and
@@ -2062,12 +2064,69 @@ async def test_retry_after_absent_keeps_exponential_backoff(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retry_after_clamped_to_backoff_max(monkeypatch):
-    """Retry-After is remote input: an absurd value is clamped to
-    retry_backoff_max_s so one call can't park the event loop for an hour."""
+@pytest.mark.parametrize("header", [
+    "0",
+    # An HTTP-date already in the past says the same thing: the window the
+    # server named has closed, so retry now.
+    "Wed, 21 Oct 2020 07:28:00 GMT",
+])
+async def test_retry_after_zero_retries_immediately(monkeypatch, header):
+    """Retry-After: 0 is guidance to retry immediately, and is honoured as
+    such — it must not be downgraded to the exponential schedule."""
     sleeps = _sleep_recorder(monkeypatch)
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": header}, text="slow down")
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    # Would have been [2.0, 4.0, 8.0] if a 0 were treated as "no guidance".
+    assert sleeps == [0.0, 0.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_honoured_in_full_never_shortened(monkeypatch):
+    """A long-but-permitted Retry-After is slept in full, not shortened.
+
+    Regression guard for the clamp this branch used to apply: retrying at the
+    ceiling instead of the server's instant lands inside the window the server
+    said was closed, so it burns an attempt that near-certainly fails.
+    """
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "120"}, text="slow down")
+
+    client = _client_with_handler(
+        handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=300.0,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [120.0, 120.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_beyond_ceiling_gives_up_rather_than_retrying_early(
+    monkeypatch,
+):
+    """When the server asks for longer than we're willing to wait, abandon
+    retries — do not retry early inside the window it named.
+
+    Retrying at the ceiling would spend every remaining attempt inside a
+    still-open rate-limit window, which is the attempt-exhaustion failure this
+    feature exists to prevent. The caller sees the same HTTPStatusError it
+    already handles after exhaustion, just without the wasted requests.
+    """
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
         return httpx.Response(429, headers={"Retry-After": "3600"}, text="slow down")
 
     client = _client_with_handler(
@@ -2077,7 +2136,31 @@ async def test_retry_after_clamped_to_backoff_max(monkeypatch):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
     await client.close()
 
-    assert sleeps == [30.0, 30.0]
+    assert sleeps == []      # never slept a shortened (early) delay
+    assert calls["n"] == 1   # and never retried inside the named window
+
+
+@pytest.mark.asyncio
+async def test_retry_after_uncapped_client_honours_any_delay(monkeypatch):
+    """retry_backoff_max_s=None (cap disabled) honours the header verbatim
+    instead of giving up — the same opt-in the exponential schedule has."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "3600"}, text="slow down")
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(base_url="http://fake/api/v1", transport=transport)
+    client = BackendClient(
+        "http://fake/api/v1", "x", client=http,
+        max_retries=2, retry_backoff_s=2.0, retry_backoff_max_s=None,
+        retry_jitter=False,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [3600.0]
 
 
 @pytest.mark.asyncio
@@ -2159,12 +2242,15 @@ def test_retry_after_delay_parses_both_rfc_forms():
     d = _retry_after_delay(_resp({"Retry-After": future}))
     assert d is not None and 43.0 <= d <= 45.0
 
+    # "Retry now" (0.0) is a real answer and must stay distinct from None
+    # ("no guidance, use our own schedule").
     past = format_datetime(
         datetime.now(timezone.utc) - timedelta(seconds=45), usegmt=True,
     )
-    assert _retry_after_delay(_resp({"Retry-After": past})) is None
+    assert _retry_after_delay(_resp({"Retry-After": past})) == 0.0
+    assert _retry_after_delay(_resp({"Retry-After": "0"})) == 0.0
     assert _retry_after_delay(_resp({})) is None
-    assert _retry_after_delay(_resp({"Retry-After": "0"})) is None
+    # Negative delta-seconds is malformed (RFC 9110: non-negative), not "now".
     assert _retry_after_delay(_resp({"Retry-After": "-30"})) is None
     assert _retry_after_delay(_resp({"Retry-After": "later"})) is None
     # Oversized numerics overflow float()/the datetime build; both are absorbed.

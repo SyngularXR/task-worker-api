@@ -14,12 +14,20 @@
   schedule burned the whole attempt budget *inside* the rate-limit
   window, so a terminal `complete`/`fail` report could exhaust all 6
   attempts while still throttled and leave the task stranded
-  `in_progress` until the sweeper reclaimed it. The header is clamped to
-  `retry_backoff_max_s` (remote input must not park the worker's event
-  loop on one call) and buys no extra attempts. Absent, unparseable, or
-  non-positive header (`Retry-After: 0`, a date already past) falls back
-  to the existing capped-jittered exponential schedule, so behaviour
-  without the header is identical to before. Oversized numerics fall back
+  `in_progress` until the sweeper reclaimed it. The delay is honoured
+  verbatim and never shortened — retrying before the instant the server
+  named lands inside the window it just said was closed, which burns an
+  attempt for nothing and reproduces that same exhaustion. `Retry-After:
+  0` (and an HTTP-date already past) therefore means retry immediately,
+  as RFC 9110 defines it. If the server asks for longer than
+  `retry_backoff_max_s`, `_retry` abandons its remaining attempts and
+  raises the `HTTPStatusError` callers already handle after exhaustion,
+  rather than retrying early; consumers that want to wait out longer
+  windows raise that ceiling or pass `None` to uncap it. Honouring the
+  header buys no extra attempts. An absent or malformed header (including
+  a negative delta-seconds, which RFC 9110 does not permit) falls back to
+  the existing capped-jittered exponential schedule, so behaviour without
+  the header is identical to before. Oversized numerics fall back
   the same way: Python ints are unbounded, so `Retry-After: 1000…0` (or an
   HTTP-date with a 40-digit year) parses as an int and overflows only on
   the conversion to a C double — the parser absorbs that `OverflowError`

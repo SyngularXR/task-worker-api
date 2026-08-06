@@ -101,40 +101,52 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
     (``Retry-After: 30``) and an HTTP-date (``Retry-After: Wed, 21 Oct 2026
     07:28:00 GMT``, converted to a delay relative to now).
 
-    Returns ``None`` when the header is absent, malformed, or resolves to a
-    non-positive delay — the caller then falls back to its own exponential
-    schedule. Non-positive is treated as "no guidance" rather than "retry
-    immediately": a ``Retry-After: 0`` or a date already in the past would
-    otherwise let the whole attempt budget fire back-to-back in milliseconds,
-    which is strictly worse for a backend that is already throttling us.
+    Returns ``None`` only when the header carries no usable guidance — absent,
+    malformed, or an absurd value we can't represent. The caller then falls
+    back to its own exponential schedule.
 
-    The header is remote input, so both parse paths also absorb
-    ``OverflowError``: Python ints are unbounded, so an oversized value
-    (``Retry-After: 1000...0``, or an HTTP-date with a 40-digit year) parses
-    as an int and then blows up on the conversion to a C double. Letting that
-    escape would abort the request outright and replace the ``HTTPStatusError``
-    the caller expects — an unparseable delay must degrade to our own schedule,
-    never to a crash.
+    ``0.0`` is a real answer, not "no guidance": ``Retry-After: 0`` and an
+    HTTP-date already in the past both mean *retry immediately* (RFC 9110
+    §10.2.3), and the attempt budget still bounds how many requests that can
+    produce. A negative *delta-seconds* is a different case — delta-seconds is
+    defined as a non-negative integer, so ``Retry-After: -5`` is malformed
+    input rather than guidance, and falls back to the schedule.
+
+    The header is remote input, so the numeric path absorbs ``OverflowError``:
+    Python ints are unbounded, so an oversized value (``Retry-After:
+    1000...0``, or an HTTP-date with a 40-digit year) parses as an int and then
+    blows up on the conversion to a C double. Letting that escape would abort
+    the request outright and replace the ``HTTPStatusError`` the caller
+    expects — an unparseable delay must degrade to our own schedule, never to
+    a crash.
     """
     raw = response.headers.get("retry-after")
     if raw is None:
         return None
     try:
-        delay = float(int(raw.strip()))
-    except (ValueError, OverflowError):
+        seconds = int(raw.strip())
+    except ValueError:
+        pass  # not delta-seconds — fall through to the HTTP-date form
+    else:
+        if seconds < 0:
+            return None  # malformed: delta-seconds is non-negative
         try:
-            when = parsedate_to_datetime(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if when is None:  # pragma: no cover — pre-3.10 returned None, not raise
-            return None
-        if when.tzinfo is None:
-            # An HTTP-date without a zone is still GMT per RFC 9110 (obs-date
-            # forms parse tz-naive); interpreting it as local time would skew
-            # the delay by the host's UTC offset.
-            when = when.replace(tzinfo=timezone.utc)
-        delay = (when - datetime.now(timezone.utc)).total_seconds()
-    return delay if delay > 0 else None
+            return float(seconds)
+        except OverflowError:
+            return None  # too large to represent → no usable guidance
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:  # pragma: no cover — pre-3.10 returned None, not raise
+        return None
+    if when.tzinfo is None:
+        # An HTTP-date without a zone is still GMT per RFC 9110 (obs-date
+        # forms parse tz-naive); interpreting it as local time would skew
+        # the delay by the host's UTC offset.
+        when = when.replace(tzinfo=timezone.utc)
+    # A date already past means "retry now", not "no guidance".
+    return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
 
 
 def _backoff_delay(
@@ -331,10 +343,15 @@ class BackendClient:
         the caller overrides the budget via ``attempts``.
 
         When a retryable *status* response carries a parseable ``Retry-After``
-        header (delta-seconds or HTTP-date), that delay is used instead of the
-        computed backoff — the server knows when its rate-limit window closes
-        better than our schedule does. It is still clamped to
-        ``retry_backoff_max_s`` and does not buy extra attempts.
+        header (delta-seconds or HTTP-date), that delay is honoured verbatim
+        instead of the computed backoff — the server knows when its rate-limit
+        window closes better than our schedule does — and ``Retry-After: 0``
+        retries immediately. The delay is never shortened, because retrying
+        before the named instant lands inside the closed window and burns an
+        attempt for nothing. If the server asks for longer than
+        ``retry_backoff_max_s``, this gives up and raises the status error
+        rather than retrying early. Honouring the header never buys extra
+        attempts.
 
         ``extra_transient`` widens the transient status set for this call
         only — used by ``complete``/``fail`` to also retry 500 (see the
@@ -381,17 +398,40 @@ class BackendClient:
                         attempt, self.retry_backoff_s,
                         self.retry_backoff_max_s, self.retry_jitter,
                     )
+                elif (
+                    self.retry_backoff_max_s is not None
+                    and retry_after > self.retry_backoff_max_s
+                ):
+                    # The server named an instant further out than this
+                    # client is willing to wait on one call. Clamping the
+                    # sleep down to the ceiling would retry *before* the
+                    # authorized instant: that attempt lands inside the
+                    # window the server just told us was closed, so it
+                    # near-certainly fails and only burns budget — the exact
+                    # attempt-exhaustion this whole branch exists to prevent.
+                    # Give up now instead and surface the status error, which
+                    # is what the caller already handles after exhaustion.
+                    # A consumer that wants to wait out longer windows raises
+                    # retry_backoff_max_s (or passes None to uncap it).
+                    log.warning(
+                        "HTTP %s on %s %s asked for Retry-After %.1fs, past "
+                        "the %.1fs retry_backoff_max_s ceiling; abandoning "
+                        "retries rather than retrying inside the window",
+                        e.response.status_code, method, path,
+                        retry_after, self.retry_backoff_max_s,
+                    )
+                    break
                 else:
-                    # Retry-After is remote input: clamp it to the same
-                    # ceiling that bounds the exponential schedule so a
-                    # misconfigured (or hostile) header can't park the
-                    # worker's event loop for an hour on one call. Not
-                    # jittered — the server named an instant, and jitter
-                    # could pull the retry back inside the window it asked
-                    # us to wait out.
+                    # Honour the server's instant exactly — never early. Not
+                    # jittered either: jitter is there to decorrelate the
+                    # fleet's *self-scheduled* retries, and a negative jitter
+                    # here would pull the retry back inside the window the
+                    # server asked us to wait out. Waiting longer than our own
+                    # schedule is the point; the sleep is async, so it stalls
+                    # only this call (and, since the polling loop is
+                    # sequential, this worker's next claim) — hence the
+                    # ceiling above rather than an unbounded wait.
                     delay = retry_after
-                    if self.retry_backoff_max_s is not None:
-                        delay = min(delay, self.retry_backoff_max_s)
                 log.debug(
                     "transient HTTP %s on %s %s; retrying in %.1fs%s",
                     e.response.status_code, method, path, delay,
