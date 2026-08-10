@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from .cancel import CancelGuard
-from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S
+from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _backoff_delay
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -51,6 +52,26 @@ HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
 # ~an order of magnitude, short enough that a recovered backend is picked up
 # within a minute.
 _DEFAULT_CLAIM_BACKOFF_MAX_S = 60.0
+
+
+def _positive_finite_s(name: str, value: float) -> float:
+    """Validate a poll-loop delay knob, or raise ``ValueError``.
+
+    These two knobs are the poll loop's only pacing, and every degenerate
+    value breaks it in a way that is silent at construction and expensive in
+    production: ``0``/negative spins the claim loop at full speed against the
+    backend, ``inf`` makes the first idle wait never end (the worker stops
+    polling for good), and ``NaN`` fails every comparison in ``_claim_wait_s``
+    — so the cap never matches, the doubling loop runs once per accumulated
+    failure, and ``asyncio.wait_for(timeout=nan)`` waits forever. Rejecting
+    them here is what makes the capped-and-still-polling guarantee real.
+    """
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{name} must be a finite positive number of seconds "
+            f"(got {value!r})"
+        )
+    return float(value)
 
 
 def _make_sync_fail(
@@ -148,8 +169,17 @@ class Worker:
             work_dir or os.environ.get("WORKER_WORKDIR") or tempfile.gettempdir()
         )
         self.shared_volume_path = shared_volume_path
-        self.poll_interval_s = poll_interval_s
-        self.claim_backoff_max_s = claim_backoff_max_s
+        self.poll_interval_s = _positive_finite_s(
+            "poll_interval_s", poll_interval_s,
+        )
+        self.claim_backoff_max_s = _positive_finite_s(
+            "claim_backoff_max_s", claim_backoff_max_s,
+        )
+        # Same flag the BackendClient uses for its per-call retry delays, and
+        # for the same reason: the fleet's workers restart together (one deploy
+        # rolls all three) and would otherwise share one deterministic
+        # schedule. Tests that assert exact delays pass retry_jitter=False.
+        self.retry_jitter = retry_jitter
         self.heartbeat_interval_s = heartbeat_interval_s
         self.heartbeat_warn_threshold = heartbeat_warn_threshold
         self.cancel_poll_interval_s = cancel_poll_interval_s
@@ -387,23 +417,37 @@ class Worker:
         request rate against a down backend decays exponentially instead of
         holding steady at one burst per worker per poll interval.
 
+        Escalated waits are jittered (±25%, shared with the client's retry
+        schedule). Decay alone doesn't fix the herd: the fleet's workers are
+        deployed and restarted together, so they enter the outage in lockstep
+        and a *deterministic* schedule keeps them there — every worker's 8th
+        failure lands on the same instant, and a backend that comes back mid-
+        backoff is hit by the whole fleet at once instead of a spread. Jitter
+        is what decorrelates them; the doubling only thins the average rate.
+
         Doubling iteratively (rather than ``poll_interval_s * 2 ** failures``)
         keeps a pathological failure count — a worker left running for days
         against a dead backend — from overflowing the float and yielding
-        ``inf``: the loop returns the cap as soon as it's reached. The cap is
+        ``inf``: the loop stops as soon as the cap is reached. The cap is
         floored at ``poll_interval_s`` so a consumer that configures a
         ``claim_backoff_max_s`` below their poll interval never polls *faster*
         while failing than while healthy.
         """
         if self._claim_failures <= 0:
+            # Healthy polling is exactly poll_interval_s — unchanged, and no
+            # herd to break up: these claims are landing.
             return self.poll_interval_s
         cap = max(self.claim_backoff_max_s, self.poll_interval_s)
         delay = self.poll_interval_s
         for _ in range(self._claim_failures):
             delay *= 2
             if delay >= cap:
-                return cap
-        return delay
+                delay = cap
+                break
+        # attempt=0 → no further doubling; this call only applies the shared
+        # ±25% jitter band to the already-capped delay (so the jittered wait
+        # can exceed the cap by up to 25%, exactly as the client's does).
+        return _backoff_delay(0, delay, None, self.retry_jitter)
 
     async def _claim(self) -> Optional[ClaimedTask]:
         try:

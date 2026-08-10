@@ -18,15 +18,27 @@
   that returns an empty queue, which is a successful round-trip. Healthy
   polling is unchanged (exactly `poll_interval_s`, no escalation, no extra
   log), while a fleet facing a down backend decays its request rate
-  exponentially instead of holding it flat. Shutdown stays responsive: the
+  exponentially instead of holding it flat. Escalated waits (only those —
+  never the healthy interval) are jittered ±25% under the existing
+  `retry_jitter` flag, reusing the client's `_backoff_delay`: the fleet
+  deploys and restarts as a unit, so its workers enter an outage in
+  lockstep, and decay alone would leave them there — every worker's *n*th
+  backoff would expire on the same instant and hit a recovering backend
+  with the whole fleet's burst at once. Shutdown stays responsive: the
   escalated wait observes the `_stop` event rather than sleeping, so a
   worker asked to exit mid-backoff exits immediately instead of up to
   `claim_backoff_max_s` later. Doubling is computed iteratively and
   short-circuits at the cap, so a worker left running for days against a
   dead backend can't overflow the delay to `inf` and stop polling
-  altogether. The change is additive and backward-compatible:
-  `claim_backoff_max_s` is a new keyword-only argument with a default, and
-  there are no API, env-var, or wire-format changes.
+  altogether. `poll_interval_s` and `claim_backoff_max_s` are now validated
+  as finite and positive at construction, since every degenerate value
+  defeats those guarantees silently: `0`/negative spins the claim loop at
+  full speed against the backend, `inf` makes the first idle wait never
+  end, and `NaN` fails every comparison in the escalation (so the cap never
+  matches and `asyncio.wait_for` waits forever). The change is additive and
+  backward-compatible: `claim_backoff_max_s` is a new keyword-only argument
+  with a default, the validation only rejects values that were already
+  broken at runtime, and there are no API, env-var, or wire-format changes.
 - `BackendClient._retry` now honours the HTTP `Retry-After` header on a
   retryable status response (429/502/503/504, plus 500 on terminal
   reports). Both RFC 9110 forms are accepted — delta-seconds and

@@ -7,14 +7,20 @@ burst every ``poll_interval_s`` (~19s with the defaults), forever. Aggregate
 load never decayed and a restarting backend got no recovery room.
 
 ``Worker`` now doubles the *idle wait between cycles* per consecutive claim
-failure, capped at ``claim_backoff_max_s`` and reset by any claim that reaches
-the backend. These tests pin: healthy polling is untouched, the escalation
-doubles and caps, it collapses on recovery, it can't overflow, and shutdown
-still interrupts an escalated wait immediately.
+failure, capped at ``claim_backoff_max_s``, jittered ±25%, and reset by any
+claim that reaches the backend. These tests pin: healthy polling is untouched,
+the escalation doubles and caps, escalated waits are jittered (so a fleet
+deployed together doesn't stay in lockstep through the outage), it collapses on
+recovery, it can't overflow, degenerate pacing knobs are rejected at
+construction, and shutdown still interrupts an escalated wait immediately.
+
+Tests that assert on an exact schedule pass ``retry_jitter=False`` — the same
+flag the BackendClient's retry tests use.
 """
 from __future__ import annotations
 
 import asyncio
+import math
 
 import pytest
 
@@ -90,6 +96,7 @@ def test_wait_is_poll_interval_while_healthy(make_worker, fake_client):
 def test_wait_doubles_per_consecutive_failure(make_worker, fake_client):
     worker = make_worker(
         client=fake_client, poll_interval_s=5.0, claim_backoff_max_s=1000.0,
+        retry_jitter=False,
     )
     for failures, expected in ((1, 10.0), (2, 20.0), (3, 40.0), (4, 80.0)):
         worker._claim_failures = failures
@@ -99,6 +106,7 @@ def test_wait_doubles_per_consecutive_failure(make_worker, fake_client):
 def test_wait_is_capped_at_claim_backoff_max_s(make_worker, fake_client):
     worker = make_worker(
         client=fake_client, poll_interval_s=5.0, claim_backoff_max_s=30.0,
+        retry_jitter=False,
     )
     worker._claim_failures = 3  # would be 40s uncapped
     assert worker._claim_wait_s() == 30.0
@@ -109,7 +117,7 @@ def test_wait_is_capped_at_claim_backoff_max_s(make_worker, fake_client):
 def test_default_claim_backoff_max_is_60s(make_worker, fake_client):
     """The documented default — 19s of poll interval must land on 60s, not
     grow without bound."""
-    worker = make_worker(client=fake_client)
+    worker = make_worker(client=fake_client, retry_jitter=False)
     assert worker.claim_backoff_max_s == 60.0
     worker._claim_failures = 99
     assert worker._claim_wait_s() == 60.0
@@ -120,6 +128,7 @@ def test_cap_is_floored_at_poll_interval(make_worker, fake_client):
     *faster* than a healthy one."""
     worker = make_worker(
         client=fake_client, poll_interval_s=30.0, claim_backoff_max_s=5.0,
+        retry_jitter=False,
     )
     assert worker._claim_wait_s() == 30.0
     worker._claim_failures = 4
@@ -130,14 +139,86 @@ def test_pathological_failure_count_stays_finite(make_worker, fake_client):
     """A worker left running for days against a dead backend accumulates a
     huge failure count. ``poll_interval_s * 2 ** failures`` would overflow to
     ``inf`` (and ``asyncio.wait_for(timeout=inf)`` would never poll again);
-    iterative doubling returns the cap."""
+    iterative doubling stops at the cap. Jitter left on: it must not
+    reintroduce a non-finite wait."""
     worker = make_worker(
         client=fake_client, poll_interval_s=5.0, claim_backoff_max_s=60.0,
     )
     worker._claim_failures = 100_000
     wait = worker._claim_wait_s()
-    assert wait == 60.0
-    assert wait != float("inf")
+    assert math.isfinite(wait)
+    assert 45.0 <= wait <= 75.0  # 60s cap ±25% jitter
+
+
+# ----- jitter ----------------------------------------------------------------
+
+
+def test_escalated_wait_is_jittered_within_a_bounded_band(
+    make_worker, fake_client,
+):
+    """Bounded means bounded: every sample sits inside the ±25% band around
+    the deterministic delay, and the values actually vary."""
+    worker = make_worker(
+        client=fake_client, poll_interval_s=5.0, claim_backoff_max_s=1000.0,
+    )
+    worker._claim_failures = 3  # deterministic delay: 40s
+    samples = [worker._claim_wait_s() for _ in range(50)]
+
+    assert all(30.0 <= s <= 50.0 for s in samples)
+    assert len(set(samples)) > 1
+
+
+def test_jitter_decorrelates_workers_with_identical_config(
+    make_worker, fake_client,
+):
+    """The thundering-herd regression: the fleet rolls as one deploy, so its
+    workers hit an outage with identical config and identical failure counts.
+    Without jitter their Nth backoff expires on the same instant and the
+    recovering backend takes the whole fleet's burst at once."""
+    def _schedule():
+        worker = make_worker(
+            client=fake_client, poll_interval_s=5.0,
+            claim_backoff_max_s=1000.0,
+        )
+        waits = []
+        for failures in range(1, 8):
+            worker._claim_failures = failures
+            waits.append(worker._claim_wait_s())
+        return waits
+
+    assert _schedule() != _schedule()
+
+
+def test_healthy_wait_is_never_jittered(make_worker, fake_client):
+    """Jitter exists to break up a herd of *failing* workers. A worker whose
+    claims land has no herd to break up, and consumers pace real work on
+    ``poll_interval_s``, so the healthy wait stays exact."""
+    worker = make_worker(client=fake_client, poll_interval_s=5.0)
+    assert {worker._claim_wait_s() for _ in range(20)} == {5.0}
+
+
+# ----- pacing knob validation ------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("knob", ["poll_interval_s", "claim_backoff_max_s"])
+def test_degenerate_pacing_knobs_are_rejected(make_worker, fake_client, knob, bad):
+    """Zero/negative spins the claim loop at full speed; ``inf`` makes the
+    first idle wait never end; ``NaN`` fails every comparison in
+    ``_claim_wait_s`` (so the cap never matches and the wait is never-ending
+    too). All are silent at construction and expensive in production."""
+    with pytest.raises(ValueError, match=knob):
+        make_worker(client=fake_client, **{knob: bad})
+
+
+def test_valid_pacing_knobs_are_coerced_to_float(make_worker, fake_client):
+    """Ints are a normal way to spell these (``int(os.environ[...])``) and must
+    keep working."""
+    worker = make_worker(
+        client=fake_client, poll_interval_s=5, claim_backoff_max_s=60,
+    )
+    assert worker.poll_interval_s == 5.0
+    assert worker.claim_backoff_max_s == 60.0
 
 
 # ----- _claim failure bookkeeping --------------------------------------------
@@ -198,6 +279,7 @@ async def test_poll_loop_backs_off_exponentially_during_outage(make_worker):
     client = _AlwaysFailingClient(stop_after=5)
     worker = make_worker(
         client=client, poll_interval_s=5.0, claim_backoff_max_s=1000.0,
+        retry_jitter=False,
     )
     client.bind(worker)
     waits = _spy_waits(worker)
@@ -213,6 +295,7 @@ async def test_poll_loop_backoff_saturates_at_cap(make_worker):
     client = _AlwaysFailingClient(stop_after=6)
     worker = make_worker(
         client=client, poll_interval_s=5.0, claim_backoff_max_s=30.0,
+        retry_jitter=False,
     )
     client.bind(worker)
     waits = _spy_waits(worker)
@@ -230,6 +313,7 @@ async def test_poll_loop_backoff_collapses_after_recovery(make_worker):
     client = _RecoveringClient(fail_count=3, stop_after=6)
     worker = make_worker(
         client=client, poll_interval_s=5.0, claim_backoff_max_s=1000.0,
+        retry_jitter=False,
     )
     client.bind(worker)
     waits = _spy_waits(worker)
@@ -246,6 +330,7 @@ async def test_shutdown_interrupts_an_escalated_wait(make_worker):
     client = _AlwaysFailingClient()
     worker = make_worker(
         client=client, poll_interval_s=30.0, claim_backoff_max_s=600.0,
+        retry_jitter=False,
     )
     worker._claim_failures = 6  # next wait would be the 600s cap
     assert worker._claim_wait_s() == 600.0
@@ -265,9 +350,10 @@ async def test_shutdown_interrupts_an_escalated_wait(make_worker):
 async def test_backoff_is_logged_once_per_escalated_cycle(make_worker, caplog):
     client = _AlwaysFailingClient(stop_after=3)
     # Real (unscaled) waits here so the logged delay is the one actually
-    # slept: 0.1 + 0.2 + 0.4s.
+    # slept: 0.1 + 0.2 + 0.4s. Jitter off so those numbers are exact.
     worker = make_worker(
         client=client, poll_interval_s=0.05, claim_backoff_max_s=1000.0,
+        retry_jitter=False,
     )
     client.bind(worker)
 
@@ -338,6 +424,7 @@ async def test_processed_task_between_failures_resets_the_escalation(
         handlers={TaskType.DETECT_CUT_PLANES: handler},
         poll_interval_s=5.0,
         claim_backoff_max_s=1000.0,
+        retry_jitter=False,
     )
     client.bind(worker)
     waits = _spy_waits(worker)
