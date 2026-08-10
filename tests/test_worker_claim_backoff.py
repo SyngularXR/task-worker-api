@@ -147,7 +147,7 @@ def test_pathological_failure_count_stays_finite(make_worker, fake_client):
     worker._claim_failures = 100_000
     wait = worker._claim_wait_s()
     assert math.isfinite(wait)
-    assert 45.0 <= wait <= 75.0  # 60s cap ±25% jitter
+    assert 45.0 <= wait <= 60.0  # 60s cap, negative jitter only at the cap
 
 
 # ----- jitter ----------------------------------------------------------------
@@ -187,6 +187,47 @@ def test_jitter_decorrelates_workers_with_identical_config(
         return waits
 
     assert _schedule() != _schedule()
+
+
+def test_jittered_wait_never_escapes_the_cap_or_the_poll_interval(
+    make_worker, fake_client,
+):
+    """Jitter is applied *inside* ``[poll_interval_s, cap]``, not around it.
+
+    Jittering a delay that has already been capped would let an escalated wait
+    overshoot ``claim_backoff_max_s`` by 25% — and, worse, undershoot
+    ``poll_interval_s`` at the low end. Both bounds are pinned here with jitter
+    on, at a failure count deep past the cap so every sample sits on it.
+    """
+    worker = make_worker(
+        client=fake_client, poll_interval_s=5.0, claim_backoff_max_s=30.0,
+    )
+    worker._claim_failures = 20  # far past the cap
+    samples = [worker._claim_wait_s() for _ in range(200)]
+
+    assert all(5.0 <= s <= 30.0 for s in samples)
+    assert len(set(samples)) > 1  # still decorrelated
+
+
+def test_failing_worker_never_polls_faster_than_a_healthy_one_with_jitter(
+    make_worker, fake_client,
+):
+    """The floor holds under jitter, not just in the deterministic schedule.
+
+    With ``claim_backoff_max_s <= poll_interval_s`` the cap collapses onto the
+    poll interval, so negative jitter on the capped delay would make a *failing*
+    worker poll up to 25% faster than a healthy one — hammering the very backend
+    it is supposed to be backing off from. Clamping after jitter pins it.
+    """
+    worker = make_worker(
+        client=fake_client, poll_interval_s=30.0, claim_backoff_max_s=5.0,
+    )
+    healthy = worker._claim_wait_s()
+    for failures in (1, 2, 7, 50):
+        worker._claim_failures = failures
+        assert all(
+            worker._claim_wait_s() >= healthy for _ in range(50)
+        ), f"failing worker polled faster than healthy at {failures} failures"
 
 
 def test_healthy_wait_is_never_jittered(make_worker, fake_client):

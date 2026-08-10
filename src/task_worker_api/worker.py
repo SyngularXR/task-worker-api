@@ -428,10 +428,11 @@ class Worker:
         Doubling iteratively (rather than ``poll_interval_s * 2 ** failures``)
         keeps a pathological failure count — a worker left running for days
         against a dead backend — from overflowing the float and yielding
-        ``inf``: the loop stops as soon as the cap is reached. The cap is
-        floored at ``poll_interval_s`` so a consumer that configures a
-        ``claim_backoff_max_s`` below their poll interval never polls *faster*
-        while failing than while healthy.
+        ``inf``: the loop stops as soon as the cap is reached. The returned
+        wait — jitter included — always lands in ``[poll_interval_s, cap]``,
+        where the cap is floored at ``poll_interval_s`` so a consumer that
+        configures a ``claim_backoff_max_s`` below their poll interval never
+        polls *faster* while failing than while healthy.
         """
         if self._claim_failures <= 0:
             # Healthy polling is exactly poll_interval_s — unchanged, and no
@@ -445,9 +446,15 @@ class Worker:
                 delay = cap
                 break
         # attempt=0 → no further doubling; this call only applies the shared
-        # ±25% jitter band to the already-capped delay (so the jittered wait
-        # can exceed the cap by up to 25%, exactly as the client's does).
-        return _backoff_delay(0, delay, None, self.retry_jitter)
+        # ±25% jitter band. Clamping *after* jitter is what keeps both bounds
+        # real: a negative sample must never drop an escalated wait below
+        # poll_interval_s (at ``claim_backoff_max_s <= poll_interval_s`` the
+        # cap *is* poll_interval_s, so unclamped jitter makes a failing worker
+        # poll up to 25% faster than a healthy one — the exact opposite of a
+        # backoff), and a positive one must not overshoot the ceiling the
+        # consumer configured.
+        jittered = _backoff_delay(0, delay, None, self.retry_jitter)
+        return min(max(jittered, self.poll_interval_s), cap)
 
     async def _claim(self) -> Optional[ClaimedTask]:
         try:

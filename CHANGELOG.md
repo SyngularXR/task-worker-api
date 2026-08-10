@@ -24,7 +24,13 @@
   deploys and restarts as a unit, so its workers enter an outage in
   lockstep, and decay alone would leave them there — every worker's *n*th
   backoff would expire on the same instant and hit a recovering backend
-  with the whole fleet's burst at once. Shutdown stays responsive: the
+  with the whole fleet's burst at once. Jitter is applied *inside* the
+  bounds rather than around them: the returned wait is clamped to
+  `[poll_interval_s, max(claim_backoff_max_s, poll_interval_s)]` after
+  jittering, so an escalated wait can neither overshoot the configured
+  ceiling nor — where the cap collapses onto the poll interval — let a
+  failing worker poll faster than a healthy one. Shutdown stays responsive:
+  the
   escalated wait observes the `_stop` event rather than sleeping, so a
   worker asked to exit mid-backoff exits immediately instead of up to
   `claim_backoff_max_s` later. Doubling is computed iteratively and
