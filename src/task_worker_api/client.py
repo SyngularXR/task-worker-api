@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -65,6 +67,12 @@ _TERMINAL_MIN_ATTEMPTS = 6
 # it via ``retry_backoff_max_s`` if they genuinely want longer waits.
 _DEFAULT_BACKOFF_MAX_S = 60.0
 
+# ``Retry-After`` is server guidance, not exponential backoff, so the backoff
+# ceiling must not shorten it. Still bound hostile or broken headers: six hours
+# is long enough for normal maintenance and rate-limit windows without
+# accepting an effectively infinite sleep.
+_MAX_RETRY_AFTER_S = 6 * 60 * 60
+
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
 # band — enough to decorrelate the fleet (Neural-Canvas, Blender-CLI,
@@ -90,6 +98,62 @@ def _is_transient_status(
     return exc.response.status_code in _TRANSIENT_STATUS_CODES or (
         exc.response.status_code in extra
     )
+
+
+def _retry_after_delay(response: httpx.Response) -> Optional[float]:
+    """Parse a response's ``Retry-After`` header into a delay in seconds.
+
+    RFC 9110 allows two forms and both are accepted: delta-seconds
+    (``Retry-After: 30``) and an HTTP-date (``Retry-After: Wed, 21 Oct 2026
+    07:28:00 GMT``, converted to a delay relative to now).
+
+    Returns ``None`` only when the header carries no usable guidance — absent
+    or malformed. The caller then falls back to its own exponential schedule.
+    Valid delays are capped at ``_MAX_RETRY_AFTER_S``. This is deliberately
+    separate from ``retry_backoff_max_s``: a 60-second exponential-backoff cap
+    must not turn ``Retry-After: 3600`` into six requests inside a one-hour
+    rate-limit window.
+
+    ``0.0`` is a real answer, not "no guidance": ``Retry-After: 0`` and an
+    HTTP-date already in the past both mean *retry immediately* (RFC 9110
+    §10.2.3), and the attempt budget still bounds how many requests that can
+    produce. A negative *delta-seconds* is a different case — delta-seconds is
+    defined as a non-negative integer, so ``Retry-After: -5`` is malformed
+    input rather than guidance, and falls back to the schedule.
+
+    The header is remote input. Oversized delta-seconds are capped before the
+    conversion to ``float``; malformed dates degrade to our schedule rather
+    than replacing the expected ``HTTPStatusError`` with a parser exception.
+    """
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    value = raw.strip()
+    if value.isascii() and value.isdecimal():
+        # Compare decimal text before conversion. Besides avoiding float
+        # overflow, this avoids Python's length limit and conversion cost for
+        # an attacker-controlled string containing thousands of digits.
+        value = value.lstrip("0") or "0"
+        ceiling = str(_MAX_RETRY_AFTER_S)
+        if len(value) > len(ceiling) or (
+            len(value) == len(ceiling) and value > ceiling
+        ):
+            return float(_MAX_RETRY_AFTER_S)
+        return float(value)
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:  # pragma: no cover — pre-3.10 returned None, not raise
+        return None
+    if when.tzinfo is None:
+        # An HTTP-date without a zone is still GMT per RFC 9110 (obs-date
+        # forms parse tz-naive); interpreting it as local time would skew
+        # the delay by the host's UTC offset.
+        when = when.replace(tzinfo=timezone.utc)
+    # A date already past means "retry now", not "no guidance".
+    delay = max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+    return min(delay, _MAX_RETRY_AFTER_S)
 
 
 def _backoff_delay(
@@ -285,6 +349,16 @@ class BackendClient:
         instant it recovers. ``max_retries`` attempts fire in total, unless
         the caller overrides the budget via ``attempts``.
 
+        When a retryable *status* response carries a parseable ``Retry-After``
+        header (delta-seconds or HTTP-date), that delay is honoured instead of
+        the computed backoff — the server knows when its rate-limit window
+        closes better than our schedule does — and ``Retry-After: 0`` retries
+        immediately. Server guidance has its own six-hour safety ceiling; it
+        is not shortened by ``retry_backoff_max_s``. When jitter is enabled,
+        only positive jitter is added, so fleet workers spread out after the
+        named instant without retrying early. Honouring the header changes
+        only the delay, never the attempt budget.
+
         ``extra_transient`` widens the transient status set for this call
         only — used by ``complete``/``fail`` to also retry 500 (see the
         ``_TRANSIENT_STATUS_CODES`` comment for the rationale).
@@ -315,13 +389,33 @@ class BackendClient:
                 last_exc = e
                 if attempt == total_attempts - 1:
                     break
-                delay = _backoff_delay(
-                    attempt, self.retry_backoff_s,
-                    self.retry_backoff_max_s, self.retry_jitter,
-                )
+                # A status response can name its own retry instant via
+                # Retry-After; honour it in preference to our schedule. On a
+                # 429 the backend's rate-limit window is authoritative, and
+                # spending the attempt budget on the SDK's own 2s/4s/8s
+                # schedule *inside* that window is how a terminal
+                # complete/fail report gets dropped — the task then sits
+                # in_progress until the sweeper reclaims it. Absent or
+                # unparseable header → the capped-jittered exponential
+                # schedule, exactly as before.
+                retry_after = _retry_after_delay(e.response)
+                if retry_after is None:
+                    delay = _backoff_delay(
+                        attempt, self.retry_backoff_s,
+                        self.retry_backoff_max_s, self.retry_jitter,
+                    )
+                else:
+                    # Never shorten server guidance. Positive-only jitter
+                    # spreads fleet retries after the named instant without
+                    # moving any request back inside the closed window.
+                    delay = retry_after
+                    if self.retry_jitter and delay > 0:
+                        delay *= 1.0 + random.uniform(0.0, _JITTER_SPREAD)
+                        delay = min(delay, _MAX_RETRY_AFTER_S)
                 log.debug(
-                    "transient HTTP %s on %s %s; retrying in %.1fs",
+                    "transient HTTP %s on %s %s; retrying in %.1fs%s",
                     e.response.status_code, method, path, delay,
+                    " (Retry-After)" if retry_after is not None else "",
                 )
                 await asyncio.sleep(delay)
         # last_exc is guaranteed non-None here because __init__ rejects
