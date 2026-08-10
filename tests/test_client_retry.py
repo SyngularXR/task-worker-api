@@ -1995,6 +1995,29 @@ async def test_retry_after_seconds_replaces_backoff(monkeypatch, status):
 
 
 @pytest.mark.asyncio
+async def test_retry_after_jitter_never_retries_early(monkeypatch):
+    """Retry-After jitter is positive-only, so workers spread out without
+    violating the server's minimum delay."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    def upper_jitter(low, high):
+        assert (low, high) == (0.0, 0.25)
+        return high
+
+    monkeypatch.setattr(random, "uniform", upper_jitter)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "8"}, text="slow down")
+
+    client = _client_with_handler(handler, max_retries=2, retry_jitter=True)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [10.0]
+
+
+@pytest.mark.asyncio
 async def test_retry_after_http_date_replaces_backoff(monkeypatch):
     """The HTTP-date form is honoured too, converted to a delay from now."""
     from datetime import datetime, timedelta, timezone
@@ -2023,16 +2046,13 @@ async def test_retry_after_http_date_replaces_backoff(monkeypatch):
 @pytest.mark.parametrize("header", [
     # "-5" is malformed, not guidance: RFC 9110 delta-seconds is a
     # non-negative integer. ("0" *is* guidance — see the test below.)
-    "soon", "", "2.5", "-5", "not-a-date",
-    # Oversized values: Python ints are unbounded, so these parse as ints and
-    # then overflow the conversion to a C double. The parser must absorb that
-    # — an escaping OverflowError would abort the request mid-schedule and
-    # replace the HTTPStatusError the caller is written to expect.
-    pytest.param("1" + "0" * 400, id="oversized-delta-seconds"),
+    "soon", "", "2.5", "+5", "1_000", "-5", "not-a-date",
+    # A malformed HTTP-date must not replace the expected HTTPStatusError with
+    # a parser exception.
     pytest.param("Wed, 21 Oct " + "9" * 40 + " 07:28:00 GMT", id="oversized-year"),
 ])
 async def test_retry_after_invalid_falls_back_to_backoff(monkeypatch, header):
-    """An unparseable or non-positive Retry-After leaves the exponential
+    """An unparseable Retry-After leaves the exponential
     schedule untouched — malformed input must never make retries *faster*."""
     sleeps = _sleep_recorder(monkeypatch)
 
@@ -2089,11 +2109,11 @@ async def test_retry_after_zero_retries_immediately(monkeypatch, header):
 
 @pytest.mark.asyncio
 async def test_retry_after_honoured_in_full_never_shortened(monkeypatch):
-    """A Retry-After under the ceiling is slept in full, not shortened.
+    """A normal Retry-After is slept in full, not shortened.
 
     Retrying before the instant the server named lands inside the window it
     just said was closed, so it burns an attempt that near-certainly fails.
-    Only an over-ceiling window gets clamped (see the test below).
+    Only the dedicated remote-input safety ceiling may shorten the delay.
     """
     sleeps = _sleep_recorder(monkeypatch)
 
@@ -2111,85 +2131,47 @@ async def test_retry_after_honoured_in_full_never_shortened(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retry_after_beyond_ceiling_clamps_but_keeps_retrying(monkeypatch):
-    """A Retry-After longer than retry_backoff_max_s is clamped to the
-    ceiling — it must never cost the call its remaining attempts.
-
-    Regression guard: retry_backoff_max_s caps a single *sleep*, and never
-    bounded how long the backend may take to recover. Treating an over-ceiling
-    window as "give up" turned a multi-attempt complete/fail report into an
-    immediate failure on the default 60s ceiling, stranding tasks in_progress
-    on any consumer that hadn't proactively raised the setting.
-    """
+async def test_retry_after_is_not_shortened_by_backoff_ceiling(monkeypatch):
+    """The backoff cap must not move a retry before the server's deadline."""
     sleeps = _sleep_recorder(monkeypatch)
     calls = {"n": 0}
 
     async def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        return httpx.Response(429, headers={"Retry-After": "3600"}, text="slow down")
-
-    client = _client_with_handler(
-        handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
-    )
-    with pytest.raises(httpx.HTTPStatusError):
-        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
-    await client.close()
-
-    assert sleeps == [30.0, 30.0]  # capped sleep, not an early exit
-    assert calls["n"] == 3         # full attempt budget still spent
-
-
-@pytest.mark.asyncio
-async def test_terminal_report_survives_over_ceiling_retry_after(monkeypatch):
-    """The reviewer's case end-to-end: a throttled complete() whose window is
-    longer than the ceiling still reports once the backend lets it through.
-
-    With the over-ceiling window treated as an abort, this call raised on the
-    first 429 and the finished task stayed in_progress until the sweeper
-    reclaimed it.
-    """
-    sleeps = _sleep_recorder(monkeypatch)
-    calls = {"n": 0}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        if calls["n"] < 3:  # window outlasts one clamped sleep
+        if calls["n"] == 1:
             return httpx.Response(
-                429, headers={"Retry-After": "120"}, text="Too Many Requests",
+                429, headers={"Retry-After": "3600"}, text="slow down",
             )
         return httpx.Response(200)
 
     client = _client_with_handler(
-        handler, max_retries=6, retry_backoff_s=2.0, retry_backoff_max_s=60.0,
+        handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
     )
     await client.complete(7, {"output": "done"})
     await client.close()
 
-    assert calls["n"] == 3
-    assert sleeps == [60.0, 60.0]
+    assert sleeps == [3600.0]
+    assert calls["n"] == 2
 
 
 @pytest.mark.asyncio
-async def test_retry_after_uncapped_client_honours_any_delay(monkeypatch):
-    """retry_backoff_max_s=None (cap disabled) sleeps the full named window —
-    the same opt-in the exponential schedule has."""
+async def test_retry_after_has_distinct_remote_input_cap(monkeypatch):
+    """Absurd server guidance is bounded independently from backoff."""
     sleeps = _sleep_recorder(monkeypatch)
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, headers={"Retry-After": "3600"}, text="slow down")
+        return httpx.Response(
+            429, headers={"Retry-After": "86400"}, text="Too Many Requests",
+        )
 
-    transport = httpx.MockTransport(handler)
-    http = httpx.AsyncClient(base_url="http://fake/api/v1", transport=transport)
-    client = BackendClient(
-        "http://fake/api/v1", "x", client=http,
-        max_retries=2, retry_backoff_s=2.0, retry_backoff_max_s=None,
-        retry_jitter=False,
+    client = _client_with_handler(
+        handler, max_retries=2, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
     )
     with pytest.raises(httpx.HTTPStatusError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
     await client.close()
 
-    assert sleeps == [3600.0]
+    assert sleeps == [6 * 60 * 60]
 
 
 @pytest.mark.asyncio
@@ -2282,8 +2264,11 @@ def test_retry_after_delay_parses_both_rfc_forms():
     # Negative delta-seconds is malformed (RFC 9110: non-negative), not "now".
     assert _retry_after_delay(_resp({"Retry-After": "-30"})) is None
     assert _retry_after_delay(_resp({"Retry-After": "later"})) is None
-    # Oversized numerics overflow float()/the datetime build; both are absorbed.
-    assert _retry_after_delay(_resp({"Retry-After": "1" + "0" * 400})) is None
+    # Oversized delta-seconds are capped before float conversion; malformed
+    # dates are rejected without leaking parser exceptions.
+    assert _retry_after_delay(
+        _resp({"Retry-After": "1" + "0" * 5000}),
+    ) == 6 * 60 * 60
     assert _retry_after_delay(
         _resp({"Retry-After": "Wed, 21 Oct " + "9" * 40 + " 07:28:00 GMT"}),
     ) is None

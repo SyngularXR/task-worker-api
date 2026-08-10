@@ -67,6 +67,12 @@ _TERMINAL_MIN_ATTEMPTS = 6
 # it via ``retry_backoff_max_s`` if they genuinely want longer waits.
 _DEFAULT_BACKOFF_MAX_S = 60.0
 
+# ``Retry-After`` is server guidance, not exponential backoff, so the backoff
+# ceiling must not shorten it. Still bound hostile or broken headers: six hours
+# is long enough for normal maintenance and rate-limit windows without
+# accepting an effectively infinite sleep.
+_MAX_RETRY_AFTER_S = 6 * 60 * 60
+
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
 # band — enough to decorrelate the fleet (Neural-Canvas, Blender-CLI,
@@ -101,9 +107,12 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
     (``Retry-After: 30``) and an HTTP-date (``Retry-After: Wed, 21 Oct 2026
     07:28:00 GMT``, converted to a delay relative to now).
 
-    Returns ``None`` only when the header carries no usable guidance — absent,
-    malformed, or an absurd value we can't represent. The caller then falls
-    back to its own exponential schedule.
+    Returns ``None`` only when the header carries no usable guidance — absent
+    or malformed. The caller then falls back to its own exponential schedule.
+    Valid delays are capped at ``_MAX_RETRY_AFTER_S``. This is deliberately
+    separate from ``retry_backoff_max_s``: a 60-second exponential-backoff cap
+    must not turn ``Retry-After: 3600`` into six requests inside a one-hour
+    rate-limit window.
 
     ``0.0`` is a real answer, not "no guidance": ``Retry-After: 0`` and an
     HTTP-date already in the past both mean *retry immediately* (RFC 9110
@@ -112,28 +121,25 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
     defined as a non-negative integer, so ``Retry-After: -5`` is malformed
     input rather than guidance, and falls back to the schedule.
 
-    The header is remote input, so the numeric path absorbs ``OverflowError``:
-    Python ints are unbounded, so an oversized value (``Retry-After:
-    1000...0``, or an HTTP-date with a 40-digit year) parses as an int and then
-    blows up on the conversion to a C double. Letting that escape would abort
-    the request outright and replace the ``HTTPStatusError`` the caller
-    expects — an unparseable delay must degrade to our own schedule, never to
-    a crash.
+    The header is remote input. Oversized delta-seconds are capped before the
+    conversion to ``float``; malformed dates degrade to our schedule rather
+    than replacing the expected ``HTTPStatusError`` with a parser exception.
     """
     raw = response.headers.get("retry-after")
     if raw is None:
         return None
-    try:
-        seconds = int(raw.strip())
-    except ValueError:
-        pass  # not delta-seconds — fall through to the HTTP-date form
-    else:
-        if seconds < 0:
-            return None  # malformed: delta-seconds is non-negative
-        try:
-            return float(seconds)
-        except OverflowError:
-            return None  # too large to represent → no usable guidance
+    value = raw.strip()
+    if value.isascii() and value.isdecimal():
+        # Compare decimal text before conversion. Besides avoiding float
+        # overflow, this avoids Python's length limit and conversion cost for
+        # an attacker-controlled string containing thousands of digits.
+        value = value.lstrip("0") or "0"
+        ceiling = str(_MAX_RETRY_AFTER_S)
+        if len(value) > len(ceiling) or (
+            len(value) == len(ceiling) and value > ceiling
+        ):
+            return float(_MAX_RETRY_AFTER_S)
+        return float(value)
     try:
         when = parsedate_to_datetime(raw)
     except (TypeError, ValueError, OverflowError):
@@ -146,7 +152,8 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
         # the delay by the host's UTC offset.
         when = when.replace(tzinfo=timezone.utc)
     # A date already past means "retry now", not "no guidance".
-    return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+    delay = max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+    return min(delay, _MAX_RETRY_AFTER_S)
 
 
 def _backoff_delay(
@@ -343,13 +350,14 @@ class BackendClient:
         the caller overrides the budget via ``attempts``.
 
         When a retryable *status* response carries a parseable ``Retry-After``
-        header (delta-seconds or HTTP-date), that delay is honoured verbatim
-        instead of the computed backoff — the server knows when its rate-limit
-        window closes better than our schedule does — and ``Retry-After: 0``
-        retries immediately. The header is capped by ``retry_backoff_max_s``
-        like any other delay, and never costs the call an attempt: a window
-        longer than the ceiling is retried at the ceiling, not abandoned.
-        Honouring the header never buys extra attempts either.
+        header (delta-seconds or HTTP-date), that delay is honoured instead of
+        the computed backoff — the server knows when its rate-limit window
+        closes better than our schedule does — and ``Retry-After: 0`` retries
+        immediately. Server guidance has its own six-hour safety ceiling; it
+        is not shortened by ``retry_backoff_max_s``. When jitter is enabled,
+        only positive jitter is added, so fleet workers spread out after the
+        named instant without retrying early. Honouring the header changes
+        only the delay, never the attempt budget.
 
         ``extra_transient`` widens the transient status set for this call
         only — used by ``complete``/``fail`` to also retry 500 (see the
@@ -397,32 +405,13 @@ class BackendClient:
                         self.retry_backoff_max_s, self.retry_jitter,
                     )
                 else:
-                    # Honour the server's instant exactly — never early, and
-                    # not jittered: jitter is there to decorrelate the fleet's
-                    # *self-scheduled* retries, and a negative jitter here
-                    # would pull the retry back inside the window the server
-                    # asked us to wait out. Waiting longer than our own
-                    # schedule is the point; the sleep is async, so it stalls
-                    # only this call (and, since the polling loop is
-                    # sequential, this worker's next claim).
+                    # Never shorten server guidance. Positive-only jitter
+                    # spreads fleet retries after the named instant without
+                    # moving any request back inside the closed window.
                     delay = retry_after
-                    if (
-                        self.retry_backoff_max_s is not None
-                        and delay > self.retry_backoff_max_s
-                    ):
-                        # A window longer than we'll sleep in one go is still
-                        # capped at the ceiling — never turned into an early
-                        # exit. retry_backoff_max_s bounds a single sleep; it
-                        # has never bounded how long the backend may take to
-                        # recover, and spending it as an attempt budget would
-                        # make a throttled terminal report fail outright where
-                        # it previously kept trying (default ceiling 60s, so
-                        # any Retry-After above a minute would strand the
-                        # task). Clamped, the retries land at the ceiling
-                        # until the window closes: the same cadence as before
-                        # Retry-After was honoured at all, and the one that
-                        # still recovers.
-                        delay = self.retry_backoff_max_s
+                    if self.retry_jitter and delay > 0:
+                        delay *= 1.0 + random.uniform(0.0, _JITTER_SPREAD)
+                        delay = min(delay, _MAX_RETRY_AFTER_S)
                 log.debug(
                     "transient HTTP %s on %s %s; retrying in %.1fs%s",
                     e.response.status_code, method, path, delay,

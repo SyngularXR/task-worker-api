@@ -6,35 +6,17 @@
 - `BackendClient._retry` now honours the HTTP `Retry-After` header on a
   retryable status response (429/502/503/504, plus 500 on terminal
   reports). Both RFC 9110 forms are accepted — delta-seconds and
-  HTTP-date — and the parsed value replaces the computed backoff for
-  that inter-attempt sleep. Previously every transient status was
-  retried on the SDK's own 2s/4s/8s schedule regardless of what the
-  server asked for: when the shared backend rate-limits lifecycle calls
-  under fleet burst load and answers 429 with `Retry-After: N`, the
-  schedule burned the whole attempt budget *inside* the rate-limit
-  window, so a terminal `complete`/`fail` report could exhaust all 6
-  attempts while still throttled and leave the task stranded
-  `in_progress` until the sweeper reclaimed it. The delay is never
-  shortened towards the exponential schedule — retrying before the
-  instant the server named lands inside the window it just said was
-  closed, which burns an attempt for nothing and reproduces that same
-  exhaustion. `Retry-After: 0` (and an HTTP-date already past) therefore
-  means retry immediately, as RFC 9110 defines it. A window longer than
-  `retry_backoff_max_s` is clamped to that ceiling, exactly like any
-  other delay, and still consumes only the sleep — never an attempt: the
-  setting caps a single sleep and has never bounded how long the backend
-  may take to recover, so retries continue at the ceiling until the
-  window closes. Honouring the header buys no extra attempts either. An
-  absent or malformed header (including
-  a negative delta-seconds, which RFC 9110 does not permit) falls back to
-  the existing capped-jittered exponential schedule, so behaviour without
-  the header is identical to before. Oversized numerics fall back
-  the same way: Python ints are unbounded, so `Retry-After: 1000…0` (or an
-  HTTP-date with a 40-digit year) parses as an int and overflows only on
-  the conversion to a C double — the parser absorbs that `OverflowError`
-  rather than letting it escape `_retry`, abort the request mid-schedule,
-  and replace the `HTTPStatusError` callers are written to expect.
-  Additive and backward-compatible: no API, env-var, or wire-format change.
+  HTTP-date — and the parsed value replaces the computed backoff. The
+  server delay is independent of `retry_backoff_max_s`: shortening
+  `Retry-After: 3600` to the default 60-second backoff cap would spend every
+  attempt inside the closed window and strand a completed task
+  `in_progress`. Remote input is instead capped by a dedicated six-hour
+  project safety ceiling. `Retry-After: 0` and past
+  HTTP-dates retry immediately; absent, malformed, and negative
+  values fall back to the existing capped-jittered exponential schedule.
+  With jitter enabled, server-directed retries receive positive-only jitter
+  so fleet workers spread out without retrying before the named instant. The
+  attempt budget is unchanged. No API, env-var, or wire-format changes.
 - `BackendClient` now exposes a `poll_cancel_status` method: a one-shot
   GET `/tasks/{id}/cancel-status` with no retries and the dedicated
   `cancel_timeout_s` deadline. The `CancelGuard` (which polls this
