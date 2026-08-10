@@ -41,6 +41,17 @@ log = logging.getLogger(__name__)
 
 HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
 
+# Default ceiling for the escalated idle wait between poll cycles after
+# consecutive claim failures. ``BackendClient._retry`` already backs off
+# *within* one claim call, but that schedule resets every cycle: during a
+# backend outage every fleet worker re-hammered the struggling backend with a
+# fresh retry burst every ``poll_interval_s``, so aggregate load never decayed
+# and a restarting backend got no room to recover. 60s matches the client's
+# ``_DEFAULT_BACKOFF_MAX_S`` — long enough to thin the fleet's request rate by
+# ~an order of magnitude, short enough that a recovered backend is picked up
+# within a minute.
+_DEFAULT_CLAIM_BACKOFF_MAX_S = 60.0
+
 
 def _make_sync_fail(
     base_url: str, api_key: str, task_id: int, *, timeout_s: float = 3.0,
@@ -110,6 +121,7 @@ class Worker:
         work_dir: Optional[str] = None,
         shared_volume_path: Optional[str] = None,
         poll_interval_s: float = 5.0,
+        claim_backoff_max_s: float = _DEFAULT_CLAIM_BACKOFF_MAX_S,
         heartbeat_interval_s: float = 10.0,
         heartbeat_warn_threshold: int = 3,
         cancel_poll_interval_s: float = 2.0,
@@ -137,6 +149,7 @@ class Worker:
         )
         self.shared_volume_path = shared_volume_path
         self.poll_interval_s = poll_interval_s
+        self.claim_backoff_max_s = claim_backoff_max_s
         self.heartbeat_interval_s = heartbeat_interval_s
         self.heartbeat_warn_threshold = heartbeat_warn_threshold
         self.cancel_poll_interval_s = cancel_poll_interval_s
@@ -166,6 +179,9 @@ class Worker:
             # used as-is; we don't reach in and rewrite its state.
             self._client = client
         self._stop = asyncio.Event()
+        # Consecutive failed claim round-trips; drives the escalating idle
+        # wait in run_forever. Reset by any claim that reaches the backend.
+        self._claim_failures = 0
 
         # Fail fast on misconfiguration: an empty handlers dict makes
         # task_types=[] in run_forever's poll loop, so the worker silently
@@ -304,10 +320,20 @@ class Worker:
             while not self._stop.is_set():
                 claimed = await self._claim()
                 if claimed is None:
+                    wait_s = self._claim_wait_s()
+                    if self._claim_failures:
+                        log.info(
+                            "claim has failed %d consecutive times; "
+                            "backing off %.1fs before the next poll",
+                            self._claim_failures, wait_s,
+                        )
                     try:
+                        # Waiting on _stop (rather than sleeping) is what keeps
+                        # shutdown responsive: an escalated 60s wait would
+                        # otherwise delay process exit by up to a minute.
                         await asyncio.wait_for(
                             self._stop.wait(),
-                            timeout=self.poll_interval_s,
+                            timeout=wait_s,
                         )
                     except asyncio.TimeoutError:
                         pass
@@ -353,14 +379,52 @@ class Worker:
 
     # ----- internals ----------------------------------------------
 
+    def _claim_wait_s(self) -> float:
+        """Idle wait before the next poll, escalated by claim failures.
+
+        ``poll_interval_s`` while claims are landing, then doubling per
+        consecutive failure up to ``claim_backoff_max_s`` — so a fleet's
+        request rate against a down backend decays exponentially instead of
+        holding steady at one burst per worker per poll interval.
+
+        Doubling iteratively (rather than ``poll_interval_s * 2 ** failures``)
+        keeps a pathological failure count — a worker left running for days
+        against a dead backend — from overflowing the float and yielding
+        ``inf``: the loop returns the cap as soon as it's reached. The cap is
+        floored at ``poll_interval_s`` so a consumer that configures a
+        ``claim_backoff_max_s`` below their poll interval never polls *faster*
+        while failing than while healthy.
+        """
+        if self._claim_failures <= 0:
+            return self.poll_interval_s
+        cap = max(self.claim_backoff_max_s, self.poll_interval_s)
+        delay = self.poll_interval_s
+        for _ in range(self._claim_failures):
+            delay *= 2
+            if delay >= cap:
+                return cap
+        return delay
+
     async def _claim(self) -> Optional[ClaimedTask]:
         try:
-            return await self._client.claim_next(
+            claimed = await self._client.claim_next(
                 self.task_types, worker_id=self.worker_id,
             )
         except Exception as e:  # noqa: BLE001
-            log.warning("claim failed against %s: %s", self.backend_url, e)
+            # BackendClient._retry already exhausted its per-call attempts, so
+            # this is a backend that stayed unreachable across the whole retry
+            # window. Count it so the poll loop widens its idle wait.
+            self._claim_failures += 1
+            log.warning(
+                "claim failed against %s (%d consecutive): %s",
+                self.backend_url, self._claim_failures, e,
+            )
             return None
+        # A completed round-trip — including an empty queue (None) — means the
+        # backend is answering, so the escalated wait collapses back to
+        # poll_interval_s immediately.
+        self._claim_failures = 0
+        return claimed
 
     async def _run_one(self, task: ClaimedTask) -> None:
         """Heartbeat → stage inputs → run handler → publish.

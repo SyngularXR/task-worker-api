@@ -3,6 +3,30 @@
 ## Unreleased
 
 **Fixes:**
+- `Worker`'s poll loop now backs off *between* claim cycles, not just
+  within a single claim call. `BackendClient._retry` already retried a
+  failing `claim_next` with capped exponential backoff, but that schedule
+  reset on every cycle: during a backend outage or deploy, every fleet
+  worker re-hammered the struggling backend with a fresh 4-attempt retry
+  burst every `poll_interval_s` (~19s of requests, then sleep, then
+  repeat) forever. Aggregate load never decayed, and a backend trying to
+  restart got no recovery room. The idle wait between poll cycles now
+  doubles per consecutive claim failure (`poll_interval_s` → 2× → 4× → …),
+  capped by the new `claim_backoff_max_s` Worker kwarg (default 60s, the
+  same ceiling as the client's `retry_backoff_max_s`), and resets to
+  `poll_interval_s` on any claim that reaches the backend — including one
+  that returns an empty queue, which is a successful round-trip. Healthy
+  polling is unchanged (exactly `poll_interval_s`, no escalation, no extra
+  log), while a fleet facing a down backend decays its request rate
+  exponentially instead of holding it flat. Shutdown stays responsive: the
+  escalated wait observes the `_stop` event rather than sleeping, so a
+  worker asked to exit mid-backoff exits immediately instead of up to
+  `claim_backoff_max_s` later. Doubling is computed iteratively and
+  short-circuits at the cap, so a worker left running for days against a
+  dead backend can't overflow the delay to `inf` and stop polling
+  altogether. The change is additive and backward-compatible:
+  `claim_backoff_max_s` is a new keyword-only argument with a default, and
+  there are no API, env-var, or wire-format changes.
 - `BackendClient._retry` now honours the HTTP `Retry-After` header on a
   retryable status response (429/502/503/504, plus 500 on terminal
   reports). Both RFC 9110 forms are accepted — delta-seconds and
