@@ -136,8 +136,13 @@ async def prepare_inputs(
     started before this call), remote-mode batch downloads abort as soon as
     the event is set: a multi-file input set for a GB-scale task can spend
     minutes streaming, and a user cancel during that window should not wait
-    for every remaining file to finish downloading. Local mode
-    (``input_path``) honours it too: the copy runs through
+    for every remaining file to finish downloading. The event is checked
+    between files *and* handed to ``download_file``, which checks it between
+    chunk writes — so a cancel aborts mid-file too. That matters most for a
+    single-file input set (a lone colmap-splat PLY, a Neural-Canvas splat),
+    where the between-files check never fires and the whole multi-GB stream
+    would otherwise run to completion after the cancel. Local mode
+    (``input_path``) honours it the same way: the copy runs through
     :func:`_copyfile_async`, which checks the event between chunks, so a
     cancel aborts mid-file rather than after a multi-GB copy completes.
     """
@@ -176,7 +181,9 @@ async def prepare_inputs(
                     f"task {task.id} cancelled by user during input download"
                 )
             dest = in_dir / filename
-            await client.download_file(task.id, filename, dest)
+            await client.download_file(
+                task.id, filename, dest, cancelled=cancelled,
+            )
             paths[key] = dest
         primary_key = "mesh" if "mesh" in paths else next(iter(paths))
         return FileContext(

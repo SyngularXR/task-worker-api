@@ -479,7 +479,7 @@ class _HeartbeatObservingClient(FakeBackendClient):
         super().__init__()
         self.progress_count_at_download: int | None = None
 
-    async def download_file(self, task_id, filename, dest):
+    async def download_file(self, task_id, filename, dest, *, cancelled=None):
         # A real BackendClient.download_file suspends on network I/O while
         # streaming bytes — that suspension is what lets the heartbeat task
         # (created just before prepare_inputs) get dispatched by the event
@@ -489,7 +489,7 @@ class _HeartbeatObservingClient(FakeBackendClient):
         # model the I/O wait, then snapshot heartbeat activity.
         await asyncio.sleep(0.05)
         self.progress_count_at_download = len(self.progress_events)
-        await super().download_file(task_id, filename, dest)
+        await super().download_file(task_id, filename, dest, cancelled=cancelled)
 
 
 @pytest.mark.asyncio
@@ -597,11 +597,11 @@ class _CancelDuringDownloadClient(FakeBackendClient):
         super().__init__()
         self._download_count = 0
 
-    async def download_file(self, task_id, filename, dest):
+    async def download_file(self, task_id, filename, dest, *, cancelled=None):
         # Yield to the event loop so the CancelGuard's poll task can run
         # and observe the cancelled state we set below.
         await asyncio.sleep(0.02)
-        await super().download_file(task_id, filename, dest)
+        await super().download_file(task_id, filename, dest, cancelled=cancelled)
         self._download_count += 1
         if self._download_count == 1:
             # Simulate a user cancel arriving after the first file lands.

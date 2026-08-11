@@ -3,6 +3,25 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient.download_file` now accepts an optional keyword-only
+  `cancelled` event and checks it before issuing the request and before
+  writing each chunk, raising `TaskCancelled` at the next chunk boundary.
+  `prepare_inputs` passes the `CancelGuard`'s event through, so a cancel is
+  now visible *during* a remote input download instead of only between batch
+  files. Previously the between-files check was the only cancel point in the
+  remote path: a single-file input set — a lone colmap-splat PLY, a
+  Neural-Canvas splat — has no such boundary, so a user cancel that arrived
+  mid-download streamed the whole multi-GB file to completion before the
+  worker noticed, burning minutes of bandwidth on a task nobody wanted.
+  `TaskCancelled` is not a transient error, so it leaves the retry loop
+  immediately without consuming retry budget (a retried cancel would
+  re-stream the same file), and the partial file at `dest` is removed by the
+  existing cleanup path. The change is additive and backward-compatible:
+  `cancelled` defaults to `None`, which reproduces the old behaviour exactly,
+  and the positional signature is unchanged, so external callers and
+  subclasses are unaffected. `FakeBackendClient.download_file` mirrors the
+  new keyword and raises `TaskCancelled` on a set event so the test double
+  stays a faithful drop-in.
 - `Worker`'s poll loop now doubles the idle wait after consecutive failed
   claim cycles, capped by the new `claim_backoff_max_s` keyword argument
   (default 60s). Any successful round-trip, including an empty queue, resets

@@ -7,10 +7,14 @@ failure payloads, and fakes the cancel-status poll.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .context import ClaimedTask
 from .enums import TaskStatus, TaskType
+from .errors import TaskCancelled
+
+if TYPE_CHECKING:  # pragma: no cover
+    import asyncio
 
 
 class FakeBackendClient:
@@ -118,13 +122,28 @@ class FakeBackendClient:
     async def fail(self, task_id: int, error: str) -> None:
         self.failed_tasks.append({"task_id": task_id, "error": error})
 
-    async def download_file(self, task_id: int, filename: str, dest: Path) -> None:
+    async def download_file(
+        self, task_id: int, filename: str, dest: Path,
+        *,
+        cancelled: "Optional[asyncio.Event]" = None,
+    ) -> None:
         """Serve a file previously staged via :meth:`queue_file`.
 
         Writes the staged bytes to ``dest`` (matching the real backend's
         stream-to-disk contract). Raises ``FileNotFoundError`` for an
         unstaged (task_id, filename) — the in-memory analogue of a 404.
+
+        A set ``cancelled`` event raises ``TaskCancelled`` and writes
+        nothing, mirroring ``BackendClient.download_file``, which checks the
+        event before the request and before each chunk write. The fake has no
+        chunks to interleave, so the pre-request check is the whole contract
+        here — enough for worker-level tests to see a mid-staging cancel
+        abort the download rather than land a file on disk.
         """
+        if cancelled is not None and cancelled.is_set():
+            raise TaskCancelled(
+                f"task {task_id} cancelled by user while downloading {filename}"
+            )
         key = (task_id, filename)
         if key not in self._files:
             raise FileNotFoundError(

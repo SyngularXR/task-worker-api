@@ -17,9 +17,11 @@ from typing import Any, Optional, TYPE_CHECKING
 import httpx
 
 from .context import ClaimedTask
-from .errors import ProtocolError
+from .errors import ProtocolError, TaskCancelled
 
 if TYPE_CHECKING:
+    import asyncio
+
     from .payload_log import PayloadLogger
 
 log = logging.getLogger(__name__)
@@ -661,6 +663,8 @@ class BackendClient:
 
     async def download_file(
         self, task_id: int, filename: str, dest: Path,
+        *,
+        cancelled: Optional["asyncio.Event"] = None,
     ) -> None:
         """GET /tasks/{id}/files/{filename} — streams to disk in 1 MB chunks.
 
@@ -680,16 +684,38 @@ class BackendClient:
         If every attempt fails (retries exhausted or a non-retryable error),
         any partial file left at ``dest`` is removed so callers never see a
         truncated/stale artifact from a failed download.
+
+        When ``cancelled`` is supplied (an ``asyncio.Event`` from a
+        ``CancelGuard`` active during input staging), the event is checked
+        before the request goes out and again before each chunk is written,
+        raising :class:`TaskCancelled` at the next chunk boundary. Without
+        the in-stream check, a cancel arriving mid-download was invisible
+        until the whole file finished: ``prepare_inputs`` only looked between
+        batch files, so a single-file input set (a lone colmap-splat PLY, a
+        Neural-Canvas splat) streamed multi-GB to completion after the user
+        had already cancelled. ``TaskCancelled`` is not a transient error, so
+        it propagates out of the retry loop immediately without consuming
+        retry budget, and the partial file at ``dest`` is cleaned up by the
+        same path as any other failure.
         """
         path = f"/tasks/{task_id}/files/{filename}"
 
+        def _raise_if_cancelled() -> None:
+            if cancelled is not None and cancelled.is_set():
+                raise TaskCancelled(
+                    f"task {task_id} cancelled by user while downloading "
+                    f"{filename}"
+                )
+
         async def _stream_once() -> None:
+            _raise_if_cancelled()
             async with self._client.stream(
                 "GET", path, timeout=self._file_timeout,
             ) as resp:
                 resp.raise_for_status()
                 with open(dest, "wb") as f:
                     async for chunk in resp.aiter_bytes():
+                        _raise_if_cancelled()
                         f.write(chunk)
 
         try:

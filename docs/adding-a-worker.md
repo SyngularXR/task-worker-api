@@ -494,6 +494,13 @@ async def test_remote_mode_happy_path(tmp_path):
 `FileNotFoundError` (the in-memory analogue of a backend 404), so
 missing-input bugs surface the same way they would in production.
 
+`download_file` also takes an optional keyword-only `cancelled` event
+(the SDK passes the `CancelGuard`'s event through `prepare_inputs`) and
+raises `TaskCancelled` when it is set, mirroring the real client's
+abort-at-the-next-chunk behaviour. If your test suite subclasses
+`FakeBackendClient` to override `download_file`, accept and forward
+`cancelled=` so cancel-during-download still works in your tests.
+
 For integration testing against a real backend, `task-worker-api`'s
 own repo has a docker-compose fixture at `tests/integration/` you
 can adapt.
