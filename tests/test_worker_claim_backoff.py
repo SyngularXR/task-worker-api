@@ -65,22 +65,17 @@ class _RecoveringClient(_AlwaysFailingClient):
         return None
 
 
-def _spy_waits(worker, *, scale: float = 0.0) -> list[float]:
-    """Record every computed idle wait, and shrink the actual sleep.
-
-    Returns the list the waits land in. ``scale`` multiplies what the loop
-    actually waits on so tests exercise many cycles instantly while still
-    asserting on the real (unscaled) schedule.
-    """
+def _capture_wait_timeouts(monkeypatch) -> list[float]:
+    """Capture the timeout that the poll loop actually passes to wait_for."""
     waits: list[float] = []
-    real = worker._claim_wait_s
 
-    def _spy() -> float:
-        value = real()
-        waits.append(value)
-        return value * scale
+    async def _wait_for(awaitable, timeout):
+        waits.append(timeout)
+        awaitable.close()
+        await asyncio.sleep(0)
+        raise asyncio.TimeoutError
 
-    worker._claim_wait_s = _spy
+    monkeypatch.setattr("task_worker_api.worker.asyncio.wait_for", _wait_for)
     return waits
 
 
@@ -209,6 +204,27 @@ def test_jittered_wait_never_escapes_the_cap_or_the_poll_interval(
     assert len(set(samples)) > 1  # still decorrelated
 
 
+def test_jitter_at_cap_samples_the_bounded_band_without_clipping(
+    make_worker, fake_client, monkeypatch,
+):
+    """Sampling the legal band directly avoids piling half the fleet onto
+    the exact cap when a symmetric sample would have exceeded it."""
+    bounds = []
+
+    def midpoint(low, high):
+        bounds.append((low, high))
+        return (low + high) / 2
+
+    monkeypatch.setattr("task_worker_api.worker.random.uniform", midpoint)
+    worker = make_worker(
+        client=fake_client, poll_interval_s=5.0, claim_backoff_max_s=30.0,
+    )
+    worker._claim_failures = 20
+
+    assert worker._claim_wait_s() == 26.25
+    assert bounds == [(22.5, 30.0)]
+
+
 def test_failing_worker_never_polls_faster_than_a_healthy_one_with_jitter(
     make_worker, fake_client,
 ):
@@ -260,6 +276,8 @@ def test_valid_pacing_knobs_are_coerced_to_float(make_worker, fake_client):
     )
     assert worker.poll_interval_s == 5.0
     assert worker.claim_backoff_max_s == 60.0
+    assert type(worker.poll_interval_s) is float
+    assert type(worker.claim_backoff_max_s) is float
 
 
 # ----- _claim failure bookkeeping --------------------------------------------
@@ -299,11 +317,13 @@ async def test_successful_claim_resets_counter(
 
 
 @pytest.mark.asyncio
-async def test_healthy_poll_loop_waits_exactly_poll_interval(make_worker, fake_client):
+async def test_healthy_poll_loop_waits_exactly_poll_interval(
+    make_worker, fake_client, monkeypatch,
+):
     """No failures → no escalation. The idle wait stays exactly
     ``poll_interval_s`` so healthy polling behaviour is unchanged."""
     worker = make_worker(client=fake_client, poll_interval_s=7.0)
-    waits = _spy_waits(worker)
+    waits = _capture_wait_timeouts(monkeypatch)
 
     async def stop_after_cycles():
         while len(waits) < 4:
@@ -316,14 +336,16 @@ async def test_healthy_poll_loop_waits_exactly_poll_interval(make_worker, fake_c
 
 
 @pytest.mark.asyncio
-async def test_poll_loop_backs_off_exponentially_during_outage(make_worker):
+async def test_poll_loop_backs_off_exponentially_during_outage(
+    make_worker, monkeypatch,
+):
     client = _AlwaysFailingClient(stop_after=5)
     worker = make_worker(
         client=client, poll_interval_s=5.0, claim_backoff_max_s=1000.0,
         retry_jitter=False,
     )
     client.bind(worker)
-    waits = _spy_waits(worker)
+    waits = _capture_wait_timeouts(monkeypatch)
 
     await worker.run_forever()
 
@@ -332,14 +354,14 @@ async def test_poll_loop_backs_off_exponentially_during_outage(make_worker):
 
 
 @pytest.mark.asyncio
-async def test_poll_loop_backoff_saturates_at_cap(make_worker):
+async def test_poll_loop_backoff_saturates_at_cap(make_worker, monkeypatch):
     client = _AlwaysFailingClient(stop_after=6)
     worker = make_worker(
         client=client, poll_interval_s=5.0, claim_backoff_max_s=30.0,
         retry_jitter=False,
     )
     client.bind(worker)
-    waits = _spy_waits(worker)
+    waits = _capture_wait_timeouts(monkeypatch)
 
     await worker.run_forever()
 
@@ -347,7 +369,7 @@ async def test_poll_loop_backoff_saturates_at_cap(make_worker):
 
 
 @pytest.mark.asyncio
-async def test_poll_loop_backoff_collapses_after_recovery(make_worker):
+async def test_poll_loop_backoff_collapses_after_recovery(make_worker, monkeypatch):
     """The whole point of resetting on a successful round-trip: a backend that
     comes back must be polled at the normal interval again immediately, not
     stay starved for a minute."""
@@ -357,7 +379,7 @@ async def test_poll_loop_backoff_collapses_after_recovery(make_worker):
         retry_jitter=False,
     )
     client.bind(worker)
-    waits = _spy_waits(worker)
+    waits = _capture_wait_timeouts(monkeypatch)
 
     await worker.run_forever()
 
@@ -416,9 +438,11 @@ async def test_backoff_is_logged_once_per_escalated_cycle(make_worker, caplog):
 
 
 @pytest.mark.asyncio
-async def test_no_backoff_log_while_healthy(make_worker, fake_client, caplog):
+async def test_no_backoff_log_while_healthy(
+    make_worker, fake_client, caplog, monkeypatch,
+):
     worker = make_worker(client=fake_client, poll_interval_s=5.0)
-    waits = _spy_waits(worker)
+    waits = _capture_wait_timeouts(monkeypatch)
 
     async def stop_after_cycles():
         while len(waits) < 3:
@@ -433,7 +457,7 @@ async def test_no_backoff_log_while_healthy(make_worker, fake_client, caplog):
 
 @pytest.mark.asyncio
 async def test_processed_task_between_failures_resets_the_escalation(
-    make_worker, tmp_path,
+    make_worker, tmp_path, monkeypatch,
 ):
     """A worker that fails a few claims, then successfully claims and *runs* a
     task, is talking to a healthy backend — the next idle wait is the plain
@@ -468,7 +492,7 @@ async def test_processed_task_between_failures_resets_the_escalation(
         retry_jitter=False,
     )
     client.bind(worker)
-    waits = _spy_waits(worker)
+    waits = _capture_wait_timeouts(monkeypatch)
 
     await worker.run_forever()
 

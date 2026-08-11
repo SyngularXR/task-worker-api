@@ -3,48 +3,18 @@
 ## Unreleased
 
 **Fixes:**
-- `Worker`'s poll loop now backs off *between* claim cycles, not just
-  within a single claim call. `BackendClient._retry` already retried a
-  failing `claim_next` with capped exponential backoff, but that schedule
-  reset on every cycle: during a backend outage or deploy, every fleet
-  worker re-hammered the struggling backend with a fresh 4-attempt retry
-  burst every `poll_interval_s` (~19s of requests, then sleep, then
-  repeat) forever. Aggregate load never decayed, and a backend trying to
-  restart got no recovery room. The idle wait between poll cycles now
-  doubles per consecutive claim failure (`poll_interval_s` → 2× → 4× → …),
-  capped by the new `claim_backoff_max_s` Worker kwarg (default 60s, the
-  same ceiling as the client's `retry_backoff_max_s`), and resets to
-  `poll_interval_s` on any claim that reaches the backend — including one
-  that returns an empty queue, which is a successful round-trip. Healthy
-  polling is unchanged (exactly `poll_interval_s`, no escalation, no extra
-  log), while a fleet facing a down backend decays its request rate
-  exponentially instead of holding it flat. Escalated waits (only those —
-  never the healthy interval) are jittered ±25% under the existing
-  `retry_jitter` flag, reusing the client's `_backoff_delay`: the fleet
-  deploys and restarts as a unit, so its workers enter an outage in
-  lockstep, and decay alone would leave them there — every worker's *n*th
-  backoff would expire on the same instant and hit a recovering backend
-  with the whole fleet's burst at once. Jitter is applied *inside* the
-  bounds rather than around them: the returned wait is clamped to
-  `[poll_interval_s, max(claim_backoff_max_s, poll_interval_s)]` after
-  jittering, so an escalated wait can neither overshoot the configured
-  ceiling nor — where the cap collapses onto the poll interval — let a
-  failing worker poll faster than a healthy one. Shutdown stays responsive:
-  the
-  escalated wait observes the `_stop` event rather than sleeping, so a
-  worker asked to exit mid-backoff exits immediately instead of up to
-  `claim_backoff_max_s` later. Doubling is computed iteratively and
-  short-circuits at the cap, so a worker left running for days against a
-  dead backend can't overflow the delay to `inf` and stop polling
-  altogether. `poll_interval_s` and `claim_backoff_max_s` are now validated
-  as finite and positive at construction, since every degenerate value
-  defeats those guarantees silently: `0`/negative spins the claim loop at
-  full speed against the backend, `inf` makes the first idle wait never
-  end, and `NaN` fails every comparison in the escalation (so the cap never
-  matches and `asyncio.wait_for` waits forever). The change is additive and
-  backward-compatible: `claim_backoff_max_s` is a new keyword-only argument
-  with a default, the validation only rejects values that were already
-  broken at runtime, and there are no API, env-var, or wire-format changes.
+- `Worker`'s poll loop now doubles the idle wait after consecutive failed
+  claim cycles, capped by the new `claim_backoff_max_s` keyword argument
+  (default 60s). Any successful round-trip, including an empty queue, resets
+  the wait to `poll_interval_s`; healthy polling is unchanged. When
+  `retry_jitter` is enabled, escalated waits are sampled directly from the
+  legal ±25% band so workers do not synchronize at the cap. Shutdown still
+  interrupts the wait immediately. `poll_interval_s` and
+  `claim_backoff_max_s` must now be finite positive values and invalid values
+  fail at construction. The new argument is optional, but the validation
+  tightens the existing constructor contract. Env-var and wire formats are
+  unchanged. Before upgrading, verify any configured poll interval is finite
+  and greater than zero.
 - `BackendClient._retry` now honours the HTTP `Retry-After` header on a
   retryable status response (429/502/503/504, plus 500 on terminal
   reports). Both RFC 9110 forms are accepted — delta-seconds and

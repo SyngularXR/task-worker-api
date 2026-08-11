@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import random
 import shutil
 import tempfile
 import time
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from .cancel import CancelGuard
-from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _backoff_delay
+from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -51,7 +52,7 @@ HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
 # ``_DEFAULT_BACKOFF_MAX_S`` — long enough to thin the fleet's request rate by
 # ~an order of magnitude, short enough that a recovered backend is picked up
 # within a minute.
-_DEFAULT_CLAIM_BACKOFF_MAX_S = 60.0
+_DEFAULT_CLAIM_BACKOFF_MAX_S = _DEFAULT_BACKOFF_MAX_S
 
 
 def _positive_finite_s(name: str, value: float) -> float:
@@ -445,16 +446,13 @@ class Worker:
             if delay >= cap:
                 delay = cap
                 break
-        # attempt=0 → no further doubling; this call only applies the shared
-        # ±25% jitter band. Clamping *after* jitter is what keeps both bounds
-        # real: a negative sample must never drop an escalated wait below
-        # poll_interval_s (at ``claim_backoff_max_s <= poll_interval_s`` the
-        # cap *is* poll_interval_s, so unclamped jitter makes a failing worker
-        # poll up to 25% faster than a healthy one — the exact opposite of a
-        # backoff), and a positive one must not overshoot the ceiling the
-        # consumer configured.
-        jittered = _backoff_delay(0, delay, None, self.retry_jitter)
-        return min(max(jittered, self.poll_interval_s), cap)
+        if not self.retry_jitter:
+            return delay
+        spread = delay * _JITTER_SPREAD
+        return random.uniform(
+            max(delay - spread, self.poll_interval_s),
+            min(delay + spread, cap),
+        )
 
     async def _claim(self) -> Optional[ClaimedTask]:
         try:
