@@ -3,6 +3,18 @@
 ## Unreleased
 
 **Fixes:**
+- `Worker`'s poll loop now doubles the idle wait after consecutive failed
+  claim cycles, capped by the new `claim_backoff_max_s` keyword argument
+  (default 60s). Any successful round-trip, including an empty queue, resets
+  the wait to `poll_interval_s`; healthy polling is unchanged. When
+  `retry_jitter` is enabled, escalated waits are sampled directly from the
+  legal ±25% band so workers do not synchronize at the cap. Shutdown still
+  interrupts the wait immediately. `poll_interval_s` and
+  `claim_backoff_max_s` must now be finite positive values and invalid values
+  fail at construction. The new argument is optional, but the validation
+  tightens the existing constructor contract. Env-var and wire formats are
+  unchanged. Before upgrading, verify any configured poll interval is finite
+  and greater than zero.
 - `BackendClient._retry` now honours the HTTP `Retry-After` header on a
   retryable status response (429/502/503/504, plus 500 on terminal
   reports). Both RFC 9110 forms are accepted — delta-seconds and
