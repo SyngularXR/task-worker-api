@@ -473,13 +473,17 @@ class _PermissiveParams(TaskParamsBase):
 class _HeartbeatObservingClient(FakeBackendClient):
     """Records how many progress (heartbeat) events had landed by the time
     ``download_file`` ran, so a test can assert the heartbeat was already
-    active during input staging."""
+    active during input staging.
+
+    Deliberately overrides the *legacy* three-positional-argument signature:
+    the worker runs a CancelGuard over prepare_inputs, so this doubles as
+    end-to-end coverage that a consumer's un-updated override still works."""
 
     def __init__(self) -> None:
         super().__init__()
         self.progress_count_at_download: int | None = None
 
-    async def download_file(self, task_id, filename, dest, *, cancelled=None):
+    async def download_file(self, task_id, filename, dest):
         # A real BackendClient.download_file suspends on network I/O while
         # streaming bytes — that suspension is what lets the heartbeat task
         # (created just before prepare_inputs) get dispatched by the event
@@ -489,7 +493,7 @@ class _HeartbeatObservingClient(FakeBackendClient):
         # model the I/O wait, then snapshot heartbeat activity.
         await asyncio.sleep(0.05)
         self.progress_count_at_download = len(self.progress_events)
-        await super().download_file(task_id, filename, dest, cancelled=cancelled)
+        await super().download_file(task_id, filename, dest)
 
 
 @pytest.mark.asyncio
