@@ -1021,3 +1021,67 @@ async def test_retry_does_not_inherit_the_dead_attempts_workdir(
         "retry started with the dead attempt's out/ files still present — "
         "upload_outputs would publish them as this attempt's result"
     )
+
+
+# ...and that removal has to fail closed. A best-effort delete leaves the
+# stale tree in place on a permission error, a filesystem fault, or a
+# partial deletion, and the attempt runs on to publish out/<filename> — the
+# dead attempt's bytes — as its own fresh result. Two shapes of failure:
+# rmtree raising, and rmtree returning while the tree survives (a vanished
+# entry mid-walk leaves its siblings behind).
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raises", "silently_survives"])
+async def test_unremovable_stale_workdir_aborts_the_attempt(
+    make_worker, fake_client, queue_cut_planes_task, tmp_path, monkeypatch,
+    failure,
+):
+    """If the leftover workdir can't be removed, the attempt must fail
+    instead of running — and publishing — on top of the dead attempt's
+    files."""
+    import shutil
+
+    from task_worker_api import worker as worker_mod
+
+    task = queue_cut_planes_task()
+
+    stale = tmp_path / "work" / f"task_{task.id}"
+    (stale / "out").mkdir(parents=True)
+    (stale / "out" / "planes.json").write_text("stale result")
+
+    real_rmtree = shutil.rmtree
+
+    def failing_rmtree(path, **kwargs):
+        # Only the fail-closed startup removal; the ``finally`` cleanup
+        # passes ignore_errors=True and stays best-effort.
+        if not kwargs.get("ignore_errors"):
+            if failure == "raises":
+                raise PermissionError(13, "Permission denied", str(path))
+            return  # deletion "succeeded" but the tree is still there
+        real_rmtree(path, **kwargs)
+
+    monkeypatch.setattr(worker_mod.shutil, "rmtree", failing_rmtree)
+
+    ran: list[int] = []
+
+    async def handler(ctx, params):
+        ran.append(1)
+        return {"output_files": {"planes": "planes.json"}}
+
+    worker = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+    )
+    # The polling loop keeps running: a failed attempt is reported, not raised.
+    assert await worker.run_one() is True
+
+    assert ran == [], "handler ran despite an unremovable stale workdir"
+    assert fake_client.completed_tasks == [], (
+        "attempt completed on top of a dead attempt's workdir — its "
+        "out/planes.json would be published as this attempt's result"
+    )
+    assert len(fake_client.failed_tasks) == 1
+    assert str(stale) in fake_client.failed_tasks[0]["error"], (
+        "failure reason must name the workdir an operator has to clear"
+    )
