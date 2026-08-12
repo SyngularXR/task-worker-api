@@ -973,3 +973,51 @@ async def test_task_workdir_cleanup_runs_off_the_event_loop(
     assert not list((tmp_path / "work").glob("task_*")), (
         "per-task workdir must be removed after the task finishes"
     )
+
+
+# The cleanup above only runs when _run_one reaches its finally block. A
+# mid-task kill (OOM killer, SIGKILL, host reboot) skips it while the
+# container filesystem survives, so the re-queued task's next attempt claims
+# the same id — and the same task_<id> path — with the dead attempt's tree
+# still on disk.
+
+
+@pytest.mark.asyncio
+async def test_retry_does_not_inherit_the_dead_attempts_workdir(
+    make_worker, fake_client, queue_cut_planes_task, tmp_path,
+):
+    """A leftover task_<id> dir must be gone before this attempt stages
+    inputs, so no stale in/ file is visible to the handler and no stale out/
+    file can be published as the retry's fresh result."""
+    task = queue_cut_planes_task()
+
+    # What the killed attempt left behind.
+    stale = tmp_path / "work" / f"task_{task.id}"
+    (stale / "in").mkdir(parents=True)
+    (stale / "out").mkdir(parents=True)
+    (stale / "in" / "old.stl").write_bytes(b"stale input")
+    (stale / "out" / "planes.json").write_text("stale result")
+
+    seen: dict[str, list[str]] = {}
+
+    async def handler(ctx, params):
+        seen["in"] = sorted(p.name for p in ctx.files.input_dir.iterdir())
+        seen["out"] = sorted(p.name for p in ctx.files.output_dir.iterdir())
+        # This attempt declares planes.json but never writes it — without the
+        # cleanup, upload_outputs publishes the dead attempt's copy.
+        return {"output_files": {"planes": "planes.json"}}
+
+    worker = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+    )
+    assert await worker.run_one() is True
+    assert len(fake_client.completed_tasks) == 1
+
+    assert seen["in"] == ["fake.stl"], (
+        "retry staged its inputs next to the dead attempt's in/ files"
+    )
+    assert seen["out"] == [], (
+        "retry started with the dead attempt's out/ files still present — "
+        "upload_outputs would publish them as this attempt's result"
+    )

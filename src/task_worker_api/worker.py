@@ -498,6 +498,10 @@ class Worker:
         must abort between uploads rather than streaming every remaining
         file to a task the user already cancelled.
 
+        Every attempt starts from a clean ``task_<id>`` workdir, so a task
+        re-queued after a mid-task kill never inherits the dead attempt's
+        staged inputs or outputs (see the removal below).
+
         A per-task watchdog (when ``timeout`` > 0) enforces a wall-clock
         deadline off the event loop. Terminal reporting goes through a single
         TerminalGuard so a timeout and a near-simultaneous normal completion
@@ -568,6 +572,24 @@ class Worker:
             # block below always calls progress.stop(), so a failure in
             # prepare_inputs still tears the heartbeat down cleanly.
             await progress.start_heartbeat()
+
+            # Each attempt starts from a clean workdir. The finally block
+            # below removes ``task_dir`` after every attempt, but a mid-task
+            # kill (OOM killer, SIGKILL, host reboot) never runs it and the
+            # container filesystem survives the restart — so when the backend
+            # re-queues the task and this worker claims it again, it computes
+            # the *same* ``task_<id>`` path and finds the dead attempt's tree
+            # still there. prepare_inputs would then stage this attempt's
+            # inputs alongside stale ``in/`` files, and upload_outputs
+            # publishes ``out/<filename>`` by name without checking who wrote
+            # it — so any output the retry's handler doesn't (re)write is
+            # published as the retry's fresh result from the dead attempt's
+            # bytes. Off the loop and ``ignore_errors=True`` for the same
+            # reasons as the cleanup in ``finally``; on a first attempt the
+            # dir doesn't exist and this is a no-op. It runs after
+            # start_heartbeat so a GB-scale leftover delete doesn't stall the
+            # heartbeat into the stale-task sweeper's window.
+            await asyncio.to_thread(shutil.rmtree, task_dir, ignore_errors=True)
 
             # Start the CancelGuard *before* prepare_inputs so a user cancel
             # during the (potentially multi-minute) input download is

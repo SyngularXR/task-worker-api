@@ -3,6 +3,21 @@
 ## Unreleased
 
 **Fixes:**
+- `Worker._run_one` now removes a leftover `task_<id>` directory at the start
+  of every attempt, so a retry never inherits a dead attempt's workdir. The
+  end-of-run cleanup only happens in `_run_one`'s `finally`; a mid-task kill
+  (OOM killer, SIGKILL, host reboot) skips it while the container filesystem
+  survives the restart, so the re-queued task's next attempt computed the same
+  `task_<id>` path and found the dead attempt's tree still on disk. Inputs
+  were then staged next to stale `in/` files, and — worse — `upload_outputs`
+  publishes `out/<filename>` by name without checking who wrote it, so any
+  output the retry's handler didn't (re)write was published as the retry's
+  fresh result from the dead attempt's bytes. The removal runs off the event
+  loop with `ignore_errors=True` (same contract as the cleanup in `finally`)
+  and after the heartbeat starts, so deleting a GB-scale leftover doesn't
+  stall into the stale-task sweeper's window. No behaviour change for a first
+  attempt: the directory doesn't exist and the call is a no-op. Nothing in
+  the public API changes.
 - `BackendClient.download_file` now accepts an optional keyword-only
   `cancelled` event and checks it before issuing the request and before
   writing each chunk, raising `TaskCancelled` at the next chunk boundary.
