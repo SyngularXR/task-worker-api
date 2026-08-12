@@ -473,7 +473,11 @@ class _PermissiveParams(TaskParamsBase):
 class _HeartbeatObservingClient(FakeBackendClient):
     """Records how many progress (heartbeat) events had landed by the time
     ``download_file`` ran, so a test can assert the heartbeat was already
-    active during input staging."""
+    active during input staging.
+
+    Deliberately overrides the *legacy* three-positional-argument signature:
+    the worker runs a CancelGuard over prepare_inputs, so this doubles as
+    end-to-end coverage that a consumer's un-updated override still works."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -597,11 +601,11 @@ class _CancelDuringDownloadClient(FakeBackendClient):
         super().__init__()
         self._download_count = 0
 
-    async def download_file(self, task_id, filename, dest):
+    async def download_file(self, task_id, filename, dest, *, cancelled=None):
         # Yield to the event loop so the CancelGuard's poll task can run
         # and observe the cancelled state we set below.
         await asyncio.sleep(0.02)
-        await super().download_file(task_id, filename, dest)
+        await super().download_file(task_id, filename, dest, cancelled=cancelled)
         self._download_count += 1
         if self._download_count == 1:
             # Simulate a user cancel arriving after the first file lands.

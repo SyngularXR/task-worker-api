@@ -358,8 +358,10 @@ async def test_prepare_inputs_aborts_mid_batch_when_cancel_set_after_first(tmp_p
             self._event = event
             self._download_count = 0
 
-        async def download_file(self, task_id, filename, dest):
-            await super().download_file(task_id, filename, dest)
+        async def download_file(self, task_id, filename, dest, *, cancelled=None):
+            await super().download_file(
+                task_id, filename, dest, cancelled=cancelled,
+            )
             self._download_count += 1
             if self._download_count == 1:
                 self._event.set()
@@ -378,6 +380,158 @@ async def test_prepare_inputs_aborts_mid_batch_when_cancel_set_after_first(tmp_p
     # First file downloaded, second aborted.
     assert (work_dir / "in" / "a.ply").exists()
     assert not (work_dir / "in" / "b.ply").exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_aborts_mid_file_on_single_input(tmp_path):
+    """A single-file input set has no between-files boundary, so the only
+    way a cancel can land during the download is if the event reaches
+    ``download_file``. Before that threading, a lone GB-scale input
+    (colmap-splat PLY, Neural-Canvas splat) streamed to completion after
+    the user cancelled and prepare_inputs returned a FileContext as if
+    nothing had happened."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    work_dir = tmp_path / "work"
+
+    class _CancelDuringSoloDownload(FakeBackendClient):
+        """Sets the cancel event *during* the download — what a CancelGuard
+        poll firing mid-stream looks like — then delegates to the fake's
+        download_file, which honours the event as the real client does."""
+        def __init__(self, event: asyncio.Event) -> None:
+            super().__init__()
+            self._event = event
+
+        async def download_file(self, task_id, filename, dest, *, cancelled=None):
+            self._event.set()
+            await super().download_file(
+                task_id, filename, dest, cancelled=cancelled,
+            )
+
+    cancelled = asyncio.Event()
+    client = _CancelDuringSoloDownload(cancelled)
+    client.queue_file(42, "solo.ply", b"pretend-multi-GB-PLY")
+
+    task = _claimed(42, params={"input_files": {"mesh": "solo.ply"}})
+
+    with pytest.raises(TaskCancelled):
+        await prepare_inputs(task, client, work_dir, cancelled=cancelled)
+
+    assert not (work_dir / "in" / "solo.ply").exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_passes_cancel_event_to_download_file(tmp_path):
+    """The guard's own event object must be handed to ``download_file`` —
+    a copy or a fresh event would never see the guard set the original."""
+    import asyncio
+
+    class _RecordingClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list = []
+
+        async def download_file(self, task_id, filename, dest, *, cancelled=None):
+            self.seen.append(cancelled)
+            await super().download_file(
+                task_id, filename, dest, cancelled=cancelled,
+            )
+
+    client = _RecordingClient()
+    client.queue_file(3, "a.ply", b"aa")
+    task = _claimed(3, params={"input_files": {"mesh": "a.ply"}})
+    cancelled = asyncio.Event()
+
+    await prepare_inputs(task, client, tmp_path / "work", cancelled=cancelled)
+
+    assert client.seen == [cancelled]
+    assert client.seen[0] is cancelled
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_accepts_legacy_download_file_signature(tmp_path):
+    """A client written against the pre-``cancelled`` signature must keep
+    working, cancel guard and all.
+
+    Worker repos pass their own clients and test doubles to
+    ``Worker(client=...)``, and the worker always has a CancelGuard running
+    over ``prepare_inputs`` — so sending ``cancelled=`` unconditionally would
+    TypeError on every consumer that hasn't updated its override yet."""
+    import asyncio
+
+    class _LegacyClient(FakeBackendClient):
+        """Three positional args, no ``cancelled`` — the SDK's own signature
+        before this feature, and what sibling repos still implement."""
+        async def download_file(self, task_id, filename, dest):
+            await FakeBackendClient.download_file(self, task_id, filename, dest)
+
+    client = _LegacyClient()
+    client.queue_file(8, "a.ply", b"aa")
+    task = _claimed(8, params={"input_files": {"mesh": "a.ply"}})
+
+    ctx = await prepare_inputs(
+        task, client, tmp_path / "work", cancelled=asyncio.Event(),
+    )
+
+    assert ctx.primary_path.read_bytes() == b"aa"
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_legacy_client_still_aborts_between_files(tmp_path):
+    """The compatibility path must not cost a legacy client the cancellation
+    it already had: ``prepare_inputs``' own between-files check still fires,
+    it just can't abort mid-stream."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    work_dir = tmp_path / "work"
+
+    class _LegacyCancelAfterFirst(FakeBackendClient):
+        def __init__(self, event: asyncio.Event) -> None:
+            super().__init__()
+            self._event = event
+
+        async def download_file(self, task_id, filename, dest):
+            await FakeBackendClient.download_file(self, task_id, filename, dest)
+            self._event.set()
+
+    cancelled = asyncio.Event()
+    client = _LegacyCancelAfterFirst(cancelled)
+    client.queue_file(9, "a.ply", b"aa")
+    client.queue_file(9, "b.ply", b"bb")
+    task = _claimed(9, params={"input_files": {"a": "a.ply", "b": "b.ply"}})
+
+    with pytest.raises(TaskCancelled):
+        await prepare_inputs(task, client, work_dir, cancelled=cancelled)
+
+    assert (work_dir / "in" / "a.ply").exists()
+    assert not (work_dir / "in" / "b.ply").exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_passes_cancel_to_kwargs_only_override(tmp_path):
+    """A ``**kwargs`` passthrough override (a common test-double shape) must
+    still receive the event — it can forward it to the real client."""
+    import asyncio
+
+    class _KwargsClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list = []
+
+        async def download_file(self, *args, **kwargs):
+            self.seen.append(kwargs.get("cancelled"))
+            await FakeBackendClient.download_file(self, *args, **kwargs)
+
+    client = _KwargsClient()
+    client.queue_file(10, "a.ply", b"aa")
+    task = _claimed(10, params={"input_files": {"mesh": "a.ply"}})
+    cancelled = asyncio.Event()
+
+    await prepare_inputs(task, client, tmp_path / "work", cancelled=cancelled)
+
+    assert client.seen == [cancelled]
 
 
 @pytest.mark.asyncio

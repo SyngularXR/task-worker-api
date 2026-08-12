@@ -22,11 +22,12 @@ the backend's completed-task sweeper never reaches. Mirrors the
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .context import ClaimedTask, FileContext
 from .errors import TaskCancelled
@@ -125,6 +126,53 @@ async def _copyfile_async(
         raise
 
 
+#: One WARNING per process when a client predating the ``cancelled`` keyword
+#: is used with a live cancel event — the condition is per-download, and a
+#: line per file of a multi-file input set would be noise.
+_warned_legacy_download_file = False
+
+
+def _download_cancel_kwarg(
+    download_file: Any, cancelled: Optional[asyncio.Event],
+) -> dict:
+    """``{"cancelled": event}`` if ``download_file`` takes it, else ``{}``.
+
+    ``cancelled=`` was added to :meth:`BackendClient.download_file` after
+    worker repos had already grown their own clients, test doubles and
+    ``FakeBackendClient`` subclasses against the three-positional-argument
+    signature (``Worker(client=...)`` takes any duck-typed client). Passing
+    the keyword unconditionally would raise ``TypeError`` on every one of
+    them the moment a cancel guard is active — which is always, since the
+    worker starts one before staging inputs. So the keyword only goes to
+    callees that declare it (or accept ``**kwargs``); older ones keep the
+    pre-existing behaviour, where a cancel is noticed between files rather
+    than mid-stream.
+    """
+    global _warned_legacy_download_file
+    if cancelled is None:
+        return {}
+    try:
+        params = inspect.signature(download_file).parameters
+    except (TypeError, ValueError):  # pragma: no cover — unintrospectable
+        # Can't tell; assume the current signature rather than silently
+        # dropping cancellation for a client that does support it.
+        return {"cancelled": cancelled}
+    if "cancelled" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        return {"cancelled": cancelled}
+    if not _warned_legacy_download_file:
+        _warned_legacy_download_file = True
+        log.warning(
+            "%s has no 'cancelled' parameter; a user cancel during a remote "
+            "input download will not be noticed until the file finishes "
+            "streaming. Add 'cancelled: Optional[asyncio.Event] = None' as a "
+            "keyword-only parameter and forward it to abort mid-stream.",
+            getattr(download_file, "__qualname__", download_file),
+        )
+    return {}
+
+
 async def prepare_inputs(
     task: ClaimedTask, client: "BackendClient", work_dir: Path,
     *,
@@ -136,8 +184,16 @@ async def prepare_inputs(
     started before this call), remote-mode batch downloads abort as soon as
     the event is set: a multi-file input set for a GB-scale task can spend
     minutes streaming, and a user cancel during that window should not wait
-    for every remaining file to finish downloading. Local mode
-    (``input_path``) honours it too: the copy runs through
+    for every remaining file to finish downloading. The event is checked
+    between files *and* handed to ``download_file``, which checks it between
+    chunk writes — so a cancel aborts mid-file too. That matters most for a
+    single-file input set (a lone colmap-splat PLY, a Neural-Canvas splat),
+    where the between-files check never fires and the whole multi-GB stream
+    would otherwise run to completion after the cancel. A client whose
+    ``download_file`` predates the ``cancelled`` keyword still works — see
+    :func:`_download_cancel_kwarg` — it just keeps the between-files-only
+    cancellation it always had. Local mode
+    (``input_path``) honours it the same way: the copy runs through
     :func:`_copyfile_async`, which checks the event between chunks, so a
     cancel aborts mid-file rather than after a multi-GB copy completes.
     """
@@ -176,7 +232,10 @@ async def prepare_inputs(
                     f"task {task.id} cancelled by user during input download"
                 )
             dest = in_dir / filename
-            await client.download_file(task.id, filename, dest)
+            await client.download_file(
+                task.id, filename, dest,
+                **_download_cancel_kwarg(client.download_file, cancelled),
+            )
             paths[key] = dest
         primary_key = "mesh" if "mesh" in paths else next(iter(paths))
         return FileContext(

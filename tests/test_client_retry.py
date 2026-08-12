@@ -22,6 +22,7 @@ import pytest
 
 from task_worker_api.client import BackendClient
 from task_worker_api.enums import TaskType
+from task_worker_api.errors import TaskCancelled
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +454,123 @@ async def test_download_file_cleanup_does_not_affect_successful_download(tmp_pat
     client = _client_with_handler(handler)
     dest = tmp_path / "out.ply"
     await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert dest.read_bytes() == body
+
+
+# -----------------------------------------------------------------------
+# download_file cancel — a user cancel during a multi-GB input stream must
+# abort at the next chunk boundary. prepare_inputs only checked between
+# batch files, so a single-file input set (a lone colmap-splat PLY,
+# a Neural-Canvas splat) streamed to completion after the cancel.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_file_aborts_mid_stream_when_cancel_set(tmp_path):
+    """A cancel that lands partway through the stream must raise
+    TaskCancelled at the next chunk boundary — not drain the whole body.
+
+    The handler counts the chunks it hands out, so draining the body to
+    completion (the pre-fix behaviour) is distinguishable from aborting.
+    """
+    chunks_sent = {"n": 0}
+    cancelled = asyncio.Event()
+
+    async def body():
+        for _ in range(10):
+            chunks_sent["n"] += 1
+            if chunks_sent["n"] == 2:
+                # A CancelGuard poll observing the user's cancel, mid-stream.
+                cancelled.set()
+            yield b"x" * 1024
+
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=body())
+
+    client = _client_with_handler(handler, max_retries=4)
+    dest = tmp_path / "out.ply"
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await client.download_file(5, "scene.ply", dest, cancelled=cancelled)
+    await client.close()
+
+    assert chunks_sent["n"] < 10, (
+        "download must abort at a chunk boundary, not stream the rest of a "
+        "multi-GB file to a task the user already cancelled"
+    )
+    # A cancel is a failure like any other for cleanup purposes: no partial
+    # input may survive for a retried task to mistake for a complete one.
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_file_cancel_does_not_consume_retry_budget(tmp_path):
+    """TaskCancelled must pass straight through ``_retry``.
+
+    If the cancel were treated as transient, the client would re-issue the
+    GET up to ``max_retries`` times — re-streaming the very file the fix
+    exists to stop streaming.
+    """
+    requests = {"n": 0}
+    cancelled = asyncio.Event()
+
+    async def body():
+        cancelled.set()
+        yield b"first-chunk"
+        yield b"second-chunk"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=body())
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(TaskCancelled):
+        await client.download_file(
+            5, "scene.ply", tmp_path / "out.ply", cancelled=cancelled,
+        )
+    await client.close()
+
+    assert requests["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_download_file_checks_cancel_before_request(tmp_path):
+    """An already-set event must abort before the GET goes out at all —
+    a cancel detected between batch files shouldn't open the next stream."""
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        requests["n"] += 1
+        return httpx.Response(200, content=b"body")
+
+    cancelled = asyncio.Event()
+    cancelled.set()
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled):
+        await client.download_file(
+            5, "scene.ply", tmp_path / "out.ply", cancelled=cancelled,
+        )
+    await client.close()
+
+    assert requests["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_download_file_unset_cancel_event_streams_full_body(tmp_path):
+    """Supplying an event that never fires must not perturb the download —
+    pins the polarity of the check (an inverted test would abort here)."""
+    body = b"\x00\x01\x02" * 1000
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "out.ply"
+    await client.download_file(5, "scene.ply", dest, cancelled=asyncio.Event())
     await client.close()
 
     assert dest.read_bytes() == body

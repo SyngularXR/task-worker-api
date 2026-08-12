@@ -210,6 +210,39 @@ async def test_download_file_scoped_per_task(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_download_file_honours_cancel_event(tmp_path):
+    """The fake must mirror ``BackendClient.download_file``'s cancel
+    contract: a set event raises TaskCancelled and writes nothing. Worker
+    tests drive cancels through the fake, so a fake that ignored the event
+    would report green while the real client aborts."""
+    import asyncio
+
+    from task_worker_api.errors import TaskCancelled
+
+    fake = FakeBackendClient()
+    fake.queue_file(1, "input.stl", b"stl-bytes")
+    dest = tmp_path / "out.stl"
+    cancelled = asyncio.Event()
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled):
+        await fake.download_file(1, "input.stl", dest, cancelled=cancelled)
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_file_unset_cancel_event_writes_content(tmp_path):
+    """An event that never fires must not perturb the download."""
+    import asyncio
+
+    fake = FakeBackendClient()
+    fake.queue_file(1, "input.stl", b"stl-bytes")
+    dest = tmp_path / "out.stl"
+    await fake.download_file(1, "input.stl", dest, cancelled=asyncio.Event())
+    assert dest.read_bytes() == b"stl-bytes"
+
+
+@pytest.mark.asyncio
 async def test_upload_file_captures_bytes(tmp_path):
     fake = FakeBackendClient()
     src = tmp_path / "output.stl"
