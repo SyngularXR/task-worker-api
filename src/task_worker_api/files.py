@@ -32,6 +32,7 @@ import logging
 import ntpath
 import os
 import shutil
+import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -49,10 +50,20 @@ log = logging.getLogger(__name__)
 _COPY_CHUNK_BYTES = 4 * 1024 * 1024
 
 
-#: Never legal in a task filename: both platforms' path separators (a
-#: ``Path`` join happily walks out of the sandbox through either) and NUL,
-#: which truncates the name inside the C-level filesystem calls.
-_FILENAME_REJECTED_CHARS = ("/", "\\", "\0")
+#: Never legal in a task filename: path separators, URL delimiters/escapes,
+#: Windows-illegal characters, and NUL. The URL characters matter because
+#: filenames are interpolated into ``/tasks/{id}/files/{filename}``: an
+#: already-escaped ``%2f`` would otherwise become a separator at the backend.
+_FILENAME_REJECTED_CHARS = frozenset('/\\\0<>:"|?*%#')
+
+#: Windows resolves these names to devices even when an extension is present
+#: (for example ``NUL.log``). Reject them on every platform so a manifest has
+#: the same meaning on Linux and Windows workers.
+_WINDOWS_RESERVED_FILENAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 def _require_safe_filename(value: Any, *, field: str, key: str) -> str:
@@ -77,8 +88,6 @@ def _require_safe_filename(value: Any, *, field: str, key: str) -> str:
     """
     if not isinstance(value, str) or not value:
         problem = "must be a non-empty string"
-    elif any(ch in value for ch in _FILENAME_REJECTED_CHARS):
-        problem = r"must not contain '/', '\' or NUL"
     elif value in (".", ".."):
         problem = "must not be '.' or '..'"
     elif ntpath.splitdrive(value)[0]:
@@ -86,6 +95,14 @@ def _require_safe_filename(value: Any, *, field: str, key: str) -> str:
         # still escapes. Checked with ntpath explicitly: workers run in
         # Linux containers, where os.path would wave it through.
         problem = "must not carry a drive or UNC prefix"
+    elif any(ch in _FILENAME_REJECTED_CHARS for ch in value):
+        problem = "contains a path, URL, or platform-reserved character"
+    elif any(ord(ch) < 32 for ch in value):
+        problem = "must not contain control characters"
+    elif value.endswith((".", " ")):
+        problem = "must not end with a dot or space"
+    elif value.split(".", 1)[0].rstrip(" .").upper() in _WINDOWS_RESERVED_FILENAMES:
+        problem = "is a Windows reserved device name"
     else:
         return value
 
@@ -94,6 +111,65 @@ def _require_safe_filename(value: Any, *, field: str, key: str) -> str:
         "Task file names are joined into the per-task sandbox directory, so "
         "they must be plain filenames with no directory component."
     )
+
+
+def _require_safe_filenames(
+    values: dict[str, Any], *, field: str,
+) -> dict[str, str]:
+    """Validate one manifest and reject cross-platform filename aliases."""
+    safe: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    for key, value in values.items():
+        filename = _require_safe_filename(value, field=field, key=key)
+        alias = ntpath.normcase(filename)
+        previous = aliases.get(alias)
+        if previous is not None and previous != filename:
+            raise ProtocolError(
+                f"{field}[{key!r}] = {filename!r} aliases {previous!r} on "
+                "case-insensitive filesystems. Task file names must be "
+                "distinct on both Linux and Windows."
+            )
+        aliases[alias] = filename
+        safe[key] = filename
+    return safe
+
+
+def _require_output_sources(
+    output_dir: Path, output_files: dict[str, str],
+) -> dict[str, tuple[str, Path]]:
+    """Reject unsafe existing output sources without following symlinks."""
+    root = output_dir.resolve(strict=True)
+    sources: dict[str, tuple[str, Path]] = {}
+    for key, filename in output_files.items():
+        src = output_dir / filename
+        try:
+            source_stat = src.lstat()
+        except FileNotFoundError:
+            # Preserve each publish branch's existing missing-file behavior:
+            # remote/local publishing raises when it tries to read/copy, while
+            # no-shared-volume mode only returns the declared manifest path.
+            sources[key] = (filename, src)
+            continue
+        if stat.S_ISLNK(source_stat.st_mode):
+            problem = "must not be a symbolic link"
+        elif not stat.S_ISREG(source_stat.st_mode):
+            problem = "must be a regular file"
+        else:
+            resolved = src.resolve(strict=True)
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                problem = "resolves outside the task output directory"
+            else:
+                sources[key] = (filename, src)
+                continue
+
+        raise ProtocolError(
+            f"output_files[{key!r}] = {filename!r} is not a safe output: "
+            f"{problem}. Task outputs must be regular files created directly "
+            "inside the task output directory."
+        )
+    return sources
 
 
 async def _copyfile_async(
@@ -287,10 +363,9 @@ async def prepare_inputs(
         # escapes ``in_dir`` must fail the task, not write onto the worker
         # host, and failing up front also avoids leaving a half-staged
         # input dir behind for the sake of a manifest we already know is bad.
-        safe_input_files = {
-            key: _require_safe_filename(filename, field="input_files", key=key)
-            for key, filename in input_files.items()
-        }
+        safe_input_files = _require_safe_filenames(
+            input_files, field="input_files",
+        )
         paths: dict[str, Path] = {}
         for key, filename in safe_input_files.items():
             if cancelled is not None and cancelled.is_set():
@@ -363,8 +438,12 @@ async def upload_outputs(
     check keeps a rejected manifest from leaving artifacts behind in the
     staging dir or on the backend.
     """
-    for key, filename in output_files.items():
-        _require_safe_filename(filename, field="output_files", key=key)
+    safe_output_files = _require_safe_filenames(
+        output_files, field="output_files",
+    )
+    output_sources = _require_output_sources(
+        file_ctx.output_dir, safe_output_files,
+    )
 
     remote_mode = bool((task.params or {}).get("input_files"))
 
@@ -377,12 +456,11 @@ async def upload_outputs(
         # propagates so the task is marked failed and retried cleanly.
         uploaded: list[str] = []
         try:
-            for _, filename in output_files.items():
+            for _, (filename, src) in output_sources.items():
                 if cancelled is not None and cancelled.is_set():
                     raise TaskCancelled(
                         f"task {task.id} cancelled by user during output upload"
                     )
-                src = file_ctx.output_dir / filename
                 await client.upload_file(task.id, filename, src)
                 uploaded.append(filename)
         except Exception:
@@ -394,7 +472,7 @@ async def upload_outputs(
                     task.id, len(uploaded), ", ".join(uploaded),
                 )
             raise
-        return dict(output_files)
+        return dict(safe_output_files)
 
     if shared_volume_path:
         # Staging dir for local-mode outputs. Lives under ``temp/`` so
@@ -406,12 +484,11 @@ async def upload_outputs(
         dest_dir.mkdir(parents=True, exist_ok=True)
         manifest: dict[str, str] = {}
         try:
-            for key, filename in output_files.items():
+            for key, (filename, src) in output_sources.items():
                 if cancelled is not None and cancelled.is_set():
                     raise TaskCancelled(
                         f"task {task.id} cancelled by user during output upload"
                     )
-                src = file_ctx.output_dir / filename
                 dest = dest_dir / filename
                 await _copyfile_async(
                     src, dest, cancelled=cancelled,
@@ -438,6 +515,6 @@ async def upload_outputs(
         return manifest
 
     return {
-        key: str(file_ctx.output_dir / filename)
-        for key, filename in output_files.items()
+        key: str(src)
+        for key, (_, src) in output_sources.items()
     }

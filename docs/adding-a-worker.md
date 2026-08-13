@@ -269,8 +269,9 @@ choice, but two conventions:
   filename** relative to `ctx.files.output_dir` — no directory component, no
   absolute path (`os.path.basename(p)` if your pipeline hands you a full
   path). The SDK joins the name into the per-task sandbox, so anything else
-  fails the task with a `ProtocolError` naming the key. Same rule for the
-  `input_files` names the backend sends.
+  fails the task with a `ProtocolError` naming the key. The output itself must
+  be a regular file created in `ctx.files.output_dir`, not a symlink. Same
+  filename rule for the `input_files` names the backend sends.
 - **Everything else**: lives on `task.result` verbatim, accessible to
   the frontend or task-result-mirror hooks. Keep it small — JSONB
   column, but don't stuff megabytes of floats in there.

@@ -13,17 +13,22 @@
   other cases' patient data, and an absolute `output_files` name discarded the
   output dir entirely — so remote mode read an arbitrary container file
   (`/etc/passwd`, an env file with credentials) and published it to the
-  backend as a task output. Names containing `/`, `\` or NUL, the bare `.` and
-  `..` segments, drive/UNC-prefixed names, and empty or non-string values now
-  raise `ProtocolError` naming the offending manifest key, so the task fails
-  with an actionable reason instead of escaping the sandbox. The whole
-  manifest is validated **up front** — before the first download in
-  `prepare_inputs`, and before any upload or copy in `upload_outputs` — so a
-  bad entry can't publish the good entries listed ahead of it and then fail,
-  leaving artifacts behind in the staging dir or on the backend.
-  Backward-compatible: only previously-vulnerable names are refused, ordinary
-  filenames (including dotted and dot-prefixed ones) pass through unchanged,
-  and no wire format, public API or cross-repo contract changes.
+  backend as a task output. Names containing path separators, URL
+  delimiters/escapes, NUL or other platform-reserved characters; the bare `.`
+  and `..` segments; drive/UNC prefixes; Windows device names; trailing dots
+  or spaces; case-insensitive aliases; and empty or non-string values now
+  raise `ProtocolError` naming the offending manifest key. Existing output
+  sources must also be regular files, never symlinks. The whole manifest is
+  validated **up front** — before the first download in `prepare_inputs`, and
+  before any upload or copy in `upload_outputs` — so a bad entry can't publish
+  the good entries listed ahead of it and then fail, leaving artifacts behind
+  in the staging dir or on the backend.
+  This intentionally tightens the file-manifest contract: values must be plain
+  filenames, not relative descendants. Producers that previously returned a
+  path must move the artifact into the task output directory and return its
+  basename. Ordinary filenames (including dotted and dot-prefixed ones) pass
+  through unchanged; the wire shape and public function signatures do not
+  change.
 - `Worker._run_one` now removes a leftover `task_<id>` directory at the start
   of every attempt, so a retry never inherits a dead attempt's workdir. The
   end-of-run cleanup only happens in `_run_one`'s `finally`; a mid-task kill

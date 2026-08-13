@@ -1050,6 +1050,20 @@ UNSAFE_NAMES = [
     ".",
     r"..\..\x.stl",
     "C:evil.stl",
+    "%2e%2e%2f42%2fsecret.ply",
+    "query?name.ply",
+    "fragment#name.ply",
+    "stream.ply:secret",
+    "NUL",
+    "con.log",
+    "COM1",
+    "trailing-dot.",
+    "trailing-space ",
+    "bad<name.ply",
+    'bad"name.ply',
+    "bad|name.ply",
+    "bad*name.ply",
+    "control\x1f.ply",
     "evil\0.stl",
     "",
 ]
@@ -1134,6 +1148,27 @@ async def test_prepare_inputs_rejects_bad_name_before_downloading_any(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prepare_inputs_rejects_case_colliding_names(tmp_path):
+    """Names that differ only by case alias on Windows and must not let a
+    later download overwrite an earlier logical input."""
+    from task_worker_api.errors import ProtocolError
+
+    work_dir = tmp_path / "work" / "task_56"
+    client = FakeBackendClient()
+    client.queue_file(56, "A.ply", b"calibration")
+    client.queue_file(56, "a.ply", b"payload")
+    task = _claimed(56, params={"input_files": {
+        "calibration": "A.ply", "payload": "a.ply",
+    }})
+
+    with pytest.raises(ProtocolError, match="case-insensitive"):
+        await prepare_inputs(task, client, work_dir)
+
+    assert not (work_dir / "in" / "A.ply").exists()
+    assert not (work_dir / "in" / "a.ply").exists()
+
+
+@pytest.mark.asyncio
 async def test_upload_outputs_remote_rejects_absolute_output_filename(tmp_path):
     """Remote mode: an absolute ``output_files`` name makes ``output_dir /
     name`` resolve to that absolute path, so the worker would read an
@@ -1161,6 +1196,64 @@ async def test_upload_outputs_remote_rejects_absolute_output_filename(tmp_path):
     assert client.uploaded_files == {}, (
         "no output may be published once the manifest is known to be unsafe"
     )
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_rejects_case_colliding_names(tmp_path):
+    """Two logical outputs must not alias the same file on Windows."""
+    from task_worker_api.errors import ProtocolError
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    task = _claimed(57, params={"input_files": {"mesh": "in.ply"}})
+    client = FakeBackendClient()
+
+    with pytest.raises(ProtocolError, match="case-insensitive"):
+        await upload_outputs(
+            task, client, _file_ctx(out_dir),
+            output_files={"preview": "Result.ply", "mesh": "result.ply"},
+            shared_volume_path=None,
+        )
+
+    assert client.uploaded_files == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["remote", "local", "no-shared-volume"])
+async def test_upload_outputs_rejects_symlink_sources(tmp_path, mode):
+    """A plain basename must not smuggle an outside file through a symlink."""
+    from task_worker_api.errors import ProtocolError
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    secret = tmp_path / "secret.env"
+    secret.write_bytes(b"API_KEY=not-for-upload")
+    link = out_dir / "result.bin"
+    try:
+        link.symlink_to(secret)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    client = FakeBackendClient()
+    if mode == "remote":
+        params = {"input_files": {"mesh": "in.ply"}}
+        shared_volume_path = None
+    elif mode == "local":
+        params = {"input_path": "/ignored"}
+        shared_volume_path = str(tmp_path / "shared")
+    else:
+        params = {"input_path": "/ignored"}
+        shared_volume_path = None
+
+    with pytest.raises(ProtocolError, match="symbolic link"):
+        await upload_outputs(
+            _claimed(58, params=params), client, _file_ctx(out_dir),
+            output_files={"artifact": "result.bin"},
+            shared_volume_path=shared_volume_path,
+        )
+
+    assert client.uploaded_files == {}
+    assert not (tmp_path / "shared" / "temp" / "58").exists()
 
 
 @pytest.mark.asyncio
