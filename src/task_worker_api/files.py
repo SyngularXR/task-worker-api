@@ -18,19 +18,25 @@ from the failed attempt (a half-populated staging dir, or a subset of
 uploaded files on the backend) would otherwise linger as orphans that
 the backend's completed-task sweeper never reaches. Mirrors the
 ``BackendClient.download_file`` partial-file cleanup contract.
+
+Every ``input_files`` / ``output_files`` name is checked by
+:func:`_require_safe_filename` before it is joined into a per-task
+directory — those names come from backend task params and handler
+output manifests, so they are the file-transfer trust boundary.
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
 import logging
+import ntpath
 import os
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from .context import ClaimedTask, FileContext
-from .errors import TaskCancelled
+from .errors import ProtocolError, TaskCancelled
 
 if TYPE_CHECKING:  # pragma: no cover
     from .client import BackendClient
@@ -41,6 +47,53 @@ log = logging.getLogger(__name__)
 #: offloaded from the event-loop thread; chunking adds cancellation points
 #: without making a multi-GB copy thread-dispatch-bound.
 _COPY_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+#: Never legal in a task filename: both platforms' path separators (a
+#: ``Path`` join happily walks out of the sandbox through either) and NUL,
+#: which truncates the name inside the C-level filesystem calls.
+_FILENAME_REJECTED_CHARS = ("/", "\\", "\0")
+
+
+def _require_safe_filename(value: Any, *, field: str, key: str) -> str:
+    """Return ``value`` if it is a plain filename; raise ``ProtocolError`` if not.
+
+    ``input_files`` values arrive in the backend's task params and
+    ``output_files`` values come from the handler's result manifest; both
+    are joined into a per-task directory (``work_dir/in``, ``work_dir/out``,
+    ``shared_volume_path/temp/<task_id>``). ``Path`` join has no notion of a
+    sandbox: ``in_dir / "../../x"`` walks out of it, and
+    ``out_dir / "/etc/passwd"`` discards ``out_dir`` entirely. Unchecked,
+    that let a task read or write anywhere the worker process can — an
+    escaped input write lands on the worker host, an escaped local output
+    stages onto the shared volume next to other cases' patient data, and an
+    absolute remote output name publishes an arbitrary container file
+    (env files, credentials) to the backend as a task output.
+
+    So a name must be exactly one path component. ``field``/``key`` name the
+    offending manifest entry in the message: these fail a task that a
+    handler or the backend has to fix, and "some filename was bad" is not
+    an actionable failure reason.
+    """
+    if not isinstance(value, str) or not value:
+        problem = "must be a non-empty string"
+    elif any(ch in value for ch in _FILENAME_REJECTED_CHARS):
+        problem = r"must not contain '/', '\' or NUL"
+    elif value in (".", ".."):
+        problem = "must not be '.' or '..'"
+    elif ntpath.splitdrive(value)[0]:
+        # "C:x" has no separator but is drive-relative, so a Windows join
+        # still escapes. Checked with ntpath explicitly: workers run in
+        # Linux containers, where os.path would wave it through.
+        problem = "must not carry a drive or UNC prefix"
+    else:
+        return value
+
+    raise ProtocolError(
+        f"{field}[{key!r}] = {value!r} is not a safe filename: {problem}. "
+        "Task file names are joined into the per-task sandbox directory, so "
+        "they must be plain filenames with no directory component."
+    )
 
 
 async def _copyfile_async(
@@ -196,6 +249,11 @@ async def prepare_inputs(
     (``input_path``) honours it the same way: the copy runs through
     :func:`_copyfile_async`, which checks the event between chunks, so a
     cancel aborts mid-file rather than after a multi-GB copy completes.
+
+    Remote-mode ``input_files`` names are backend-supplied and land under
+    ``work_dir/in/``, so each must be a plain basename; one that isn't
+    fails the task with a :class:`ProtocolError` naming its key, before any
+    download starts. See :func:`_require_safe_filename`.
     """
     in_dir = work_dir / "in"
     out_dir = work_dir / "out"
@@ -225,8 +283,16 @@ async def prepare_inputs(
         )
 
     if input_files:
+        # Validate the whole set before the first download: a name that
+        # escapes ``in_dir`` must fail the task, not write onto the worker
+        # host, and failing up front also avoids leaving a half-staged
+        # input dir behind for the sake of a manifest we already know is bad.
+        safe_input_files = {
+            key: _require_safe_filename(filename, field="input_files", key=key)
+            for key, filename in input_files.items()
+        }
         paths: dict[str, Path] = {}
-        for key, filename in input_files.items():
+        for key, filename in safe_input_files.items():
             if cancelled is not None and cancelled.is_set():
                 raise TaskCancelled(
                     f"task {task.id} cancelled by user during input download"
@@ -289,7 +355,17 @@ async def upload_outputs(
     backend's completed-task sweeper never reaches (it only sweeps staging
     dirs / accepts output manifests for tasks it recorded as complete).
     Mirrors the ``BackendClient.download_file`` partial-file cleanup.
+
+    Every filename in ``output_files`` must be a plain basename; one that
+    isn't fails the task with a :class:`ProtocolError` naming its key. The
+    whole manifest is checked before the first upload or copy, so a bad
+    entry can't publish the entries ahead of it first — an all-or-nothing
+    check keeps a rejected manifest from leaving artifacts behind in the
+    staging dir or on the backend.
     """
+    for key, filename in output_files.items():
+        _require_safe_filename(filename, field="output_files", key=key)
+
     remote_mode = bool((task.params or {}).get("input_files"))
 
     if remote_mode:

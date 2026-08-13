@@ -1023,3 +1023,189 @@ async def test_local_mode_staging_cleanup_runs_off_the_event_loop(
         "staging-dir rmtree ran on the event loop thread"
     )
     assert not (shared / "temp" / "71").exists()
+
+
+# ---------------------------------------------------------------------------#
+# Path-traversal guard — ``input_files`` / ``output_files`` names are joined
+# into per-task sandbox dirs, so an unchecked name escaped them entirely:
+# ``in_dir / "../../x"`` writes onto the worker host, ``out_dir /
+# "/etc/passwd"`` drops ``out_dir`` and publishes an arbitrary container file
+# to the backend, and an escaped local output name stages onto the shared
+# volume beside other cases' data. Every name must be a plain basename.
+# ---------------------------------------------------------------------------#
+
+
+#: One escape per mechanism: relative walk-up, absolute (join discards the
+#: sandbox), a nested subdirectory, the bare dot segments, a Windows
+#: separator + drive-relative name (workers run on Linux, but the name comes
+#: off the wire and the SDK is importable anywhere), NUL truncation, and the
+#: empty name (``dir / ""`` is the dir itself).
+UNSAFE_NAMES = [
+    "../../x.stl",
+    "../escape.stl",
+    "/etc/passwd",
+    "/app/.env",
+    "sub/dir.stl",
+    "..",
+    ".",
+    r"..\..\x.stl",
+    "C:evil.stl",
+    "evil\0.stl",
+    "",
+]
+
+
+@pytest.mark.parametrize("name", UNSAFE_NAMES)
+def test_require_safe_filename_rejects_escapes(name):
+    """The guard itself: every escape shape is refused, and the message
+    names the offending manifest key so the failure is actionable."""
+    from task_worker_api.errors import ProtocolError
+    from task_worker_api.files import _require_safe_filename
+
+    with pytest.raises(ProtocolError, match="mesh"):
+        _require_safe_filename(name, field="input_files", key="mesh")
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["mesh.ply", "case_12_finalized.glb", "..hidden.stl", "a.b.c", "C_evil.stl"],
+)
+def test_require_safe_filename_accepts_plain_names(name):
+    """Backward compatibility: ordinary filenames — including ones that
+    merely start with dots or contain them — pass through unchanged."""
+    from task_worker_api.files import _require_safe_filename
+
+    assert _require_safe_filename(name, field="output_files", key="k") == name
+
+
+def test_require_safe_filename_rejects_non_string():
+    """A non-string name (malformed params) is refused rather than blowing
+    up later inside the ``Path`` join with an opaque TypeError."""
+    from task_worker_api.errors import ProtocolError
+    from task_worker_api.files import _require_safe_filename
+
+    with pytest.raises(ProtocolError, match="non-empty string"):
+        _require_safe_filename(7, field="input_files", key="mesh")
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_rejects_escaping_input_filename(tmp_path):
+    """Remote mode: a backend-supplied ``input_files`` name that walks out
+    of ``in/`` must fail the task before anything is downloaded — otherwise
+    the download writes onto the worker host outside the sandbox."""
+    from task_worker_api.errors import ProtocolError
+
+    work_dir = tmp_path / "work" / "task_51"
+    outside = tmp_path / "work" / "pwned.ply"
+
+    client = FakeBackendClient()
+    client.queue_file(51, "../pwned.ply", b"evil")
+
+    task = _claimed(51, params={"input_files": {"mesh": "../pwned.ply"}})
+
+    with pytest.raises(ProtocolError, match="input_files\\['mesh'\\]"):
+        await prepare_inputs(task, client, work_dir)
+
+    assert not outside.exists(), "input download escaped the per-task in/ dir"
+
+
+@pytest.mark.asyncio
+async def test_prepare_inputs_rejects_bad_name_before_downloading_any(tmp_path):
+    """All-or-nothing: a bad entry anywhere in the manifest stops the whole
+    batch, including the good entries listed before it."""
+    from task_worker_api.errors import ProtocolError
+
+    work_dir = tmp_path / "work" / "task_52"
+    client = FakeBackendClient()
+    client.queue_file(52, "good.ply", b"good")
+    client.queue_file(52, "../../evil.ply", b"evil")
+
+    task = _claimed(52, params={"input_files": {
+        "mesh": "good.ply", "meta": "../../evil.ply",
+    }})
+
+    with pytest.raises(ProtocolError, match="input_files\\['meta'\\]"):
+        await prepare_inputs(task, client, work_dir)
+
+    assert not (work_dir / "in" / "good.ply").exists(), (
+        "no input may be staged once the manifest is known to be unsafe"
+    )
+    assert not (tmp_path / "evil.ply").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_remote_rejects_absolute_output_filename(tmp_path):
+    """Remote mode: an absolute ``output_files`` name makes ``output_dir /
+    name`` resolve to that absolute path, so the worker would read an
+    arbitrary container file and publish it to the backend as a task
+    output. It must be refused, with nothing uploaded."""
+    from task_worker_api.errors import ProtocolError
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    secret = tmp_path / "secret.env"
+    secret.write_bytes(b"API_KEY=hunter2")
+
+    task = _claimed(53, params={"input_files": {"mesh": "in.ply"}})
+    client = FakeBackendClient()
+
+    with pytest.raises(ProtocolError, match="output_files\\['leak'\\]"):
+        await upload_outputs(
+            task, client, _file_ctx(out_dir),
+            output_files={"a": "a.stl", "leak": str(secret)},
+            shared_volume_path=None,
+        )
+
+    # All-or-nothing: not even the legitimate file ahead of it was sent.
+    assert client.uploaded_files == {}, (
+        "no output may be published once the manifest is known to be unsafe"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_local_rejects_escaping_output_filename(tmp_path):
+    """Local mode: an output name that walks out of the staging dir would
+    write onto the shared volume beside other cases' data. It must be
+    refused before the staging dir is even created."""
+    from task_worker_api.errors import ProtocolError
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    (out_dir / "escape.stl").write_bytes(b"eee")
+
+    task = _claimed(54, params={"input_path": "/ignored"})
+
+    with pytest.raises(ProtocolError, match="output_files\\['b'\\]"):
+        await upload_outputs(
+            task, FakeBackendClient(), _file_ctx(out_dir),
+            output_files={"a": "a.stl", "b": "../escape.stl"},
+            shared_volume_path=str(shared),
+        )
+
+    assert not (shared / "temp" / "escape.stl").exists(), (
+        "output copy escaped the per-task staging dir"
+    )
+    assert not (shared / "temp" / "54").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_no_shared_volume_rejects_escaping_name(tmp_path):
+    """The no-shared-volume branch returns ``output_dir / name`` paths
+    straight into the result manifest, so it needs the same guard: an
+    escaping name must not be handed to the backend as a task output."""
+    from task_worker_api.errors import ProtocolError
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+
+    task = _claimed(55, params={"input_path": "/ignored"})
+
+    with pytest.raises(ProtocolError, match="output_files\\['a'\\]"):
+        await upload_outputs(
+            task, FakeBackendClient(), _file_ctx(out_dir),
+            output_files={"a": "../../etc/passwd"},
+            shared_volume_path=None,
+        )

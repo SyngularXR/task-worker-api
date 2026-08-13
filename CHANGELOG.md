@@ -3,6 +3,27 @@
 ## Unreleased
 
 **Fixes:**
+- `prepare_inputs` and `upload_outputs` now reject any `input_files` /
+  `output_files` name that is not a plain basename. Both joined the
+  caller-supplied name straight into a per-task sandbox directory
+  (`work_dir/in/`, `work_dir/out/`, `shared_volume_path/temp/<task_id>/`), and
+  a `Path` join has no notion of a sandbox: an `input_files` value of
+  `../../x` from backend task params wrote outside the workdir onto the worker
+  host, an escaped local output name staged onto the shared volume beside
+  other cases' patient data, and an absolute `output_files` name discarded the
+  output dir entirely — so remote mode read an arbitrary container file
+  (`/etc/passwd`, an env file with credentials) and published it to the
+  backend as a task output. Names containing `/`, `\` or NUL, the bare `.` and
+  `..` segments, drive/UNC-prefixed names, and empty or non-string values now
+  raise `ProtocolError` naming the offending manifest key, so the task fails
+  with an actionable reason instead of escaping the sandbox. The whole
+  manifest is validated **up front** — before the first download in
+  `prepare_inputs`, and before any upload or copy in `upload_outputs` — so a
+  bad entry can't publish the good entries listed ahead of it and then fail,
+  leaving artifacts behind in the staging dir or on the backend.
+  Backward-compatible: only previously-vulnerable names are refused, ordinary
+  filenames (including dotted and dot-prefixed ones) pass through unchanged,
+  and no wire format, public API or cross-repo contract changes.
 - `Worker._run_one` now removes a leftover `task_<id>` directory at the start
   of every attempt, so a retry never inherits a dead attempt's workdir. The
   end-of-run cleanup only happens in `_run_one`'s `finally`; a mid-task kill

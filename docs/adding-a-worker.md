@@ -265,7 +265,12 @@ choice, but two conventions:
 
 - **`output_files`**: `{logical_key: filename}`. The SDK publishes
   these — local mode copies to `shared_volume_path/temp/<task_id>/`; remote
-  mode PUTs each via the file endpoints.
+  mode PUTs each via the file endpoints. Each value must be a **plain
+  filename** relative to `ctx.files.output_dir` — no directory component, no
+  absolute path (`os.path.basename(p)` if your pipeline hands you a full
+  path). The SDK joins the name into the per-task sandbox, so anything else
+  fails the task with a `ProtocolError` naming the key. Same rule for the
+  `input_files` names the backend sends.
 - **Everything else**: lives on `task.result` verbatim, accessible to
   the frontend or task-result-mirror hooks. Keep it small — JSONB
   column, but don't stuff megabytes of floats in there.
