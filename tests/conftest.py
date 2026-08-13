@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from task_worker_api import TaskType, Worker
+from task_worker_api import ClaimedTask, TaskType, Worker
 from task_worker_api.testing import FakeBackendClient
 
 _FAKE_BACKEND_URL = "http://fake/api/v1"
@@ -81,13 +81,13 @@ def queue_cut_planes_task(tmp_path, fake_client):
 
     Returns the ``ClaimedTask``. Additional params can be merged in.
     """
-    def _queue(*, extra_params: dict | None = None) -> None:
+    def _queue(*, extra_params: dict | None = None) -> ClaimedTask:
         stl = tmp_path / "fake.stl"
         stl.write_bytes(b"solid\nendsolid\n")
         params: dict = {"input_path": str(stl)}
         if extra_params:
             params.update(extra_params)
-        fake_client.queue_task(
+        return fake_client.queue_task(
             task_type=TaskType.DETECT_CUT_PLANES,
             params=params,
         )

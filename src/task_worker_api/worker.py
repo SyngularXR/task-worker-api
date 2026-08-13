@@ -117,6 +117,37 @@ def _make_sync_fail(
     return _sync_fail
 
 
+def _clear_workdir(task_dir: Path) -> None:
+    """Remove a leftover attempt's workdir, or raise. Runs in a thread.
+
+    Fails *closed*: the caller runs this before staging inputs, and the whole
+    point is that nothing from a dead attempt survives into this one. A
+    best-effort delete (``ignore_errors=True``) would let a permission error,
+    a filesystem fault, or a partial deletion leave stale ``out/`` files in
+    place while the attempt runs on to publish them by name as its own fresh
+    result — the exact data-integrity bug this removal exists to prevent. So
+    an unremovable leftover aborts the attempt instead: the task fails, is
+    re-queued, and an operator sees the error rather than a silently wrong
+    output.
+
+    A missing directory is the normal first-attempt case, not a failure. The
+    explicit ``exists`` check afterwards covers deletions that *don't* raise:
+    ``rmtree`` can hit ``FileNotFoundError`` on one entry that vanished
+    mid-walk and leave every sibling behind, so "no exception" alone is not
+    evidence the tree is gone.
+    """
+    try:
+        shutil.rmtree(task_dir)
+    except FileNotFoundError:
+        pass
+    if task_dir.exists():
+        raise RuntimeError(
+            f"stale workdir {task_dir} survived removal; refusing to run this "
+            "attempt in a dead attempt's directory (its outputs would be "
+            "published as this attempt's results)"
+        )
+
+
 class Worker:
     """Glues everything together. One instance per worker process.
 
@@ -498,6 +529,13 @@ class Worker:
         must abort between uploads rather than streaming every remaining
         file to a task the user already cancelled.
 
+        Every attempt starts from a clean ``task_<id>`` workdir, so a task
+        re-queued after a mid-task kill never inherits the dead attempt's
+        staged inputs or outputs (see the removal below). That removal fails
+        closed: a leftover workdir that cannot be removed aborts the attempt
+        (reported as a failure) rather than letting it run — and publish —
+        on top of another attempt's files.
+
         A per-task watchdog (when ``timeout`` > 0) enforces a wall-clock
         deadline off the event loop. Terminal reporting goes through a single
         TerminalGuard so a timeout and a near-simultaneous normal completion
@@ -568,6 +606,26 @@ class Worker:
             # block below always calls progress.stop(), so a failure in
             # prepare_inputs still tears the heartbeat down cleanly.
             await progress.start_heartbeat()
+
+            # Each attempt starts from a clean workdir. The finally block
+            # below removes ``task_dir`` after every attempt, but a mid-task
+            # kill (OOM killer, SIGKILL, host reboot) never runs it and the
+            # container filesystem survives the restart — so when the backend
+            # re-queues the task and this worker claims it again, it computes
+            # the *same* ``task_<id>`` path and finds the dead attempt's tree
+            # still there. prepare_inputs would then stage this attempt's
+            # inputs alongside stale ``in/`` files, and upload_outputs
+            # publishes ``out/<filename>`` by name without checking who wrote
+            # it — so any output the retry's handler doesn't (re)write is
+            # published as the retry's fresh result from the dead attempt's
+            # bytes. Unlike the best-effort cleanup in ``finally``, this one
+            # fails closed (see _clear_workdir): if the leftover can't be
+            # removed we abort the attempt rather than run on top of it. Off
+            # the loop for the same reason as the ``finally`` cleanup, and
+            # after start_heartbeat so a GB-scale leftover delete doesn't
+            # stall the heartbeat into the stale-task sweeper's window. On a
+            # first attempt the dir doesn't exist and this is a no-op.
+            await asyncio.to_thread(_clear_workdir, task_dir)
 
             # Start the CancelGuard *before* prepare_inputs so a user cancel
             # during the (potentially multi-minute) input download is
