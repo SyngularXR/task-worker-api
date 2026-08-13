@@ -599,6 +599,153 @@ async def test_upload_file_sends_multipart_put(tmp_path):
     assert "multipart/form-data" in captured["content_type"]
 
 
+# -----------------------------------------------------------------------
+# upload_file cancel — a user cancel during a multi-GB output stream must
+# abort the in-flight PUT. upload_outputs only checked between batch files,
+# so a single-file output set (a lone colmap-splat PLY, a Neural-Canvas
+# splat) streamed to completion after the cancel. The upload-side
+# counterpart of the download_file cancel tests above.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_file_aborts_in_flight_put_when_cancel_set(tmp_path):
+    """A cancel that lands while the body is streaming must abort the PUT —
+    not deliver the file to a task the user already cancelled.
+
+    The handler parks (standing in for a multi-minute body upload) and only
+    records delivery afterwards, so streaming to completion (the pre-fix
+    behaviour) is distinguishable from aborting.
+    """
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"pretend-multi-GB-PLY")
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    delivered = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await asyncio.sleep(30)  # the body still streaming to the backend
+        delivered["n"] += 1
+        return httpx.Response(200)
+
+    async def cancel_once_in_flight() -> None:
+        # A CancelGuard poll observing the user's cancel, mid-upload.
+        await started.wait()
+        cancelled.set()
+
+    client = _client_with_handler(handler, max_retries=4)
+    poll = asyncio.create_task(cancel_once_in_flight())
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        # wait_for bounds the failure mode: an upload that ignores the event
+        # fails the test instead of parking CI on the 30s handler.
+        await asyncio.wait_for(
+            client.upload_file(9, "output.ply", src, cancelled=cancelled), 5,
+        )
+    await poll
+    await client.close()
+
+    assert delivered["n"] == 0, (
+        "upload must abort in flight, not stream the rest of a multi-GB file "
+        "to a task the user already cancelled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_file_cancel_does_not_consume_retry_budget(tmp_path):
+    """TaskCancelled must pass straight through ``_retry``.
+
+    If the cancel were treated as transient, the client would re-issue the
+    PUT up to ``max_retries`` times — re-sending the very file the fix
+    exists to stop sending.
+    """
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"x" * 64)
+
+    requests = {"n": 0}
+    cancelled = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        cancelled.set()
+        await asyncio.sleep(30)
+        return httpx.Response(200)  # pragma: no cover — cancelled first
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(TaskCancelled):
+        await asyncio.wait_for(
+            client.upload_file(9, "output.ply", src, cancelled=cancelled), 5,
+        )
+    await client.close()
+
+    assert requests["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_file_checks_cancel_before_request(tmp_path):
+    """An already-set event must abort before the PUT goes out at all —
+    a cancel detected between batch files shouldn't open the next upload."""
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"x")
+
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        requests["n"] += 1
+        return httpx.Response(200)
+
+    cancelled = asyncio.Event()
+    cancelled.set()
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled):
+        await client.upload_file(9, "output.ply", src, cancelled=cancelled)
+    await client.close()
+
+    assert requests["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_upload_file_unset_cancel_event_sends_full_body(tmp_path):
+    """Supplying an event that never fires must not perturb the upload —
+    pins the polarity of the check (an inverted test would abort here) and
+    proves the race hands back the real response, not a stand-in."""
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"result-bytes")
+
+    captured: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    await client.upload_file(
+        9, "output.ply", src, cancelled=asyncio.Event(),
+    )
+    await client.close()
+
+    assert b"result-bytes" in captured["body"]
+
+
+@pytest.mark.asyncio
+async def test_upload_file_cancel_still_raises_non_transient_status(tmp_path):
+    """A live-but-unset event must not swallow the response's own errors:
+    the raced request's result is still status-checked."""
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"x")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="backend down")
+
+    client = _client_with_handler(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.upload_file(
+            9, "output.ply", src, cancelled=asyncio.Event(),
+        )
+    await client.close()
+
+
 @pytest.mark.asyncio
 async def test_upload_file_raises_on_500(tmp_path):
     src = tmp_path / "output.stl"

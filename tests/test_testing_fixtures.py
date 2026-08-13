@@ -252,6 +252,39 @@ async def test_upload_file_captures_bytes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_upload_file_honours_cancel_event(tmp_path):
+    """The fake must mirror ``BackendClient.upload_file``'s cancel contract:
+    a set event raises TaskCancelled and captures nothing. Worker tests drive
+    cancels through the fake, so a fake that ignored the event would report
+    green while the real client aborts the PUT."""
+    import asyncio
+
+    from task_worker_api.errors import TaskCancelled
+
+    fake = FakeBackendClient()
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"result-bytes")
+    cancelled = asyncio.Event()
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled):
+        await fake.upload_file(1, "output.stl", src, cancelled=cancelled)
+    assert fake.uploaded_files == {}
+
+
+@pytest.mark.asyncio
+async def test_upload_file_unset_cancel_event_captures_bytes(tmp_path):
+    """An event that never fires must not perturb the upload."""
+    import asyncio
+
+    fake = FakeBackendClient()
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"result-bytes")
+    await fake.upload_file(1, "output.stl", src, cancelled=asyncio.Event())
+    assert fake.uploaded_files == {(1, "output.stl"): b"result-bytes"}
+
+
+@pytest.mark.asyncio
 async def test_upload_file_overwrites_on_resend(tmp_path):
     fake = FakeBackendClient()
     src = tmp_path / "output.stl"
