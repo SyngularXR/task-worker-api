@@ -683,6 +683,50 @@ async def test_upload_file_cancel_does_not_consume_retry_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_upload_file_drains_put_when_caller_is_cancelled(tmp_path):
+    """Worker shutdown: cancelling the *caller* must not leave the PUT running.
+
+    ``Task.cancel()`` only requests cancellation, so returning straight after
+    it would unwind ``upload_file`` — closing ``src`` and letting the caller
+    close the client — while the request was still to be resumed for its own
+    teardown. The handler's cleanup needs a loop turn (as a real connection
+    teardown does), so it has only run by the time ``upload_file`` finishes
+    if the cancel was actually awaited to completion.
+    """
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"pretend-multi-GB-PLY")
+
+    started = asyncio.Event()
+    torn_down = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await asyncio.sleep(30)  # the body still streaming to the backend
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)  # connection teardown, one loop turn
+            torn_down.set()
+            raise
+        return httpx.Response(200)  # pragma: no cover — cancelled first
+
+    client = _client_with_handler(handler)
+    upload = asyncio.create_task(
+        client.upload_file(9, "output.ply", src, cancelled=asyncio.Event()),
+    )
+    await started.wait()
+
+    upload.cancel()  # the worker shutting down mid-upload
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    assert torn_down.is_set(), (
+        "the in-flight PUT must be awaited to completion, not left running "
+        "detached after upload_file closed src and the worker moved on"
+    )
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_upload_file_checks_cancel_before_request(tmp_path):
     """An already-set event must abort before the PUT goes out at all —
     a cancel detected between batch files shouldn't open the next upload."""

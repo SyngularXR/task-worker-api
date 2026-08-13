@@ -19,7 +19,13 @@
   leaves the retry loop immediately without consuming retry budget (a retried
   cancel would re-send the same file). A request that has already completed
   wins the race, so a cancel arriving after delivery is not reported as an
-  aborted upload. The change is additive and backward-compatible: `cancelled`
+  aborted upload. Both the losing request and the event waiter are awaited to
+  completion before the race helper returns or raises — cancellation is only a
+  *request*, so a helper that returned straight after `cancel()` would leave
+  the PUT still reading `src` after `upload_file` closed it and tearing its
+  connection down after the client shut down. That applies equally when the
+  caller itself is cancelled (worker shutdown mid-upload). The change is
+  additive and backward-compatible: `cancelled`
   defaults to `None`, which reproduces the old behaviour exactly, and the
   positional signature is unchanged. Consumers need not migrate anything —
   `upload_outputs` only sends `cancelled=` to an `upload_file` that declares

@@ -191,6 +191,26 @@ def _backoff_delay(
     return delay
 
 
+async def _cancel_and_drain(task: "asyncio.Future") -> None:
+    """Cancel ``task`` and wait for it to actually stop.
+
+    ``cancel()`` only *requests* cancellation — it schedules a
+    ``CancelledError`` for the next time the loop resumes the task, so a
+    caller that moves on straight after cancelling leaves it running. For an
+    in-flight PUT that means the request can still be reading ``src`` after
+    ``upload_file`` closed it, or tearing its connection down after the
+    client shut down: exactly the detached background work the cancel was
+    supposed to stop. Whatever the task raises on the way out (the
+    ``CancelledError`` we asked for, or a transport error from the severed
+    connection) is discarded — it must not mask the reason we are unwinding.
+    """
+    task.cancel()
+    try:
+        await task
+    except BaseException:
+        pass
+
+
 async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str):
     """Await ``coro``, aborting it as soon as ``cancelled`` is set.
 
@@ -210,6 +230,11 @@ async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str
     If the *caller* is cancelled while waiting (worker shutdown), the
     in-flight request is cancelled too rather than left running detached
     with a file handle open.
+
+    Every exit drains both children to completion via
+    :func:`_cancel_and_drain` before returning or raising: cancellation is
+    cooperative, so merely requesting it would let the PUT run on past the
+    ``with open(src)`` block that ``upload_file`` is unwinding out of.
     """
     import asyncio
 
@@ -223,22 +248,18 @@ async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str
         # asyncio.wait does not cancel its futures when the awaiting task is
         # cancelled; without this the PUT would keep streaming after the
         # worker moved on.
-        request.cancel()
+        await _cancel_and_drain(request)
         raise
     finally:
-        waiter.cancel()
+        await _cancel_and_drain(waiter)
 
     if request.done():
         return request.result()
 
-    request.cancel()
-    try:
-        await request
-    except (asyncio.CancelledError, Exception):
-        # The upload was aborted on purpose; whatever it raises on the way
-        # out (CancelledError, or a transport error from the severed
-        # connection) must not mask the cancel the caller asked for.
-        pass
+    # The upload is aborted on purpose; wait for it to unwind so the
+    # connection is closed and the body has stopped reading src before
+    # upload_file's `with open(src)` closes the handle underneath it.
+    await _cancel_and_drain(request)
     raise TaskCancelled(message)
 
 
