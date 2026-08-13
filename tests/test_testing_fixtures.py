@@ -278,6 +278,39 @@ async def test_upload_file_scoped_per_task_and_filename(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_upload_file_honours_cancel_event(tmp_path):
+    """The fake must mirror ``BackendClient.upload_file``'s cancel
+    contract: a set event raises ``TaskCancelled`` and uploads nothing."""
+    import asyncio
+
+    from task_worker_api.errors import TaskCancelled
+
+    fake = FakeBackendClient()
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"result-bytes")
+
+    cancelled = asyncio.Event()
+    cancelled.set()
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await fake.upload_file(1, "output.stl", src, cancelled=cancelled)
+    assert fake.uploaded_files == {}, "cancel must prevent the upload"
+
+
+@pytest.mark.asyncio
+async def test_upload_file_unset_cancel_event_captures_bytes(tmp_path):
+    """An unset (but supplied) event must not interfere with the upload."""
+    import asyncio
+
+    fake = FakeBackendClient()
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"result-bytes")
+    await fake.upload_file(
+        1, "output.stl", src, cancelled=asyncio.Event(),
+    )
+    assert fake.uploaded_files == {(1, "output.stl"): b"result-bytes"}
+
+
+@pytest.mark.asyncio
 async def test_roundtrip_download_then_upload(tmp_path):
     """Exercises the full prepare_inputs→handler→upload_outputs remote path."""
     fake = FakeBackendClient()

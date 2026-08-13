@@ -733,6 +733,8 @@ class BackendClient:
 
     async def upload_file(
         self, task_id: int, filename: str, src: Path,
+        *,
+        cancelled: Optional["asyncio.Event"] = None,
     ) -> None:
         """PUT /tasks/{id}/files/{filename} — multipart upload.
 
@@ -750,15 +752,96 @@ class BackendClient:
         :meth:`BackendClient.__init__`) rather than the 30s general request
         timeout — uploading GB-scale outputs can take minutes, and the general
         timeout would spuriously abort large uploads mid-stream.
+
+        When ``cancelled`` is supplied (an ``asyncio.Event`` from a
+        ``CancelGuard`` active during output publishing), the event is
+        checked before the request goes out and the request is raced against
+        it: if the event fires while the upload is still streaming, the
+        in-flight request is aborted and :class:`TaskCancelled` is raised
+        instead of streaming the whole body to completion. Without the
+        mid-stream abort, a cancel arriving during a single-file output set
+        (a lone colmap-splat PLY, a Neural-Canvas splat) was invisible until
+        the entire multi-GB file finished uploading — ``upload_outputs``
+        only looked between batch files, so the worker kept pushing bytes to
+        a task the user had already cancelled. ``TaskCancelled`` is not a
+        transient error, so it propagates out of the retry loop immediately
+        without consuming retry budget (a retried cancel would re-stream the
+        same file). The wire shape is unchanged: the request is built
+        exactly as before (multipart with a known content length); aborting
+        only closes the in-flight connection, and httpx discards the broken
+        connection so the client stays usable for the next call.
         """
+        import asyncio
+
         path = f"/tasks/{task_id}/files/{filename}"
 
+        def _raise_if_cancelled() -> None:
+            if cancelled is not None and cancelled.is_set():
+                raise TaskCancelled(
+                    f"task {task_id} cancelled by user while uploading "
+                    f"{filename}"
+                )
+
         async def _upload_once() -> None:
+            _raise_if_cancelled()
             with open(src, "rb") as f:
                 files = {"file": (filename, f)}
-                resp = await self._client.request(
-                    "PUT", path, files=files, timeout=self._file_timeout,
+                if cancelled is None:
+                    # No cancel event — plain request, exactly as before.
+                    resp = await self._client.request(
+                        "PUT", path, files=files, timeout=self._file_timeout,
+                    )
+                    resp.raise_for_status()
+                    return
+                # Race the request against the cancel event. httpx streams
+                # the multipart body directly from the file handle, so there
+                # is no per-chunk callback where a mid-stream cancel could
+                # be observed; cancelling the request task instead aborts the
+                # in-flight write at the next socket await, closing the
+                # connection and unblocking the file handle via the ``with``.
+                request_task = asyncio.create_task(
+                    self._client.request(
+                        "PUT", path, files=files, timeout=self._file_timeout,
+                    )
                 )
-                resp.raise_for_status()
+                cancel_waiter = asyncio.create_task(cancelled.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {request_task, cancel_waiter},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except BaseException:
+                    # The attempt itself was cancelled (e.g. worker
+                    # shutdown): don't leak the two children.
+                    request_task.cancel()
+                    cancel_waiter.cancel()
+                    await asyncio.gather(
+                        request_task, cancel_waiter, return_exceptions=True,
+                    )
+                    raise
+                if request_task in done:
+                    # The upload finished first — the cancel event either
+                    # never fired or fired too late to matter.
+                    cancel_waiter.cancel()
+                    try:
+                        await cancel_waiter
+                    except asyncio.CancelledError:
+                        pass
+                    resp = request_task.result()
+                    resp.raise_for_status()
+                    return
+                # The cancel event fired while the request was streaming:
+                # abort the upload and surface the cancel. Not a transient
+                # error, so ``_retry`` re-raises it immediately without
+                # spending attempt budget.
+                request_task.cancel()
+                try:
+                    await request_task
+                except asyncio.CancelledError:
+                    pass
+                raise TaskCancelled(
+                    f"task {task_id} cancelled by user while uploading "
+                    f"{filename}"
+                )
 
         await self._retry(_upload_once, method="PUT", path=path)

@@ -248,6 +248,93 @@ async def test_remote_mode_no_warning_when_first_upload_fails(tmp_path, caplog):
     assert partial_warnings == []
 
 
+class _RecordingUploadClient(FakeBackendClient):
+    """Fake whose ``upload_file`` records whether it received ``cancelled``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_cancel_events: list = []
+
+    async def upload_file(
+        self, task_id: int, filename: str, src: Path,
+        *,
+        cancelled: "Optional[asyncio.Event]" = None,
+    ) -> None:
+        self.seen_cancel_events.append(cancelled)
+        await super().upload_file(task_id, filename, src, cancelled=cancelled)
+
+
+@pytest.mark.asyncio
+async def test_remote_mode_forwards_cancel_event_to_upload_file(tmp_path):
+    """The guard's ``cancelled`` event must reach ``upload_file`` so a
+    cancel can abort a GB-scale upload mid-stream — not just between batch
+    files. A client that declares the keyword receives it; the existing
+    between-files check stays as the first line of defence."""
+    import asyncio
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    (out_dir / "b.stl").write_bytes(b"bbb")
+
+    task = _claimed(23, params={"input_files": {"mesh": "in.ply"}})
+    file_ctx = _file_ctx(out_dir)
+    client = _RecordingUploadClient()
+    cancelled = asyncio.Event()
+
+    manifest = await upload_outputs(
+        task, client, file_ctx,
+        output_files={"a": "a.stl", "b": "b.stl"},
+        shared_volume_path=None,
+        cancelled=cancelled,
+    )
+
+    assert manifest == {"a": "a.stl", "b": "b.stl"}
+    assert client.seen_cancel_events == [cancelled, cancelled], (
+        "upload_file must receive the guard's cancel event on every upload"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_mode_legacy_client_without_cancel_kwarg_still_works(
+    tmp_path, caplog,
+):
+    """A duck-typed client whose ``upload_file`` predates the ``cancelled``
+    keyword must not raise ``TypeError`` when the worker passes a live
+    cancel event — the kwarg is only sent to clients that declare it."""
+    import asyncio
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    task = _claimed(24, params={"input_files": {"mesh": "in.ply"}})
+    file_ctx = _file_ctx(out_dir)
+
+    class _LegacyUploadClient(FakeBackendClient):
+        async def upload_file(self, task_id: int, filename: str, src: Path) -> None:
+            self.uploaded_files[(task_id, filename)] = src.read_bytes()
+
+    client = _LegacyUploadClient()
+    with caplog.at_level("WARNING"):
+        manifest = await upload_outputs(
+            task, client, file_ctx,
+            output_files={"a": "a.stl"},
+            shared_volume_path=None,
+            cancelled=asyncio.Event(),
+        )
+
+    assert manifest == {"a": "a.stl"}
+    assert client.uploaded_files == {(24, "a.stl"): b"aaa"}
+    # One WARNING per process naming the legacy client.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "no 'cancelled' parameter" in r.getMessage()
+        and "output upload" in r.getMessage()
+        for r in warnings
+    )
+
+
 @pytest.mark.asyncio
 async def test_remote_mode_succeeds_without_warning(tmp_path, caplog):
     """A clean multi-file remote publish must not log any partial-upload

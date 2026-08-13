@@ -503,17 +503,22 @@ missing-input bugs surface the same way they would in production.
 `download_file` also takes an optional keyword-only `cancelled` event
 (the SDK passes the `CancelGuard`'s event through `prepare_inputs`) and
 raises `TaskCancelled` when it is set, mirroring the real client's
-abort-at-the-next-chunk behaviour.
+abort-at-the-next-chunk behaviour. `upload_file` gained the same
+keyword: `upload_outputs` forwards the guard's event, and a cancel that
+fires mid-upload aborts the in-flight request instead of streaming the
+whole file (GB-scale outputs) to a task the user already cancelled.
 
 Nothing to migrate: `prepare_inputs` checks whether the client's
 `download_file` declares `cancelled` (or takes `**kwargs`) and only
-passes it if so, so an existing client, test double, or
+passes it if so — and `upload_outputs` does the same for
+`upload_file` — so an existing client, test double, or
 `FakeBackendClient` subclass written against the old
-`download_file(task_id, filename, dest)` signature keeps working
+`download_file(task_id, filename, dest)` / `upload_file(task_id,
+filename, src)` signatures keeps working
 unchanged — it just keeps the between-files-only cancellation it always
 had, and the SDK logs one WARNING naming the override. Adding
-`*, cancelled: Optional[asyncio.Event] = None` to your override (and
-forwarding it) is what buys the mid-download abort.
+`*, cancelled: Optional[asyncio.Event] = None` to your overrides (and
+forwarding them) is what buys the mid-download/mid-upload abort.
 
 For integration testing against a real backend, `task-worker-api`'s
 own repo has a docker-compose fixture at `tests/integration/` you

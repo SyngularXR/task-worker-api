@@ -256,32 +256,35 @@ async def _copyfile_async(
 
 
 #: One WARNING per process when a client predating the ``cancelled`` keyword
-#: is used with a live cancel event — the condition is per-download, and a
-#: line per file of a multi-file input set would be noise.
-_warned_legacy_download_file = False
+#: is used with a live cancel event — the condition is per-transfer, and a
+#: line per file of a multi-file batch would be noise.
+_warned_legacy_cancel_kwarg = False
 
 
-def _download_cancel_kwarg(
-    download_file: Any, cancelled: Optional[asyncio.Event],
+def _cancel_kwarg(
+    fn: Any, cancelled: Optional[asyncio.Event], *, transfer: str,
 ) -> dict:
-    """``{"cancelled": event}`` if ``download_file`` takes it, else ``{}``.
+    """``{"cancelled": event}`` if ``fn`` takes it, else ``{}``.
 
-    ``cancelled=`` was added to :meth:`BackendClient.download_file` after
-    worker repos had already grown their own clients, test doubles and
-    ``FakeBackendClient`` subclasses against the three-positional-argument
-    signature (``Worker(client=...)`` takes any duck-typed client). Passing
-    the keyword unconditionally would raise ``TypeError`` on every one of
-    them the moment a cancel guard is active — which is always, since the
-    worker starts one before staging inputs. So the keyword only goes to
-    callees that declare it (or accept ``**kwargs``); older ones keep the
-    pre-existing behaviour, where a cancel is noticed between files rather
-    than mid-stream.
+    ``cancelled=`` was added to :meth:`BackendClient.download_file` and
+    :meth:`BackendClient.upload_file` after worker repos had already grown
+    their own clients, test doubles and ``FakeBackendClient`` subclasses
+    against the pre-existing positional signatures (``Worker(client=...)``
+    takes any duck-typed client). Passing the keyword unconditionally would
+    raise ``TypeError`` on every one of them the moment a cancel guard is
+    active — which is always, since the worker starts one before staging
+    inputs. So the keyword only goes to callees that declare it (or accept
+    ``**kwargs``); older ones keep the pre-existing behaviour, where a
+    cancel is noticed between files rather than mid-stream.
+
+    ``transfer`` names the operation ("remote input download" / "output
+    upload") in the one-time warning.
     """
-    global _warned_legacy_download_file
+    global _warned_legacy_cancel_kwarg
     if cancelled is None:
         return {}
     try:
-        params = inspect.signature(download_file).parameters
+        params = inspect.signature(fn).parameters
     except (TypeError, ValueError):  # pragma: no cover — unintrospectable
         # Can't tell; assume the current signature rather than silently
         # dropping cancellation for a client that does support it.
@@ -290,14 +293,14 @@ def _download_cancel_kwarg(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
     ):
         return {"cancelled": cancelled}
-    if not _warned_legacy_download_file:
-        _warned_legacy_download_file = True
+    if not _warned_legacy_cancel_kwarg:
+        _warned_legacy_cancel_kwarg = True
         log.warning(
-            "%s has no 'cancelled' parameter; a user cancel during a remote "
-            "input download will not be noticed until the file finishes "
-            "streaming. Add 'cancelled: Optional[asyncio.Event] = None' as a "
+            "%s has no 'cancelled' parameter; a user cancel during a %s "
+            "will not be noticed until the file finishes streaming. "
+            "Add 'cancelled: Optional[asyncio.Event] = None' as a "
             "keyword-only parameter and forward it to abort mid-stream.",
-            getattr(download_file, "__qualname__", download_file),
+            getattr(fn, "__qualname__", fn), transfer,
         )
     return {}
 
@@ -375,7 +378,10 @@ async def prepare_inputs(
             dest = in_dir / filename
             await client.download_file(
                 task.id, filename, dest,
-                **_download_cancel_kwarg(client.download_file, cancelled),
+                **_cancel_kwarg(
+                    client.download_file, cancelled,
+                    transfer="remote input download",
+                ),
             )
             paths[key] = dest
         primary_key = "mesh" if "mesh" in paths else next(iter(paths))
@@ -419,7 +425,12 @@ async def upload_outputs(
     to finish streaming to a task the user already cancelled. The check
     runs between files, raising ``TaskCancelled`` before the next upload
     starts — mirroring the cancel-during-download guard in
-    :func:`prepare_inputs`. Local-mode staging copies go through
+    :func:`prepare_inputs`. The event is also handed to ``upload_file``
+    (when the client declares the ``cancelled`` keyword), which aborts a
+    cancel mid-stream too: a single-file output set — a lone colmap-splat
+    PLY, a Neural-Canvas splat — has no between-files boundary, so without
+    the in-stream abort the whole multi-GB body would stream to completion
+    after the cancel. Local-mode staging copies go through
     :func:`_copyfile_async`, so the event is also checked *within* a file:
     a cancel aborts mid-copy instead of waiting out a multi-GB write.
 
@@ -461,7 +472,13 @@ async def upload_outputs(
                     raise TaskCancelled(
                         f"task {task.id} cancelled by user during output upload"
                     )
-                await client.upload_file(task.id, filename, src)
+                await client.upload_file(
+                    task.id, filename, src,
+                    **_cancel_kwarg(
+                        client.upload_file, cancelled,
+                        transfer="output upload",
+                    ),
+                )
                 uploaded.append(filename)
         except Exception:
             if uploaded:

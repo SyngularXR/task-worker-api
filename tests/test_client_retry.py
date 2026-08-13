@@ -614,6 +614,106 @@ async def test_upload_file_raises_on_500(tmp_path):
 
 
 # -----------------------------------------------------------------------
+# upload_file cancel — a user cancel mid-upload must abort the stream
+# instead of pushing a GB-scale output to completion. Mirrors the
+# download_file cancel contract: TaskCancelled, no retry budget spent,
+# no request issued for an already-set event.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_file_aborts_mid_stream_when_cancel_set(tmp_path):
+    """A cancel that lands while the upload is in flight must abort the
+    request and raise TaskCancelled — not stream the body to completion.
+
+    The handler sleeps after the request arrives, so the cancel event
+    fires strictly mid-stream; aborting (the pre-fix behaviour was to
+    wait out the whole upload) is observable as the handler being
+    cancelled before it can return a response.
+    """
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"x" * 4096)
+
+    started = asyncio.Event()
+    aborted = {"n": 0}
+    cancelled = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            aborted["n"] += 1
+            raise
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    upload_task = asyncio.create_task(
+        client.upload_file(9, "output.stl", src, cancelled=cancelled)
+    )
+    await started.wait()
+    cancelled.set()
+    with pytest.raises(TaskCancelled, match="cancelled by user"):
+        await upload_task
+    await client.close()
+
+    # The in-flight request was aborted, not allowed to finish streaming.
+    assert aborted["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_file_cancel_does_not_consume_retry_budget(tmp_path):
+    """TaskCancelled must pass straight through ``_retry``.
+
+    If the cancel were treated as transient, the client would re-issue the
+    PUT up to ``max_retries`` times — re-streaming the very file the fix
+    exists to stop streaming.
+    """
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"x" * 4096)
+    requests = {"n": 0}
+    cancelled = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        cancelled.set()
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(TaskCancelled):
+        await client.upload_file(9, "output.stl", src, cancelled=cancelled)
+    await client.close()
+
+    assert requests["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_file_checks_cancel_before_request(tmp_path):
+    """An already-set event must abort before the PUT goes out at all —
+    a cancel detected between batch files shouldn't open the next stream."""
+    src = tmp_path / "output.stl"
+    src.write_bytes(b"x" * 4096)
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        requests["n"] += 1
+        return httpx.Response(200)
+
+    cancelled = asyncio.Event()
+    cancelled.set()
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled):
+        await client.upload_file(9, "output.stl", src, cancelled=cancelled)
+    await client.close()
+
+    assert requests["n"] == 0
+
+
+# -----------------------------------------------------------------------
 # upload_file retry — the file handle must be re-opened on each attempt.
 # Before the fix, open() was called once *outside* the retry loop; httpx
 # consumed the handle to EOF on the first attempt, so every retry sent

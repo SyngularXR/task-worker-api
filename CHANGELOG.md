@@ -3,6 +3,33 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient.upload_file` now accepts an optional keyword-only
+  `cancelled` event and checks it before issuing the request; when the
+  event fires while the multipart body is still streaming, the in-flight
+  request is aborted and `TaskCancelled` is raised instead of streaming
+  the whole file to completion. `upload_outputs` passes the
+  `CancelGuard`'s event through, so a cancel is now visible *during* a
+  remote output upload instead of only between batch files. Previously
+  the between-files check was the only cancel point in the remote
+  publish path: a single-file output set — a lone colmap-splat PLY, a
+  Neural-Canvas splat — has no such boundary, so a user cancel that
+  arrived mid-upload pushed the entire multi-GB body to a task the user
+  had already cancelled, burning minutes of bandwidth and stalling the
+  worker's shutdown. `TaskCancelled` is not a transient error, so it
+  leaves the retry loop immediately without consuming retry budget (a
+  retried cancel would re-stream the same file). The change is additive
+  and backward-compatible: `cancelled` defaults to `None`, which
+  reproduces the old behaviour exactly, and the positional signature is
+  unchanged. As with `download_file`, `upload_outputs` only sends
+  `cancelled=` to an `upload_file` that declares it (or accepts
+  `**kwargs`), so a client, test double, or `FakeBackendClient`
+  subclass still written against `upload_file(task_id, filename, src)`
+  keeps working instead of raising `TypeError` — such a client keeps
+  the between-files-only cancellation it always had, and the SDK logs
+  one WARNING per process naming the override.
+  `FakeBackendClient.upload_file` mirrors the new keyword and raises
+  `TaskCancelled` on a set event so the test double stays a faithful
+  drop-in.
 - `prepare_inputs` and `upload_outputs` now reject any `input_files` /
   `output_files` name that is not a plain basename. Both joined the
   caller-supplied name straight into a per-task sandbox directory

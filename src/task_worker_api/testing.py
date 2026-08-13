@@ -153,13 +153,29 @@ class FakeBackendClient:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(self._files[key])
 
-    async def upload_file(self, task_id: int, filename: str, src: Path) -> None:
+    async def upload_file(
+        self, task_id: int, filename: str, src: Path,
+        *,
+        cancelled: "Optional[asyncio.Event]" = None,
+    ) -> None:
         """Capture an uploaded artifact in :attr:`uploaded_files`.
 
         Reads the source file bytes (as the real backend would receive
         them) and stores them keyed by (task_id, filename) so test suites
         can assert on produced outputs without a live HTTP endpoint.
+
+        A set ``cancelled`` event raises ``TaskCancelled`` and uploads
+        nothing, mirroring ``BackendClient.upload_file``, which checks the
+        event before the request and aborts the request if it fires
+        mid-stream. The fake has no stream to interleave, so the pre-request
+        check is the whole contract here — enough for worker-level tests to
+        see a mid-publish cancel abort the upload rather than land a file on
+        the backend.
         """
+        if cancelled is not None and cancelled.is_set():
+            raise TaskCancelled(
+                f"task {task_id} cancelled by user while uploading {filename}"
+            )
         self.uploaded_files[(task_id, filename)] = src.read_bytes()
 
     async def close(self) -> None:
