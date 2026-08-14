@@ -7,7 +7,11 @@
   `cancelled` event: it is checked before the PUT goes out, and the in-flight
   request is raced against it so a cancel arriving mid-upload aborts the
   request and raises `TaskCancelled` instead of streaming the rest of the
-  body. `upload_outputs` passes the `CancelGuard`'s event through, so a
+  body. The cancel race covers the complete transfer retry loop, so it also
+  interrupts retry backoff instead of waiting for the next attempt.
+  Cancellation stops the client transport; it cannot retract a file the
+  backend finished committing before the connection was severed.
+  `upload_outputs` passes the `CancelGuard`'s event through, so a
   cancel is now visible *during* a remote output upload instead of only
   between batch files. Previously the between-files check was the only cancel
   point in the remote publish path: a single-file output set — a lone

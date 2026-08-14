@@ -214,22 +214,20 @@ async def _cancel_and_drain(task: "asyncio.Future") -> None:
 async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str):
     """Await ``coro``, aborting it as soon as ``cancelled`` is set.
 
-    Used by :meth:`BackendClient.upload_file`. A download can be checked at
-    every chunk *it* writes, but the body of an upload is streamed out by
-    httpx from inside one ``await`` — there is no boundary in this coroutine
-    to check an event at. So the request runs as a task and races the event:
-    whichever finishes first wins, and if the event wins the in-flight
-    request is cancelled (closing the connection mid-body) and
-    :class:`TaskCancelled` is raised with ``message``.
+    Used around each file transfer's complete retry loop, so cancellation
+    interrupts both an in-flight request and any retry backoff. The operation
+    runs as a task and races the event: whichever finishes first wins, and if
+    the event wins the operation is cancelled and :class:`TaskCancelled` is
+    raised with ``message``.
 
-    A request that has already completed wins the tie, matching the
+    An operation that has already completed wins the tie, matching the
     last-chunk-wins behaviour of ``download_file`` and ``_copyfile_async``:
     the bytes are on the backend either way, so reporting a cancel that
     arrived after delivery would be a lie about what happened.
 
     If the *caller* is cancelled while waiting (worker shutdown), the
-    in-flight request is cancelled too rather than left running detached
-    with a file handle open.
+    operation is cancelled too rather than left running detached with a file
+    handle open.
 
     Every exit drains both children to completion via
     :func:`_cancel_and_drain` before returning or raising: cancellation is
@@ -771,13 +769,13 @@ class BackendClient:
         same path as any other failure.
         """
         path = f"/tasks/{task_id}/files/{filename}"
+        cancel_message = (
+            f"task {task_id} cancelled by user while downloading {filename}"
+        )
 
         def _raise_if_cancelled() -> None:
             if cancelled is not None and cancelled.is_set():
-                raise TaskCancelled(
-                    f"task {task_id} cancelled by user while downloading "
-                    f"{filename}"
-                )
+                raise TaskCancelled(cancel_message)
 
         async def _stream_once() -> None:
             _raise_if_cancelled()
@@ -790,8 +788,14 @@ class BackendClient:
                         _raise_if_cancelled()
                         f.write(chunk)
 
+        operation = self._retry(_stream_once, method="GET", path=path)
         try:
-            await self._retry(_stream_once, method="GET", path=path)
+            if cancelled is None:
+                await operation
+            else:
+                await _await_unless_cancelled(
+                    operation, cancelled, cancel_message,
+                )
         except Exception:
             # A mid-stream transport failure can leave a partial file at dest
             # (each retry truncates via "wb", but the final failed attempt's
@@ -837,6 +841,8 @@ class BackendClient:
         had already cancelled. ``TaskCancelled`` is not a transient error, so
         it propagates out of the retry loop immediately without consuming
         retry budget — a retried cancel would just re-send the same file.
+        This stops the client transport; it cannot retract a file the backend
+        finished committing before the connection was severed.
         """
         path = f"/tasks/{task_id}/files/{filename}"
         cancel_message = (
@@ -848,15 +854,15 @@ class BackendClient:
                 raise TaskCancelled(cancel_message)
             with open(src, "rb") as f:
                 files = {"file": (filename, f)}
-                request = self._client.request(
+                resp = await self._client.request(
                     "PUT", path, files=files, timeout=self._file_timeout,
                 )
-                if cancelled is None:
-                    resp = await request
-                else:
-                    resp = await _await_unless_cancelled(
-                        request, cancelled, cancel_message,
-                    )
                 resp.raise_for_status()
 
-        await self._retry(_upload_once, method="PUT", path=path)
+        operation = self._retry(_upload_once, method="PUT", path=path)
+        if cancelled is None:
+            await operation
+        else:
+            await _await_unless_cancelled(
+                operation, cancelled, cancel_message,
+            )

@@ -683,6 +683,51 @@ async def test_upload_file_cancel_does_not_consume_retry_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["download", "upload"])
+async def test_file_transfer_cancel_interrupts_retry_backoff(
+    monkeypatch, tmp_path, direction,
+):
+    """A cancel must interrupt retry backoff, not wait for its delay."""
+    sleeping = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_sleep(delay):
+        sleeping.set()
+        await release.wait()
+
+    monkeypatch.setattr(asyncio, "sleep", blocked_sleep)
+
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(503)
+
+    client = _client_with_handler(handler, max_retries=4)
+    cancelled = asyncio.Event()
+    if direction == "download":
+        operation = client.download_file(
+            9, "file.ply", tmp_path / "file.ply", cancelled=cancelled,
+        )
+    else:
+        src = tmp_path / "file.ply"
+        src.write_bytes(b"output")
+        operation = client.upload_file(
+            9, "file.ply", src, cancelled=cancelled,
+        )
+
+    transfer = asyncio.create_task(operation)
+    await asyncio.wait_for(sleeping.wait(), 1)
+    cancelled.set()
+
+    with pytest.raises(TaskCancelled):
+        await asyncio.wait_for(transfer, 1)
+    await client.close()
+
+    assert requests["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_upload_file_drains_put_when_caller_is_cancelled(tmp_path):
     """Worker shutdown: cancelling the *caller* must not leave the PUT running.
 
