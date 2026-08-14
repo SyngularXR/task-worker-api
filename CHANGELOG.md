@@ -3,6 +3,46 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient.upload_file` now accepts an optional keyword-only
+  `cancelled` event: it is checked before the PUT goes out, and the in-flight
+  request is raced against it so a cancel arriving mid-upload aborts the
+  request and raises `TaskCancelled` instead of streaming the rest of the
+  body. The cancel race covers the complete transfer retry loop, so it also
+  interrupts retry backoff instead of waiting for the next attempt.
+  Cancellation stops the client transport; it cannot retract a file the
+  backend finished committing before the connection was severed.
+  `upload_outputs` passes the `CancelGuard`'s event through, so a
+  cancel is now visible *during* a remote output upload instead of only
+  between batch files. Previously the between-files check was the only cancel
+  point in the remote publish path: a single-file output set — a lone
+  colmap-splat PLY, a Neural-Canvas splat — has no such boundary, so a user
+  cancel that arrived mid-upload streamed the whole multi-GB file to the
+  backend before the worker noticed, burning minutes of upload bandwidth on a
+  task nobody wanted. This is the upload-side counterpart of the
+  `download_file` fix below. `TaskCancelled` is not a transient error, so it
+  leaves the retry loop immediately without consuming retry budget (a retried
+  cancel would re-send the same file). A request that has already completed
+  wins the race, so a cancel arriving after delivery is not reported as an
+  aborted upload. Both the losing request and the event waiter are awaited to
+  completion before the race helper returns or raises — cancellation is only a
+  *request*, so a helper that returned straight after `cancel()` would leave
+  the PUT still reading `src` after `upload_file` closed it and tearing its
+  connection down after the client shut down. That applies equally when the
+  caller itself is cancelled (worker shutdown mid-upload). The change is
+  additive and backward-compatible: `cancelled`
+  defaults to `None`, which reproduces the old behaviour exactly, and the
+  positional signature is unchanged. Consumers need not migrate anything —
+  `upload_outputs` only sends `cancelled=` to an `upload_file` that declares
+  it (or accepts `**kwargs`), so a client, test double, or
+  `FakeBackendClient` subclass still written against
+  `upload_file(task_id, filename, src)` keeps working instead of raising
+  `TypeError` the moment a cancel guard is active (which is always — the
+  worker keeps one running through output publishing, and `Worker(client=...)`
+  accepts any duck-typed client). Such a client keeps the between-files-only
+  cancellation it always had, and the SDK logs one WARNING per process per
+  transfer direction naming the override. `FakeBackendClient.upload_file`
+  mirrors the new keyword and raises `TaskCancelled` on a set event so the
+  test double stays a faithful drop-in.
 - `prepare_inputs` and `upload_outputs` now reject any `input_files` /
   `output_files` name that is not a plain basename. Both joined the
   caller-supplied name straight into a per-task sandbox directory

@@ -699,6 +699,154 @@ async def test_upload_outputs_no_cancel_event_uploads_all(tmp_path):
     assert (54, "b.stl") in client.uploaded_files
 
 
+@pytest.mark.asyncio
+async def test_upload_outputs_aborts_mid_file_on_single_output(tmp_path):
+    """A single-file output set has no between-files boundary, so the only
+    way a cancel can land during the upload is if the event reaches
+    ``upload_file``. Before that threading, a lone GB-scale output
+    (colmap-splat PLY, Neural-Canvas splat) streamed to completion after the
+    user cancelled and upload_outputs returned a manifest as if nothing had
+    happened."""
+    import asyncio
+    from task_worker_api.errors import TaskCancelled
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "solo.ply").write_bytes(b"pretend-multi-GB-PLY")
+
+    class _CancelDuringSoloUpload(FakeBackendClient):
+        """Sets the cancel event *during* the upload — what a CancelGuard
+        poll firing mid-stream looks like — then delegates to the fake's
+        upload_file, which honours the event as the real client does."""
+        def __init__(self, event: asyncio.Event) -> None:
+            super().__init__()
+            self._event = event
+
+        async def upload_file(self, task_id, filename, src, *, cancelled=None):
+            self._event.set()
+            await super().upload_file(
+                task_id, filename, src, cancelled=cancelled,
+            )
+
+    cancelled = asyncio.Event()
+    client = _CancelDuringSoloUpload(cancelled)
+    task = _claimed(55, params={"input_files": {"mesh": "in.ply"}})
+
+    with pytest.raises(TaskCancelled):
+        await upload_outputs(
+            task, client, _file_ctx(out_dir),
+            output_files={"mesh": "solo.ply"},
+            shared_volume_path=None,
+            cancelled=cancelled,
+        )
+
+    assert (55, "solo.ply") not in client.uploaded_files
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_passes_cancel_event_to_upload_file(tmp_path):
+    """The guard's own event object must be handed to ``upload_file`` —
+    a copy or a fresh event would never see the guard set the original."""
+    import asyncio
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    class _RecordingClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list = []
+
+        async def upload_file(self, task_id, filename, src, *, cancelled=None):
+            self.seen.append(cancelled)
+            await super().upload_file(
+                task_id, filename, src, cancelled=cancelled,
+            )
+
+    client = _RecordingClient()
+    task = _claimed(56, params={"input_files": {"mesh": "in.ply"}})
+    cancelled = asyncio.Event()
+
+    await upload_outputs(
+        task, client, _file_ctx(out_dir),
+        output_files={"a": "a.stl"},
+        shared_volume_path=None,
+        cancelled=cancelled,
+    )
+
+    assert client.seen == [cancelled]
+    assert client.seen[0] is cancelled
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_accepts_legacy_upload_file_signature(tmp_path):
+    """A client written against the pre-``cancelled`` signature must keep
+    working, cancel guard and all.
+
+    Worker repos pass their own clients and test doubles to
+    ``Worker(client=...)``, and the worker keeps a CancelGuard running over
+    ``upload_outputs`` — so sending ``cancelled=`` unconditionally would
+    TypeError on every consumer that hasn't updated its override yet."""
+    import asyncio
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    class _LegacyClient(FakeBackendClient):
+        """Three positional args, no ``cancelled`` — the SDK's own signature
+        before this feature, and what sibling repos still implement."""
+        async def upload_file(self, task_id, filename, src):
+            await FakeBackendClient.upload_file(self, task_id, filename, src)
+
+    client = _LegacyClient()
+    task = _claimed(57, params={"input_files": {"mesh": "in.ply"}})
+
+    manifest = await upload_outputs(
+        task, client, _file_ctx(out_dir),
+        output_files={"a": "a.stl"},
+        shared_volume_path=None,
+        cancelled=asyncio.Event(),
+    )
+
+    assert manifest == {"a": "a.stl"}
+    assert client.uploaded_files[(57, "a.stl")] == b"aaa"
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_passes_cancel_to_kwargs_only_override(tmp_path):
+    """A ``**kwargs`` passthrough override (a common test-double shape) must
+    still receive the event — it can forward it to the real client."""
+    import asyncio
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    class _KwargsClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list = []
+
+        async def upload_file(self, *args, **kwargs):
+            self.seen.append(kwargs.get("cancelled"))
+            await FakeBackendClient.upload_file(self, *args, **kwargs)
+
+    client = _KwargsClient()
+    task = _claimed(58, params={"input_files": {"mesh": "in.ply"}})
+    cancelled = asyncio.Event()
+
+    await upload_outputs(
+        task, client, _file_ctx(out_dir),
+        output_files={"a": "a.stl"},
+        shared_volume_path=None,
+        cancelled=cancelled,
+    )
+
+    assert client.seen == [cancelled]
+
+
 # ---------------------------------------------------------------------------#
 # Local-mode copies are chunked and cancellable *mid-file*.
 #

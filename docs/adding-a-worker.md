@@ -500,20 +500,22 @@ async def test_remote_mode_happy_path(tmp_path):
 `FileNotFoundError` (the in-memory analogue of a backend 404), so
 missing-input bugs surface the same way they would in production.
 
-`download_file` also takes an optional keyword-only `cancelled` event
-(the SDK passes the `CancelGuard`'s event through `prepare_inputs`) and
-raises `TaskCancelled` when it is set, mirroring the real client's
-abort-at-the-next-chunk behaviour.
+`download_file` and `upload_file` also take an optional keyword-only
+`cancelled` event (the SDK passes the `CancelGuard`'s event through
+`prepare_inputs` and `upload_outputs`) and raise `TaskCancelled` when it
+is set, mirroring the real client — which aborts a download at the next
+chunk boundary and aborts an upload by cancelling the in-flight PUT.
 
-Nothing to migrate: `prepare_inputs` checks whether the client's
-`download_file` declares `cancelled` (or takes `**kwargs`) and only
-passes it if so, so an existing client, test double, or
+Nothing to migrate: `prepare_inputs` / `upload_outputs` check whether the
+client's `download_file` / `upload_file` declares `cancelled` (or takes
+`**kwargs`) and only pass it if so, so an existing client, test double, or
 `FakeBackendClient` subclass written against the old
-`download_file(task_id, filename, dest)` signature keeps working
+`download_file(task_id, filename, dest)` /
+`upload_file(task_id, filename, src)` signature keeps working
 unchanged — it just keeps the between-files-only cancellation it always
-had, and the SDK logs one WARNING naming the override. Adding
-`*, cancelled: Optional[asyncio.Event] = None` to your override (and
-forwarding it) is what buys the mid-download abort.
+had, and the SDK logs one WARNING per direction naming the override.
+Adding `*, cancelled: Optional[asyncio.Event] = None` to your override
+(and forwarding it) is what buys the mid-file abort.
 
 For integration testing against a real backend, `task-worker-api`'s
 own repo has a docker-compose fixture at `tests/integration/` you
