@@ -3,6 +3,32 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient` (and `Worker`, which forwards it) takes a new optional
+  `retry_total_max_s` — a total wall-clock budget, default 600s, for the time
+  one call may spend *sleeping* between retry attempts. `None` restores the
+  legacy unbounded behaviour. The existing caps bound each delay in
+  isolation, but they multiply against the attempt budget, and a `Retry-After`
+  delay is honoured in full by design (bounded only by its own six-hour
+  remote-input ceiling, never shortened by `retry_backoff_max_s`). So a
+  persistently rate-limited backend could hold a single terminal
+  `complete`/`fail` report — which floors its attempt budget at 6 — for up to
+  6 × 6h = 36h. A worker runs one task at a time, so that one call blocks the
+  entire polling loop for the duration: no new claims, no cancel polls, no
+  response to shutdown, and nothing in the logs to explain it. `_retry` now
+  accumulates the time it has slept across attempts and, when the next
+  required delay would not fit in what remains of the budget, stops and
+  re-raises the last error rather than sleeping on and then firing a
+  near-certainly-futile request inside the rate-limit window. The outcome for
+  the caller is identical to exhausting the attempt budget — for a terminal
+  report the task is re-queued by the backend's sweeper exactly as any
+  retries-exhausted report is today — and the worker gets back to polling.
+  Early exhaustion logs one WARNING naming the elapsed backoff, the delay
+  that didn't fit, and the budget, so an operator can tell this apart from a
+  backend that is actually down. A delay landing exactly on the budget still
+  fits. The knob is validated like `retry_backoff_max_s` (`> 0`, or `None`),
+  and the change is additive and backward-compatible: schedules that fit the
+  budget — including every default-configured path, which sleeps ~14s total —
+  are byte-for-byte unchanged.
 - `BackendClient.upload_file` now accepts an optional keyword-only
   `cancelled` event: it is checked before the PUT goes out, and the in-flight
   request is raced against it so a cancel arriving mid-upload aborts the

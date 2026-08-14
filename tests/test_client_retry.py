@@ -29,12 +29,16 @@ from task_worker_api.errors import TaskCancelled
 # Helpers
 # ---------------------------------------------------------------------------
 
+_KEEP_SDK_DEFAULT = object()
+
+
 def _client_with_handler(
     handler,
     *,
     max_retries: int = 4,
     retry_backoff_s: float = 0.0,
     retry_backoff_max_s: float | None = None,
+    retry_total_max_s=_KEEP_SDK_DEFAULT,
     retry_jitter: bool = False,
 ) -> BackendClient:
     """Build a real BackendClient backed by a MockTransport handler.
@@ -43,6 +47,11 @@ def _client_with_handler(
     instant — the timing is verified separately via a mocked ``asyncio.sleep``.
     Jitter defaults to False so timing-assertion tests stay deterministic; the
     jitter behaviour itself is covered by dedicated _backoff_delay unit tests.
+
+    ``retry_total_max_s`` keeps the SDK default (600s total sleep budget)
+    unless a test passes one explicitly — including ``None``, which restores
+    the legacy unbounded behaviour for tests that exercise multi-hour
+    per-attempt delays.
     """
     transport = httpx.MockTransport(handler)
     http = httpx.AsyncClient(
@@ -58,6 +67,8 @@ def _client_with_handler(
     # Keep the SDK default (60s cap) unless a test explicitly overrides it.
     if retry_backoff_max_s is not None:
         kwargs["retry_backoff_max_s"] = retry_backoff_max_s
+    if retry_total_max_s is not _KEEP_SDK_DEFAULT:
+        kwargs["retry_total_max_s"] = retry_total_max_s
     return BackendClient(
         "http://fake/api/v1",
         "x",
@@ -2498,8 +2509,12 @@ async def test_retry_after_is_not_shortened_by_backoff_ceiling(monkeypatch):
             )
         return httpx.Response(200)
 
+    # Budget off: this test is about the per-delay ceilings. Whether an
+    # hour-long delay fits the *total* budget is a separate contract, covered
+    # by the retry_total_max_s tests below.
     client = _client_with_handler(
         handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
+        retry_total_max_s=None,
     )
     await client.complete(7, {"output": "done"})
     await client.close()
@@ -2520,6 +2535,7 @@ async def test_retry_after_has_distinct_remote_input_cap(monkeypatch):
 
     client = _client_with_handler(
         handler, max_retries=2, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
+        retry_total_max_s=None,  # see the note above; per-delay cap only
     )
     with pytest.raises(httpx.HTTPStatusError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
@@ -2626,3 +2642,175 @@ def test_retry_after_delay_parses_both_rfc_forms():
     assert _retry_after_delay(
         _resp({"Retry-After": "Wed, 21 Oct " + "9" * 40 + " 07:28:00 GMT"}),
     ) is None
+
+
+# -----------------------------------------------------------------------
+# Total retry budget — the per-delay caps bound each sleep in isolation, but
+# they multiply against the attempt budget. A persistently rate-limited
+# backend answering every attempt with a long Retry-After (honoured in full
+# by design, and capped only at 6h) could pin a terminal complete/fail
+# report — 6-attempt floor — for up to 36h on one call. The worker runs one
+# task at a time, so that call blocks the whole polling loop: no claims, no
+# cancel polls, no shutdown response. retry_total_max_s (default 600s) caps
+# the sum of one call's sleeps; when the next delay doesn't fit, the loop
+# stops and re-raises instead of firing a futile request inside the window.
+# -----------------------------------------------------------------------
+
+
+def test_init_rejects_non_positive_retry_total_max():
+    """A non-positive budget is degenerate — fail fast, like the backoff cap."""
+    with pytest.raises(ValueError, match="retry_total_max_s must be > 0"):
+        BackendClient("http://fake", "x", retry_total_max_s=0)
+    with pytest.raises(ValueError, match="retry_total_max_s must be > 0"):
+        BackendClient("http://fake", "x", retry_total_max_s=-5)
+
+
+def test_init_accepts_none_retry_total_max():
+    """None disables the budget — valid (legacy unbounded behaviour)."""
+    client = BackendClient("http://fake", "x", retry_total_max_s=None)
+    assert client.retry_total_max_s is None
+
+
+def test_init_defaults_retry_total_max():
+    """The budget defaults to 600s."""
+    assert BackendClient("http://fake", "x").retry_total_max_s == 600.0
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatch):
+    """The motivating case: a complete() throttled with Retry-After: 6h must
+    not sleep it out — one such delay already exceeds the whole budget, so the
+    call gives up immediately rather than pinning the polling loop for 36h."""
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            429, headers={"Retry-After": "21600"}, text="Too Many Requests",
+        )
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.complete(7, {"output": "done"})
+    await client.close()
+
+    # One attempt, no sleep — and the caller sees the same error it would
+    # have seen after exhausting the attempt budget, so the task is re-queued
+    # by the sweeper exactly as before.
+    assert exc_info.value.response.status_code == 429
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_total_budget_accumulates_across_attempts(monkeypatch):
+    """Slept time accumulates: retries continue while they fit the budget
+    (a delay landing exactly on it still fits) and stop when the next one
+    would overrun it."""
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            429, headers={"Retry-After": "200"}, text="Too Many Requests",
+        )
+
+    client = _client_with_handler(
+        handler, max_retries=6, retry_backoff_s=2.0, retry_total_max_s=400.0,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    # 200 + 200 exactly fills the 400s budget; the third would overrun it.
+    assert sleeps == [200.0, 200.0]
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_budget_exhaustion_logs_warning(monkeypatch, caplog):
+    """Operators must be able to see why a report gave up while the backend
+    is plainly still up — so early exhaustion logs at WARNING, not DEBUG."""
+    _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503, headers={"Retry-After": "900"}, text="Service Unavailable",
+        )
+
+    client = _client_with_handler(handler, max_retries=4)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("retry_total_max_s" in m for m in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_transport_error_retries_respect_the_budget(monkeypatch):
+    """The budget covers the exponential-backoff path too, not just
+    Retry-After: a long backoff schedule stops once the sum won't fit."""
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.TransportError("connection refused")
+
+    # Schedule is [10, 20, 40, 80, ...]; 10 + 20 + 40 = 70 fits, the 80 does not.
+    client = _client_with_handler(
+        handler, max_retries=8, retry_backoff_s=10.0,
+        retry_backoff_max_s=1000.0, retry_total_max_s=100.0,
+    )
+    with pytest.raises(httpx.TransportError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [10.0, 20.0, 40.0]
+    assert calls["n"] == 4
+
+
+@pytest.mark.asyncio
+async def test_budget_none_restores_unbounded_retrying(monkeypatch):
+    """None disables the budget entirely — the full attempt budget is spent
+    on hour-long delays, exactly as before this knob existed."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, headers={"Retry-After": "3600"}, text="Too Many Requests",
+        )
+
+    client = _client_with_handler(
+        handler, max_retries=3, retry_backoff_s=2.0, retry_total_max_s=None,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert sleeps == [3600.0, 3600.0]
+
+
+@pytest.mark.asyncio
+async def test_budget_does_not_disturb_normal_retry_schedules(monkeypatch):
+    """A schedule that fits the budget is untouched — the default 600s is far
+    above the ~14s the default config actually sleeps."""
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 4:
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    await client.complete(7, {"output": "done"})
+    await client.close()
+
+    assert sleeps == [2.0, 4.0, 8.0]
+    assert calls["n"] == 4
