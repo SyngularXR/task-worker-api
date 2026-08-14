@@ -2814,3 +2814,42 @@ async def test_budget_does_not_disturb_normal_retry_schedules(monkeypatch):
 
     assert sleeps == [2.0, 4.0, 8.0]
     assert calls["n"] == 4
+
+
+def test_retry_knobs_are_keyword_only_on_both_public_constructors():
+    """Adding a knob *between* existing retry parameters is only safe because
+    every one of them is keyword-only on both public constructors.
+
+    Were they positional-capable, inserting ``retry_total_max_s`` ahead of
+    ``retry_jitter`` would silently re-bind an existing caller's arguments —
+    ``retry_jitter=True`` would land on the budget as a 1-second ceiling
+    (``True == 1`` passes the ``> 0`` check), and everything after it would
+    shift one slot. The ``*`` markers that rule this out predate the budget
+    knob, so pin them here: the next knob inserted mid-list needs the same
+    guarantee, and nothing else in the suite would fail if a ``*`` were
+    dropped.
+    """
+    import inspect
+
+    from task_worker_api.worker import Worker
+
+    for ctor in (BackendClient.__init__, Worker.__init__):
+        params = inspect.signature(ctor).parameters
+        for name in (
+            "max_retries",
+            "retry_backoff_s",
+            "retry_backoff_max_s",
+            "retry_total_max_s",
+            "retry_jitter",
+        ):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (
+                f"{ctor.__qualname__}: {name} must stay keyword-only so a "
+                "later insertion can't re-bind a caller's arguments"
+            )
+
+    # The concrete call the ordering concern is about: nothing past the two
+    # positional credentials binds positionally at all, on either constructor.
+    with pytest.raises(TypeError):
+        BackendClient("http://fake", "x", 4)
+    with pytest.raises(TypeError):
+        Worker("http://fake", "x", "w", {})
