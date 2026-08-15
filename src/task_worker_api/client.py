@@ -8,7 +8,9 @@ the pre-SDK shape — this client consolidates three divergent copies
 from __future__ import annotations
 
 import logging
+import math
 import random
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -281,6 +283,7 @@ class BackendClient:
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
+        retry_sleep_budget_s: Optional[float] = None,
         retry_jitter: bool = True,
         client: Optional[httpx.AsyncClient] = None,
         payload_logger: Optional["PayloadLogger"] = None,
@@ -310,6 +313,51 @@ class BackendClient:
                 "pass None to disable the cap."
             )
         self.retry_backoff_max_s = retry_backoff_max_s
+        # Optional budget on the inter-attempt sleeps one call may *start*.
+        # The per-delay caps bound each sleep in isolation, but they multiply
+        # against the attempt budget, and Retry-After bypasses
+        # retry_backoff_max_s by design: a backend answering every attempt with
+        # ``Retry-After: 21600`` pins a terminal complete/fail report (6-attempt
+        # floor, so five inter-attempt sleeps) for up to 5 × 6h = 30h on one
+        # call. The worker runs one task at a time, so that call blocks the
+        # whole polling loop: no new claims, no cancel polls, no shutdown
+        # response — the process looks hung to operators.
+        #
+        # It bounds admission, not wall clock. The loop refuses to *start* a
+        # sleep that would not fit in what remains, and each sleep is charged
+        # what the monotonic clock says it cost — but a sleep already in
+        # flight is never cut short, so the real elapsed time can end up over
+        # budget. See _retry.
+        #
+        # ponytail: soft budget — a starved event loop overruns it by however
+        # long it was blocked, and the loop only notices at the next admission
+        # check. Ceiling: nothing running *inside* a blocked loop can preempt
+        # the sleep — an asyncio.wait_for timer is starved by the same block,
+        # so a hard deadline here would be a hard deadline in name only.
+        # Upgrade path: keep handler work off this loop (executor or
+        # subprocess) so sleeps wake on time and admission matches wall clock.
+        #
+        # Default None: unbounded, exactly as before this knob existed. 600s
+        # (ten minutes) is the *recommended* opt-in value — longer than any
+        # real backend restart or rate-limit window we've observed, and giving
+        # up after it costs nothing a retries-exhausted report doesn't already
+        # cost: the task is re-queued by the sweeper either way. Enable it
+        # deliberately, per consumer (see docs/fleet/runbooks/sdk-upgrade.md).
+        #
+        # NaN is rejected as well as <= 0: every comparison against NaN is
+        # False, so a NaN budget would sail through a bare ``<= 0`` check and
+        # then silently disable the very limit it was asked to impose. ``inf``
+        # is an unbounded budget spelled as a number; None is the one
+        # documented way to say that.
+        if retry_sleep_budget_s is not None and not (
+            math.isfinite(retry_sleep_budget_s) and retry_sleep_budget_s > 0
+        ):
+            raise ValueError(
+                f"retry_sleep_budget_s must be a finite number > 0 "
+                f"(got {retry_sleep_budget_s}); pass None (the default) to "
+                "disable the budget."
+            )
+        self.retry_sleep_budget_s = retry_sleep_budget_s
         # Jitter decorrelates retries across the fleet so a shared transient
         # outage doesn't produce a synchronized retry storm the instant the
         # backend recovers. Default on; tests that assert on exact delays pass
@@ -434,11 +482,38 @@ class BackendClient:
         ``extra_transient`` widens the transient status set for this call
         only — used by ``complete``/``fail`` to also retry 500 (see the
         ``_TRANSIENT_STATUS_CODES`` comment for the rationale).
+
+        ``retry_sleep_budget_s`` bounds the inter-attempt sleeps this call is
+        allowed to *start*. It defaults to ``None`` — unbounded, the behaviour
+        that predates the knob — and 600s is the recommended value to opt into.
+        The per-delay caps bound each sleep in isolation but multiply against
+        the attempt budget, and ``Retry-After`` deliberately bypasses
+        ``retry_backoff_max_s`` — so a persistently throttled backend can hold
+        one call (and with it the worker's single-task polling loop) for up to
+        5 × 6h, the five inter-attempt sleeps of a terminal report's 6-attempt
+        floor. Once a budget is set: when the next required delay would not fit
+        in what's left of it, the loop stops early and re-raises the last error
+        instead of sleeping on and firing a near-certainly-futile request
+        inside the rate-limit window; that early stop is logged at WARNING. The
+        outcome for the caller is identical to exhausting the attempt budget —
+        for a terminal report, the task is re-queued by the backend's sweeper.
+
+        It is a budget on admission, **not** a wall-clock deadline. Spend is
+        measured on the monotonic clock, so a sleep that overruns its requested
+        delay is charged what it actually cost and tightens every later
+        admission — but a sleep already in flight is never interrupted, so real
+        elapsed time can exceed the budget by however long the event loop was
+        starved (the worker's own handler runs in this process). A 600s budget
+        whose sleeps each take twice their delay stops after ~800s, not 600s.
+        Bounding that last overrun is not something this loop can do from
+        inside the blocked loop, and it is why this is a budget rather than a
+        maximum: pick a value with headroom against a handler that blocks.
         """
         import asyncio
 
         total_attempts = attempts if attempts is not None else self.max_retries
         last_exc: Optional[Exception] = None
+        slept_s = 0.0
         for attempt in range(total_attempts):
             try:
                 return await fn()
@@ -450,11 +525,7 @@ class BackendClient:
                     attempt, self.retry_backoff_s,
                     self.retry_backoff_max_s, self.retry_jitter,
                 )
-                log.debug(
-                    "transient %s on %s %s; retrying in %.1fs",
-                    type(e).__name__, method, path, delay,
-                )
-                await asyncio.sleep(delay)
+                what, source = type(e).__name__, ""
             except httpx.HTTPStatusError as e:
                 if not _is_transient_status(e, extra_transient):
                     raise
@@ -484,12 +555,51 @@ class BackendClient:
                     if self.retry_jitter and delay > 0:
                         delay *= 1.0 + random.uniform(0.0, _JITTER_SPREAD)
                         delay = min(delay, _MAX_RETRY_AFTER_S)
-                log.debug(
-                    "transient HTTP %s on %s %s; retrying in %.1fs%s",
-                    e.response.status_code, method, path, delay,
-                    " (Retry-After)" if retry_after is not None else "",
+                what = f"HTTP {e.response.status_code}"
+                source = " (Retry-After)" if retry_after is not None else ""
+            # Reached only from a retryable failure that still has attempts
+            # left; both branches above have picked this attempt's delay.
+            if (
+                self.retry_sleep_budget_s is not None
+                and slept_s + delay > self.retry_sleep_budget_s
+            ):
+                # Waiting the delay out would blow the budget, and firing the
+                # request early lands inside the window the backend just named
+                # — so stop here and let the caller (and the sweeper) handle
+                # it. WARNING, not DEBUG: from the outside this looks like a
+                # worker giving up while the backend is plainly still up. The
+                # remaining figure floors at zero — an overrun sleep can leave
+                # it negative, and "the remaining -200.0s" reads as a bug; the
+                # elapsed figure next to it already shows the overspend.
+                log.warning(
+                    "transient %s on %s %s; giving up after %d attempt(s) and "
+                    "%.1fs of retry backoff — the next delay (%.1fs) exceeds "
+                    "the remaining %.1fs of the %.1fs retry_sleep_budget_s",
+                    what, method, path, attempt + 1, slept_s, delay,
+                    max(0.0, self.retry_sleep_budget_s - slept_s),
+                    self.retry_sleep_budget_s,
                 )
-                await asyncio.sleep(delay)
+                break
+            log.debug(
+                "transient %s on %s %s; retrying in %.1fs%s",
+                what, method, path, delay, source,
+            )
+            started = time.monotonic()
+            await asyncio.sleep(delay)
+            # Charge what the sleep *cost*, not what it asked for. A budget
+            # summed from requested delays is a budget on our intentions: an
+            # event loop starved by a blocking handler (the worker's own task
+            # runs in this process) hands control back late, and enough of
+            # those overruns blow the wall-clock budget with the arithmetic
+            # still insisting it fits. Measuring narrows that gap — every later
+            # admission sees the real spend — but does not close it: this
+            # sleep's own overrun is already past. It can only ever charge
+            # more, since asyncio.sleep never returns early and time.monotonic
+            # never runs backwards, so `delay` is the floor. The requests
+            # themselves stay out of the budget: each has its own timeout, and
+            # download_file's minutes-long transfers would otherwise eat a
+            # retry budget meant for backoff.
+            slept_s += max(delay, time.monotonic() - started)
         # last_exc is guaranteed non-None here because __init__ rejects
         # max_retries < 1, so the loop always executes at least once. The
         # explicit guard avoids a bare assert (which is stripped under -O
