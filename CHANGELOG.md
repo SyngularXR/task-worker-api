@@ -15,7 +15,10 @@
   6 × 6h = 36h. A worker runs one task at a time, so that one call blocks the
   entire polling loop for the duration: no new claims, no cancel polls, no
   response to shutdown, and nothing in the logs to explain it. `_retry` now
-  accumulates the time it has slept across attempts and, when the next
+  accumulates the time it has slept across attempts — measured on the
+  monotonic clock around each sleep, so a sleep that overruns its requested
+  delay (a task handler blocking this process's event loop) is charged what
+  it actually cost rather than what it asked for — and, when the next
   required delay would not fit in what remains of the budget, stops and
   re-raises the last error rather than sleeping on and then firing a
   near-certainly-futile request inside the rate-limit window. The outcome for
@@ -25,7 +28,10 @@
   Early exhaustion logs one WARNING naming the elapsed backoff, the delay
   that didn't fit, and the budget, so an operator can tell this apart from a
   backend that is actually down. A delay landing exactly on the budget still
-  fits. The knob is validated like `retry_backoff_max_s` (`> 0`, or `None`),
+  fits. The knob is validated like `retry_backoff_max_s` — a finite number
+  `> 0`, or `None` to opt out; both now reject `nan`/`inf`, which passed the
+  old `> 0` check and then silently disabled the ceiling they were asked to
+  impose (every comparison against `nan` is False) —
   and the change is additive and backward-compatible: schedules that fit the
   budget — including every default-configured path, which sleeps ~14s total —
   are byte-for-byte unchanged.

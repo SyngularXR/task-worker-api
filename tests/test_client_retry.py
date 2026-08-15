@@ -1394,9 +1394,9 @@ async def test_request_caps_backoff_at_max(monkeypatch):
 
 def test_init_rejects_non_positive_backoff_max():
     """A non-positive retry_backoff_max_s is degenerate — fail fast."""
-    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be"):
         BackendClient("http://fake", "x", retry_backoff_max_s=0)
-    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be"):
         BackendClient("http://fake", "x", retry_backoff_max_s=-5)
 
 
@@ -2659,10 +2659,22 @@ def test_retry_after_delay_parses_both_rfc_forms():
 
 def test_init_rejects_non_positive_retry_total_max():
     """A non-positive budget is degenerate — fail fast, like the backoff cap."""
-    with pytest.raises(ValueError, match="retry_total_max_s must be > 0"):
+    with pytest.raises(ValueError, match="retry_total_max_s must be"):
         BackendClient("http://fake", "x", retry_total_max_s=0)
-    with pytest.raises(ValueError, match="retry_total_max_s must be > 0"):
+    with pytest.raises(ValueError, match="retry_total_max_s must be"):
         BackendClient("http://fake", "x", retry_total_max_s=-5)
+
+
+@pytest.mark.parametrize("knob", ["retry_total_max_s", "retry_backoff_max_s"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_init_rejects_non_finite_retry_ceilings(knob, value):
+    """A NaN ceiling is worse than a bad one: every comparison against NaN is
+    False, so it passes a bare ``<= 0`` check and then silently disables the
+    limit it was meant to impose — the caller believes they capped the wait
+    and nothing caps it. ``inf`` is an unbounded ceiling spelled as a number.
+    ``None`` is the one supported way to opt out."""
+    with pytest.raises(ValueError, match=f"{knob} must be"):
+        BackendClient("http://fake", "x", **{knob: value})
 
 
 def test_init_accepts_none_retry_total_max():
@@ -2772,6 +2784,51 @@ async def test_transport_error_retries_respect_the_budget(monkeypatch):
 
     assert sleeps == [10.0, 20.0, 40.0]
     assert calls["n"] == 4
+
+
+@pytest.mark.asyncio
+async def test_budget_charges_measured_time_not_requested_delay(monkeypatch):
+    """The budget is wall-clock, so each sleep is charged what the monotonic
+    clock says it cost — not what it asked for.
+
+    The worker's own task handler runs in this process; a handler that blocks
+    the event loop makes ``asyncio.sleep(200)`` hand control back well after
+    200s. Summing requested delays would keep the arithmetic under budget
+    while the polling loop is pinned for far longer than 600s — the exact
+    stall the budget exists to prevent. Here every sleep takes twice its
+    delay, so the budget must be spent in half the attempts.
+    """
+    import time
+
+    clock = {"t": 1000.0}
+    sleeps: list[float] = []
+
+    async def overrunning_sleep(delay):
+        sleeps.append(delay)
+        clock["t"] += delay * 2  # event loop hands control back late
+
+    monkeypatch.setattr(asyncio, "sleep", overrunning_sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            429, headers={"Retry-After": "200"}, text="Too Many Requests",
+        )
+
+    client = _client_with_handler(
+        handler, max_retries=6, retry_backoff_s=2.0, retry_total_max_s=600.0,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    # Two sleeps really cost 400 + 400 = 800s, so the third can't fit. Summing
+    # requested delays would have allowed three (200 + 200 + 200 = 600) and
+    # spent 1200s of wall clock inside a 600s budget.
+    assert sleeps == [200.0, 200.0]
+    assert calls["n"] == 3
 
 
 @pytest.mark.asyncio

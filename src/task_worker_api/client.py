@@ -8,7 +8,9 @@ the pre-SDK shape — this client consolidates three divergent copies
 from __future__ import annotations
 
 import logging
+import math
 import random
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -114,6 +116,28 @@ def _is_transient_status(
     return exc.response.status_code in _TRANSIENT_STATUS_CODES or (
         exc.response.status_code in extra
     )
+
+
+def _validate_ceiling(
+    name: str,
+    value: Optional[float],
+    disables: str,
+) -> Optional[float]:
+    """Validate one retry ceiling (``retry_backoff_max_s``/``retry_total_max_s``).
+
+    Both ceilings are enforced by comparing a delay against them, and *every*
+    comparison against NaN is False — so a NaN ceiling sails through a plain
+    ``<= 0`` check at construction and then silently disables the very limit
+    it was asked to impose. ``inf`` is rejected for the same reason: an
+    unbounded ceiling spelled as a number. ``None`` stays the one explicit,
+    documented way to opt out of a limit.
+    """
+    if value is not None and not (math.isfinite(value) and value > 0):
+        raise ValueError(
+            f"{name} must be a finite number > 0 (got {value}); "
+            f"pass None to disable the {disables}."
+        )
+    return value
 
 
 def _retry_after_delay(response: httpx.Response) -> Optional[float]:
@@ -319,23 +343,17 @@ class BackendClient:
         # (high max_retries) would otherwise block the worker's event loop for
         # minutes on one call. None disables the cap for consumers that want
         # the legacy unbounded behaviour, but the default bounds it.
-        if retry_backoff_max_s is not None and retry_backoff_max_s <= 0:
-            raise ValueError(
-                f"retry_backoff_max_s must be > 0 (got {retry_backoff_max_s}); "
-                "pass None to disable the cap."
-            )
-        self.retry_backoff_max_s = retry_backoff_max_s
+        self.retry_backoff_max_s = _validate_ceiling(
+            "retry_backoff_max_s", retry_backoff_max_s, "cap",
+        )
         # Ceiling on the *sum* of one call's inter-attempt sleeps. The per-delay
         # caps don't bound the product of delay × attempts, and Retry-After
         # (which bypasses retry_backoff_max_s by design) can make each delay
         # hours long — see _DEFAULT_RETRY_TOTAL_MAX_S. None restores the legacy
         # unbounded behaviour for consumers that want it.
-        if retry_total_max_s is not None and retry_total_max_s <= 0:
-            raise ValueError(
-                f"retry_total_max_s must be > 0 (got {retry_total_max_s}); "
-                "pass None to disable the budget."
-            )
-        self.retry_total_max_s = retry_total_max_s
+        self.retry_total_max_s = _validate_ceiling(
+            "retry_total_max_s", retry_total_max_s, "budget",
+        )
         # Jitter decorrelates retries across the fleet so a shared transient
         # outage doesn't produce a synchronized retry storm the instant the
         # backend recovers. Default on; tests that assert on exact delays pass
@@ -462,7 +480,9 @@ class BackendClient:
         ``_TRANSIENT_STATUS_CODES`` comment for the rationale).
 
         ``retry_total_max_s`` (default 600s; ``None`` disables) bounds the
-        *sum* of this call's inter-attempt sleeps. The per-delay caps bound
+        *sum* of this call's inter-attempt sleeps, measured on the monotonic
+        clock: a sleep that overruns its requested delay (starved event loop)
+        is charged what it actually cost. The per-delay caps bound
         each sleep in isolation but multiply against the attempt budget, and
         ``Retry-After`` deliberately bypasses ``retry_backoff_max_s`` — so a
         persistently throttled backend could otherwise hold one call (and with
@@ -545,8 +565,20 @@ class BackendClient:
                 "transient %s on %s %s; retrying in %.1fs%s",
                 what, method, path, delay, source,
             )
-            slept_s += delay
+            started = time.monotonic()
             await asyncio.sleep(delay)
+            # Charge what the sleep *cost*, not what it asked for. A budget
+            # summed from requested delays is a budget on our intentions: an
+            # event loop starved by a blocking handler (the worker's own task
+            # runs in this process) hands control back late, and enough of
+            # those overruns blow the wall-clock budget with the arithmetic
+            # still insisting it fits. Measuring closes that gap — and it can
+            # only ever charge more, since asyncio.sleep never returns early
+            # and time.monotonic never runs backwards, so `delay` is the
+            # floor. Non-sleep time (the requests themselves) stays out: each
+            # has its own timeout, and download_file's minutes-long transfers
+            # would otherwise eat a retry budget meant for backoff.
+            slept_s += max(delay, time.monotonic() - started)
         # last_exc is guaranteed non-None here because __init__ rejects
         # max_retries < 1, so the loop always executes at least once. The
         # explicit guard avoids a bare assert (which is stripped under -O
