@@ -21,6 +21,40 @@ log = logging.getLogger(__name__)
 
 _REMOTE_KILL_HANDLE = {"pid": None, "container": None, "host": "remote"}
 
+#: Set once a client without ``report_progress_once`` has been warned about,
+#: so a legacy client logs one WARNING per process rather than one per stage
+#: transition of every task the worker runs.
+_warned_legacy_progress_client = False
+
+
+def _one_shot_report(client: "BackendClient"):
+    """``client.report_progress_once`` if it has one, else ``report_progress``.
+
+    ``report_progress_once`` was added after the worker repos had already
+    grown their own clients, test doubles and ``FakeBackendClient`` subclasses
+    against the older protocol (``Worker(client=...)`` takes any duck-typed
+    client). Calling it unconditionally would raise ``AttributeError`` on
+    every one of them at the first stage transition, so a client that lacks it
+    keeps the retried call it always had — it just keeps the old worst case,
+    where one immediate report can block the handler for ``max_retries`` ×
+    ``lifecycle_timeout_s`` plus backoff.
+    """
+    report = getattr(client, "report_progress_once", None)
+    if report is not None:
+        return report
+    global _warned_legacy_progress_client
+    if not _warned_legacy_progress_client:
+        _warned_legacy_progress_client = True
+        log.warning(
+            "%s has no 'report_progress_once'; an immediate progress update "
+            "will keep going through the retried 'report_progress', so a "
+            "degraded backend can stall a handler for max_retries x "
+            "lifecycle_timeout_s plus backoff on one update. Add a one-shot "
+            "(no-retry) 'report_progress_once' with the same signature.",
+            type(client).__qualname__,
+        )
+    return client.report_progress
+
 
 @dataclass
 class _SharedState:
@@ -69,12 +103,23 @@ class ProgressReporter:
     async def update(self, stage: str, current: int = 0, total: int = 0) -> None:
         """Handler progress update. Updates shared state; the heartbeat
         loop picks up the new values on its next tick. Also emits an
-        immediate progress call so stage transitions land quickly."""
+        immediate progress call so stage transitions land quickly.
+
+        The immediate call is one-shot (``report_progress_once``): it runs on
+        the handler's critical path, and the retried ``report_progress`` could
+        hold it for ``max_retries`` × ``lifecycle_timeout_s`` plus backoff
+        (~75s with SDK defaults) against a degraded backend — stalling the
+        work the update was describing. Losing one immediate report costs
+        stage-transition latency only: the new state is already in
+        ``self._state``, and the background heartbeat re-sends it on its next
+        tick through the retried call, which is what keeps ``updated_at``
+        fresh across a backend blip.
+        """
         self._state.stage = stage
         self._state.current = current
         self._state.total = total
         try:
-            resp = await self._client.report_progress(
+            resp = await _one_shot_report(self._client)(
                 self._task_id, stage=stage, current=current, total=total,
                 kill_handle=_REMOTE_KILL_HANDLE,
             )

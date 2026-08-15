@@ -96,6 +96,25 @@ class FakeBackendClient:
         })
         return {"cancelled": task_id in self.cancelled_task_ids}
 
+    async def report_progress_once(
+        self, task_id: int, *, stage: str, current: int = 0, total: int = 0,
+        kill_handle=None,
+    ) -> dict:
+        """One-shot progress report — mirrors ``report_progress_once``.
+
+        The fake doesn't simulate HTTP retries, so this delegates to
+        :meth:`report_progress` (same recorded event). Delegating rather than
+        duplicating also keeps subclasses that override ``report_progress``
+        (the documented way to fake a flaky backend) in control of both
+        paths. Tests that need to assert on the one-shot (no-retry) contract
+        use ``httpx.MockTransport`` against the real ``BackendClient`` (see
+        ``test_client_retry.py``).
+        """
+        return await self.report_progress(
+            task_id, stage=stage, current=current, total=total,
+            kill_handle=kill_handle,
+        )
+
     async def get_cancel_status(self, task_id: int) -> dict:
         return {
             "cancelled": task_id in self.cancelled_task_ids,
