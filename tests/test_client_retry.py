@@ -35,7 +35,7 @@ def _client_with_handler(
     max_retries: int = 4,
     retry_backoff_s: float = 0.0,
     retry_backoff_max_s: float | None = None,
-    retry_total_max_s: float | None = None,
+    retry_sleep_budget_s: float | None = None,
     retry_jitter: bool = False,
 ) -> BackendClient:
     """Build a real BackendClient backed by a MockTransport handler.
@@ -45,7 +45,7 @@ def _client_with_handler(
     Jitter defaults to False so timing-assertion tests stay deterministic; the
     jitter behaviour itself is covered by dedicated _backoff_delay unit tests.
 
-    ``retry_total_max_s`` defaults to ``None`` — the SDK default, no total
+    ``retry_sleep_budget_s`` defaults to ``None`` — the SDK default, no total
     sleep budget — so tests that don't name it exercise the unbounded legacy
     retry behaviour. Budget tests pass a value explicitly.
     """
@@ -63,8 +63,8 @@ def _client_with_handler(
     # Keep the SDK default (60s cap) unless a test explicitly overrides it.
     if retry_backoff_max_s is not None:
         kwargs["retry_backoff_max_s"] = retry_backoff_max_s
-    if retry_total_max_s is not None:
-        kwargs["retry_total_max_s"] = retry_total_max_s
+    if retry_sleep_budget_s is not None:
+        kwargs["retry_sleep_budget_s"] = retry_sleep_budget_s
     return BackendClient(
         "http://fake/api/v1",
         "x",
@@ -2643,19 +2643,21 @@ def test_retry_after_delay_parses_both_rfc_forms():
 # 6-attempt floor, so five inter-attempt sleeps — for up to 5 × 6h = 30h on
 # one call. The worker runs one task at a time, so that call blocks the whole
 # polling loop: no claims, no cancel polls, no shutdown response.
-# retry_total_max_s caps the sum of one call's sleeps; when the next delay
-# doesn't fit, the loop stops and re-raises instead of firing a futile request
-# inside the window. It is opt-in: the default is None (unbounded, exactly as
-# before the knob existed), and 600s is the recommended value to enable.
+# retry_sleep_budget_s bounds the sleeps one call may *start*: when the next
+# delay doesn't fit what's left, the loop stops and re-raises instead of firing
+# a futile request inside the window. It bounds admission, not wall clock — a
+# started sleep is never interrupted (see the overrun test below). It is
+# opt-in: the default is None (unbounded, exactly as before the knob existed),
+# and 600s is the recommended value to enable.
 # -----------------------------------------------------------------------
 
 
 def test_init_rejects_non_positive_retry_total_max():
     """A non-positive budget is degenerate — fail fast, like the backoff cap."""
-    with pytest.raises(ValueError, match="retry_total_max_s must be"):
-        BackendClient("http://fake", "x", retry_total_max_s=0)
-    with pytest.raises(ValueError, match="retry_total_max_s must be"):
-        BackendClient("http://fake", "x", retry_total_max_s=-5)
+    with pytest.raises(ValueError, match="retry_sleep_budget_s must be"):
+        BackendClient("http://fake", "x", retry_sleep_budget_s=0)
+    with pytest.raises(ValueError, match="retry_sleep_budget_s must be"):
+        BackendClient("http://fake", "x", retry_sleep_budget_s=-5)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
@@ -2665,20 +2667,20 @@ def test_init_rejects_non_finite_retry_total_max(value):
     limit it was meant to impose — the caller believes they bounded the wait
     and nothing bounds it. ``inf`` is an unbounded budget spelled as a number.
     ``None`` is the one supported way to opt out."""
-    with pytest.raises(ValueError, match="retry_total_max_s must be"):
-        BackendClient("http://fake", "x", retry_total_max_s=value)
+    with pytest.raises(ValueError, match="retry_sleep_budget_s must be"):
+        BackendClient("http://fake", "x", retry_sleep_budget_s=value)
 
 
 def test_init_accepts_none_retry_total_max():
     """None disables the budget — valid (legacy unbounded behaviour)."""
-    client = BackendClient("http://fake", "x", retry_total_max_s=None)
-    assert client.retry_total_max_s is None
+    client = BackendClient("http://fake", "x", retry_sleep_budget_s=None)
+    assert client.retry_sleep_budget_s is None
 
 
 def test_init_defaults_retry_total_max_to_none():
     """The budget is opt-in: omitting it leaves retrying unbounded, so an
     existing consumer's behaviour is unchanged by upgrading the SDK."""
-    assert BackendClient("http://fake", "x").retry_total_max_s is None
+    assert BackendClient("http://fake", "x").retry_sleep_budget_s is None
 
 
 @pytest.mark.asyncio
@@ -2697,7 +2699,7 @@ async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatc
         )
 
     client = _client_with_handler(
-        handler, max_retries=4, retry_backoff_s=2.0, retry_total_max_s=600.0,
+        handler, max_retries=4, retry_backoff_s=2.0, retry_sleep_budget_s=600.0,
     )
     with pytest.raises(httpx.HTTPStatusError) as exc_info:
         await client.complete(7, {"output": "done"})
@@ -2726,7 +2728,7 @@ async def test_total_budget_accumulates_across_attempts(monkeypatch):
         )
 
     client = _client_with_handler(
-        handler, max_retries=6, retry_backoff_s=2.0, retry_total_max_s=400.0,
+        handler, max_retries=6, retry_backoff_s=2.0, retry_sleep_budget_s=400.0,
     )
     with pytest.raises(httpx.HTTPStatusError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
@@ -2749,7 +2751,7 @@ async def test_budget_exhaustion_logs_warning(monkeypatch, caplog):
         )
 
     client = _client_with_handler(
-        handler, max_retries=4, retry_total_max_s=600.0,
+        handler, max_retries=4, retry_sleep_budget_s=600.0,
     )
     with caplog.at_level("WARNING"):
         with pytest.raises(httpx.HTTPStatusError):
@@ -2757,7 +2759,7 @@ async def test_budget_exhaustion_logs_warning(monkeypatch, caplog):
     await client.close()
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert any("retry_total_max_s" in m for m in warnings), warnings
+    assert any("retry_sleep_budget_s" in m for m in warnings), warnings
 
 
 @pytest.mark.asyncio
@@ -2774,7 +2776,7 @@ async def test_transport_error_retries_respect_the_budget(monkeypatch):
     # Schedule is [10, 20, 40, 80, ...]; 10 + 20 + 40 = 70 fits, the 80 does not.
     client = _client_with_handler(
         handler, max_retries=8, retry_backoff_s=10.0,
-        retry_backoff_max_s=1000.0, retry_total_max_s=100.0,
+        retry_backoff_max_s=1000.0, retry_sleep_budget_s=100.0,
     )
     with pytest.raises(httpx.TransportError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
@@ -2785,16 +2787,25 @@ async def test_transport_error_retries_respect_the_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_budget_charges_measured_time_not_requested_delay(monkeypatch):
-    """The budget is wall-clock, so each sleep is charged what the monotonic
-    clock says it cost — not what it asked for.
+async def test_budget_charges_measured_time_and_admission_only(monkeypatch):
+    """Two halves of one contract, pinned together because each is only
+    defensible next to the other.
 
-    The worker's own task handler runs in this process; a handler that blocks
-    the event loop makes ``asyncio.sleep(200)`` hand control back well after
-    200s. Summing requested delays would keep the arithmetic under budget
-    while the polling loop is pinned for far longer than 600s — the exact
-    stall the budget exists to prevent. Here every sleep takes twice its
-    delay, so the budget must be spent in half the attempts.
+    *Charged on the monotonic clock.* The worker's own task handler runs in
+    this process; a handler that blocks the event loop makes
+    ``asyncio.sleep(200)`` hand control back well after 200s. Summing requested
+    delays would keep the arithmetic under budget while the polling loop is
+    pinned for far longer — the exact stall the budget exists to prevent. Here
+    every sleep costs twice its delay, so the budget is spent in half the
+    attempts.
+
+    *Admission, not a deadline.* Measuring narrows the gap but cannot close
+    it: the second sleep is admitted on the remaining 200s and then costs 400s,
+    so this 600s budget really spends 800s. Nothing running inside a blocked
+    event loop can preempt that sleep — a ``wait_for`` timer is starved by the
+    same block — so the overrun is bounded by the block, not by the budget.
+    That is why the knob is named a budget and documented as one; a consumer
+    picking a value must leave headroom for it.
     """
     import time
 
@@ -2816,7 +2827,7 @@ async def test_budget_charges_measured_time_not_requested_delay(monkeypatch):
         )
 
     client = _client_with_handler(
-        handler, max_retries=6, retry_backoff_s=2.0, retry_total_max_s=600.0,
+        handler, max_retries=6, retry_backoff_s=2.0, retry_sleep_budget_s=600.0,
     )
     with pytest.raises(httpx.HTTPStatusError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
@@ -2827,11 +2838,15 @@ async def test_budget_charges_measured_time_not_requested_delay(monkeypatch):
     # spent 1200s of wall clock inside a 600s budget.
     assert sleeps == [200.0, 200.0]
     assert calls["n"] == 3
+    # The documented overshoot, asserted rather than left implicit: 800s spent
+    # against a 600s budget. If a future change makes this a hard ceiling,
+    # this assertion fails and the docstring/CHANGELOG wording must follow.
+    assert clock["t"] - 1000.0 == 800.0
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "budget", [{}, {"retry_total_max_s": None}], ids=["omitted", "explicit-none"],
+    "budget", [{}, {"retry_sleep_budget_s": None}], ids=["omitted", "explicit-none"],
 )
 async def test_no_budget_keeps_unbounded_retrying(monkeypatch, budget):
     """No budget — omitted (the default) or an explicit None — leaves retrying
@@ -2848,7 +2863,7 @@ async def test_no_budget_keeps_unbounded_retrying(monkeypatch, budget):
     client = _client_with_handler(
         handler, max_retries=3, retry_backoff_s=2.0, **budget,
     )
-    assert client.retry_total_max_s is None
+    assert client.retry_sleep_budget_s is None
     with pytest.raises(httpx.HTTPStatusError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
     await client.close()
@@ -2870,7 +2885,7 @@ async def test_budget_does_not_disturb_normal_retry_schedules(monkeypatch):
         return httpx.Response(200)
 
     client = _client_with_handler(
-        handler, max_retries=4, retry_backoff_s=2.0, retry_total_max_s=600.0,
+        handler, max_retries=4, retry_backoff_s=2.0, retry_sleep_budget_s=600.0,
     )
     await client.complete(7, {"output": "done"})
     await client.close()
@@ -2883,7 +2898,7 @@ def test_retry_knobs_are_keyword_only_on_both_public_constructors():
     """Adding a knob *between* existing retry parameters is only safe because
     every one of them is keyword-only on both public constructors.
 
-    Were they positional-capable, inserting ``retry_total_max_s`` ahead of
+    Were they positional-capable, inserting ``retry_sleep_budget_s`` ahead of
     ``retry_jitter`` would silently re-bind an existing caller's arguments —
     ``retry_jitter=True`` would land on the budget as a 1-second ceiling
     (``True == 1`` passes the ``> 0`` check), and everything after it would
@@ -2902,7 +2917,7 @@ def test_retry_knobs_are_keyword_only_on_both_public_constructors():
             "max_retries",
             "retry_backoff_s",
             "retry_backoff_max_s",
-            "retry_total_max_s",
+            "retry_sleep_budget_s",
             "retry_jitter",
         ):
             assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (

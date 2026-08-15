@@ -185,7 +185,7 @@ class Worker:
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
-        retry_total_max_s: Optional[float] = None,
+        retry_sleep_budget_s: Optional[float] = None,
         retry_jitter: bool = True,
         task_timeout_s: float = DEFAULT_TASK_TIMEOUT_S,
         task_timeouts: Optional[dict] = None,
@@ -234,7 +234,7 @@ class Worker:
                 max_retries=max_retries,
                 retry_backoff_s=retry_backoff_s,
                 retry_backoff_max_s=retry_backoff_max_s,
-                retry_total_max_s=retry_total_max_s,
+                retry_sleep_budget_s=retry_sleep_budget_s,
                 retry_jitter=retry_jitter,
                 payload_logger=self._payload_logger,
             )

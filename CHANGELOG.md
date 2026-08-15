@@ -4,8 +4,8 @@
 
 **Fixes:**
 - `BackendClient` (and `Worker`, which forwards it) takes a new optional
-  `retry_total_max_s` — a total wall-clock budget for the time one call may
-  spend *sleeping* between retry attempts. **It defaults to `None`, which is
+  `retry_sleep_budget_s` — a budget for the time one call may spend *sleeping*
+  between retry attempts. **It defaults to `None`, which is
   the pre-existing unbounded behaviour: upgrading the SDK alone changes
   nothing.** 600 seconds is the recommended value, and must be enabled
   deliberately, per consumer — see
@@ -32,7 +32,15 @@
   Early exhaustion logs one WARNING naming the elapsed backoff, the delay that
   didn't fit, and the budget, so an operator can tell this apart from a
   backend that is actually down. A delay landing exactly on the budget still
-  fits. The knob is validated at construction: a finite number `> 0`, or
+  fits. **It bounds admission, not wall clock**: the loop refuses to *start* a
+  sleep that would not fit, but never interrupts one already in flight, so a
+  starved event loop overruns the budget by however long it was blocked — a
+  600s budget whose sleeps each take twice their delay stops after ~800s.
+  Measuring on the monotonic clock makes every later admission see the real
+  spend, but nothing running inside a blocked loop can preempt the sleep
+  itself (an `asyncio.wait_for` timer is starved by the same block), so the
+  name says budget rather than max: leave headroom for a handler that blocks.
+  The knob is validated at construction: a finite number `> 0`, or
   `None` to opt out. `nan` is rejected specifically because it would pass a
   bare `> 0` check and then silently disable the very budget it was asked to
   impose (every comparison against `nan` is False), and `inf` is an unbounded

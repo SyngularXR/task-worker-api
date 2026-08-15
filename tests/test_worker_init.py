@@ -258,7 +258,7 @@ async def test_worker_init_default_lifecycle_timeout_is_15():
 async def test_worker_init_threads_retry_params_to_client():
     """When Worker constructs its own BackendClient (no client= passed),
     the retry-tuning parameters (max_retries, retry_backoff_s,
-    retry_backoff_max_s, retry_total_max_s, retry_jitter) must be forwarded
+    retry_backoff_max_s, retry_sleep_budget_s, retry_jitter) must be forwarded
     so operators who use the simple Worker(...) constructor can tune retry
     behaviour per workload without manually constructing a BackendClient."""
     worker = Worker(
@@ -269,14 +269,14 @@ async def test_worker_init_threads_retry_params_to_client():
         max_retries=8,
         retry_backoff_s=1.5,
         retry_backoff_max_s=120.0,
-        retry_total_max_s=900.0,
+        retry_sleep_budget_s=900.0,
         retry_jitter=False,
     )
     try:
         assert worker._client.max_retries == 8
         assert worker._client.retry_backoff_s == 1.5
         assert worker._client.retry_backoff_max_s == 120.0
-        assert worker._client.retry_total_max_s == 900.0
+        assert worker._client.retry_sleep_budget_s == 900.0
         assert worker._client.retry_jitter is False
     finally:
         await worker._client.close()
@@ -298,7 +298,7 @@ async def test_worker_init_default_retry_params_match_client_defaults():
         assert worker._client.max_retries == 4
         assert worker._client.retry_backoff_s == 2.0
         assert worker._client.retry_backoff_max_s == 60.0
-        assert worker._client.retry_total_max_s is None
+        assert worker._client.retry_sleep_budget_s is None
         assert worker._client.retry_jitter is True
     finally:
         await worker._client.close()

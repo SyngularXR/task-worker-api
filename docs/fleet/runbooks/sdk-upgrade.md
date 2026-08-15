@@ -60,7 +60,7 @@ The wheel URL must exist before this PR's CI runs, otherwise pytest install fail
 
 ## Staged rollout for opt-in behaviour changes
 
-Some SDK releases add a knob that is inert until a consumer sets it — the release is a no-op by design, and the behaviour change lands per worker, on your schedule. `retry_total_max_s` (the total retry-sleep budget, default `None` = unbounded, recommended value `600.0`) is the current example. Roll these out in three passes, never in one:
+Some SDK releases add a knob that is inert until a consumer sets it — the release is a no-op by design, and the behaviour change lands per worker, on your schedule. `retry_sleep_budget_s` (the retry-sleep budget, default `None` = unbounded, recommended value `600.0`) is the current example. It bounds the sleeps a call may *start*, not wall clock — a sleep already in flight is never interrupted, so a handler that blocks the event loop can overrun the budget by however long it blocked. Pick a value with headroom for that; don't read it as a hard ceiling. Roll these out in three passes, never in one:
 
 1. **Release the no-op SDK.** Land the SDK PR and let the wheel publish. Nothing in the fleet changes behaviour — every consumer still gets the old semantics because the new knob defaults to off.
 2. **Bump each consumer's pin** using the per-repo recipes above. Still a no-op: the worker now *has* the knob, but isn't passing it.
@@ -68,7 +68,7 @@ Some SDK releases add a knob that is inert until a consumer sets it — the rele
    ```python
    Worker(
        ...,
-       retry_total_max_s=600.0,   # give up after 10 min of retry backoff
+       retry_sleep_budget_s=600.0,   # give up after 10 min of retry backoff
    )
    ```
    Then flip the corresponding deployment setting for that one service in `syngar-deployment-scripts` and watch it for a full task cycle before moving to the next. One worker at a time keeps a bad value from taking the whole fleet down, and keeps the blame obvious if throughput changes.
