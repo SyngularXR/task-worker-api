@@ -77,20 +77,6 @@ _DEFAULT_BACKOFF_MAX_S = 60.0
 # accepting an effectively infinite sleep.
 _MAX_RETRY_AFTER_S = 6 * 60 * 60
 
-# Default ceiling for the *total* time one call may spend sleeping between
-# attempts. The per-delay caps bound each sleep in isolation, but they
-# multiply against the attempt budget: a persistently rate-limited backend
-# answering every attempt with ``Retry-After: 21600`` pins a terminal
-# complete/fail report (6-attempt floor, and server guidance deliberately
-# bypasses ``retry_backoff_max_s``) for up to 6 × 6h = 36h on a single call.
-# The worker runs one task at a time, so that one call blocks the whole
-# polling loop: no new claims, no cancel polls, no shutdown response — the
-# process looks hung to operators. Ten minutes is longer than any real backend
-# restart or rate-limit window we've observed, and giving up after it costs
-# nothing a retries-exhausted report doesn't already cost: the task is
-# re-queued by the sweeper either way, and the worker gets back to polling.
-_DEFAULT_RETRY_TOTAL_MAX_S = 600.0
-
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
 # band — enough to decorrelate the fleet (Neural-Canvas, Blender-CLI,
@@ -116,28 +102,6 @@ def _is_transient_status(
     return exc.response.status_code in _TRANSIENT_STATUS_CODES or (
         exc.response.status_code in extra
     )
-
-
-def _validate_ceiling(
-    name: str,
-    value: Optional[float],
-    disables: str,
-) -> Optional[float]:
-    """Validate one retry ceiling (``retry_backoff_max_s``/``retry_total_max_s``).
-
-    Both ceilings are enforced by comparing a delay against them, and *every*
-    comparison against NaN is False — so a NaN ceiling sails through a plain
-    ``<= 0`` check at construction and then silently disables the very limit
-    it was asked to impose. ``inf`` is rejected for the same reason: an
-    unbounded ceiling spelled as a number. ``None`` stays the one explicit,
-    documented way to opt out of a limit.
-    """
-    if value is not None and not (math.isfinite(value) and value > 0):
-        raise ValueError(
-            f"{name} must be a finite number > 0 (got {value}); "
-            f"pass None to disable the {disables}."
-        )
-    return value
 
 
 def _retry_after_delay(response: httpx.Response) -> Optional[float]:
@@ -319,7 +283,7 @@ class BackendClient:
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
-        retry_total_max_s: Optional[float] = _DEFAULT_RETRY_TOTAL_MAX_S,
+        retry_total_max_s: Optional[float] = None,
         retry_jitter: bool = True,
         client: Optional[httpx.AsyncClient] = None,
         payload_logger: Optional["PayloadLogger"] = None,
@@ -343,17 +307,43 @@ class BackendClient:
         # (high max_retries) would otherwise block the worker's event loop for
         # minutes on one call. None disables the cap for consumers that want
         # the legacy unbounded behaviour, but the default bounds it.
-        self.retry_backoff_max_s = _validate_ceiling(
-            "retry_backoff_max_s", retry_backoff_max_s, "cap",
-        )
-        # Ceiling on the *sum* of one call's inter-attempt sleeps. The per-delay
-        # caps don't bound the product of delay × attempts, and Retry-After
-        # (which bypasses retry_backoff_max_s by design) can make each delay
-        # hours long — see _DEFAULT_RETRY_TOTAL_MAX_S. None restores the legacy
-        # unbounded behaviour for consumers that want it.
-        self.retry_total_max_s = _validate_ceiling(
-            "retry_total_max_s", retry_total_max_s, "budget",
-        )
+        if retry_backoff_max_s is not None and retry_backoff_max_s <= 0:
+            raise ValueError(
+                f"retry_backoff_max_s must be > 0 (got {retry_backoff_max_s}); "
+                "pass None to disable the cap."
+            )
+        self.retry_backoff_max_s = retry_backoff_max_s
+        # Optional ceiling on the *sum* of one call's inter-attempt sleeps.
+        # The per-delay caps bound each sleep in isolation, but they multiply
+        # against the attempt budget, and Retry-After bypasses
+        # retry_backoff_max_s by design: a backend answering every attempt with
+        # ``Retry-After: 21600`` pins a terminal complete/fail report (6-attempt
+        # floor, so five inter-attempt sleeps) for up to 5 × 6h = 30h on one
+        # call. The worker runs one task at a time, so that call blocks the
+        # whole polling loop: no new claims, no cancel polls, no shutdown
+        # response — the process looks hung to operators.
+        #
+        # Default None: unbounded, exactly as before this knob existed. 600s
+        # (ten minutes) is the *recommended* opt-in value — longer than any
+        # real backend restart or rate-limit window we've observed, and giving
+        # up after it costs nothing a retries-exhausted report doesn't already
+        # cost: the task is re-queued by the sweeper either way. Enable it
+        # deliberately, per consumer (see docs/fleet/runbooks/sdk-upgrade.md).
+        #
+        # NaN is rejected as well as <= 0: every comparison against NaN is
+        # False, so a NaN budget would sail through a bare ``<= 0`` check and
+        # then silently disable the very limit it was asked to impose. ``inf``
+        # is an unbounded budget spelled as a number; None is the one
+        # documented way to say that.
+        if retry_total_max_s is not None and not (
+            math.isfinite(retry_total_max_s) and retry_total_max_s > 0
+        ):
+            raise ValueError(
+                f"retry_total_max_s must be a finite number > 0 "
+                f"(got {retry_total_max_s}); pass None (the default) to "
+                "disable the budget."
+            )
+        self.retry_total_max_s = retry_total_max_s
         # Jitter decorrelates retries across the fleet so a shared transient
         # outage doesn't produce a synchronized retry storm the instant the
         # backend recovers. Default on; tests that assert on exact delays pass
@@ -479,20 +469,22 @@ class BackendClient:
         only — used by ``complete``/``fail`` to also retry 500 (see the
         ``_TRANSIENT_STATUS_CODES`` comment for the rationale).
 
-        ``retry_total_max_s`` (default 600s; ``None`` disables) bounds the
-        *sum* of this call's inter-attempt sleeps, measured on the monotonic
-        clock: a sleep that overruns its requested delay (starved event loop)
-        is charged what it actually cost. The per-delay caps bound
-        each sleep in isolation but multiply against the attempt budget, and
-        ``Retry-After`` deliberately bypasses ``retry_backoff_max_s`` — so a
-        persistently throttled backend could otherwise hold one call (and with
-        it the worker's single-task polling loop) for up to 6 × 6h. When the
-        next required delay would not fit in what's left of the budget, the
-        loop stops early and re-raises the last error instead of sleeping on
-        and firing a near-certainly-futile request inside the rate-limit
-        window; that early stop is logged at WARNING. The outcome for the
-        caller is identical to exhausting the attempt budget — for a terminal
-        report, the task is re-queued by the backend's sweeper.
+        ``retry_total_max_s`` bounds the *sum* of this call's inter-attempt
+        sleeps, measured on the monotonic clock: a sleep that overruns its
+        requested delay (starved event loop) is charged what it actually cost.
+        It defaults to ``None`` — unbounded, the behaviour that predates the
+        knob — and 600s is the recommended value to opt into. The per-delay
+        caps bound each sleep in isolation but multiply against the attempt
+        budget, and ``Retry-After`` deliberately bypasses
+        ``retry_backoff_max_s`` — so a persistently throttled backend can hold
+        one call (and with it the worker's single-task polling loop) for up to
+        5 × 6h, the five inter-attempt sleeps of a terminal report's 6-attempt
+        floor. Once a budget is set: when the next required delay would not fit
+        in what's left of it, the loop stops early and re-raises the last error
+        instead of sleeping on and firing a near-certainly-futile request
+        inside the rate-limit window; that early stop is logged at WARNING. The
+        outcome for the caller is identical to exhausting the attempt budget —
+        for a terminal report, the task is re-queued by the backend's sweeper.
         """
         import asyncio
 

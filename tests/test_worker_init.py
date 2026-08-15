@@ -283,8 +283,8 @@ async def test_worker_init_threads_retry_params_to_client():
 
 
 async def test_worker_init_default_retry_params_match_client_defaults():
-    """The default retry policy (4 attempts / 2s base / 60s cap / 600s total
-    budget / jitter on) must reach the BackendClient when the Worker
+    """The default retry policy (4 attempts / 2s base / 60s cap / no total
+    sleep budget / jitter on) must reach the BackendClient when the Worker
     constructs one itself — identical to what a directly-constructed
     BackendClient gets, so upgrading to Worker(...) changes nothing about
     retry behaviour."""
@@ -298,25 +298,8 @@ async def test_worker_init_default_retry_params_match_client_defaults():
         assert worker._client.max_retries == 4
         assert worker._client.retry_backoff_s == 2.0
         assert worker._client.retry_backoff_max_s == 60.0
-        assert worker._client.retry_total_max_s == 600.0
-        assert worker._client.retry_jitter is True
-    finally:
-        await worker._client.close()
-
-
-async def test_worker_init_retry_total_max_none_disables_budget():
-    """Passing retry_total_max_s=None must propagate to the client as None
-    (disabling the total-sleep budget), matching BackendClient's documented
-    'pass None to disable the budget' contract."""
-    worker = Worker(
-        backend_url="http://fake/api/v1",
-        api_key="k",
-        worker_id="w",
-        handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
-        retry_total_max_s=None,
-    )
-    try:
         assert worker._client.retry_total_max_s is None
+        assert worker._client.retry_jitter is True
     finally:
         await worker._client.close()
 

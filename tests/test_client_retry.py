@@ -29,16 +29,13 @@ from task_worker_api.errors import TaskCancelled
 # Helpers
 # ---------------------------------------------------------------------------
 
-_KEEP_SDK_DEFAULT = object()
-
-
 def _client_with_handler(
     handler,
     *,
     max_retries: int = 4,
     retry_backoff_s: float = 0.0,
     retry_backoff_max_s: float | None = None,
-    retry_total_max_s=_KEEP_SDK_DEFAULT,
+    retry_total_max_s: float | None = None,
     retry_jitter: bool = False,
 ) -> BackendClient:
     """Build a real BackendClient backed by a MockTransport handler.
@@ -48,10 +45,9 @@ def _client_with_handler(
     Jitter defaults to False so timing-assertion tests stay deterministic; the
     jitter behaviour itself is covered by dedicated _backoff_delay unit tests.
 
-    ``retry_total_max_s`` keeps the SDK default (600s total sleep budget)
-    unless a test passes one explicitly — including ``None``, which restores
-    the legacy unbounded behaviour for tests that exercise multi-hour
-    per-attempt delays.
+    ``retry_total_max_s`` defaults to ``None`` — the SDK default, no total
+    sleep budget — so tests that don't name it exercise the unbounded legacy
+    retry behaviour. Budget tests pass a value explicitly.
     """
     transport = httpx.MockTransport(handler)
     http = httpx.AsyncClient(
@@ -67,7 +63,7 @@ def _client_with_handler(
     # Keep the SDK default (60s cap) unless a test explicitly overrides it.
     if retry_backoff_max_s is not None:
         kwargs["retry_backoff_max_s"] = retry_backoff_max_s
-    if retry_total_max_s is not _KEEP_SDK_DEFAULT:
+    if retry_total_max_s is not None:
         kwargs["retry_total_max_s"] = retry_total_max_s
     return BackendClient(
         "http://fake/api/v1",
@@ -1394,9 +1390,9 @@ async def test_request_caps_backoff_at_max(monkeypatch):
 
 def test_init_rejects_non_positive_backoff_max():
     """A non-positive retry_backoff_max_s is degenerate — fail fast."""
-    with pytest.raises(ValueError, match="retry_backoff_max_s must be"):
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
         BackendClient("http://fake", "x", retry_backoff_max_s=0)
-    with pytest.raises(ValueError, match="retry_backoff_max_s must be"):
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
         BackendClient("http://fake", "x", retry_backoff_max_s=-5)
 
 
@@ -2509,12 +2505,8 @@ async def test_retry_after_is_not_shortened_by_backoff_ceiling(monkeypatch):
             )
         return httpx.Response(200)
 
-    # Budget off: this test is about the per-delay ceilings. Whether an
-    # hour-long delay fits the *total* budget is a separate contract, covered
-    # by the retry_total_max_s tests below.
     client = _client_with_handler(
         handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
-        retry_total_max_s=None,
     )
     await client.complete(7, {"output": "done"})
     await client.close()
@@ -2535,7 +2527,6 @@ async def test_retry_after_has_distinct_remote_input_cap(monkeypatch):
 
     client = _client_with_handler(
         handler, max_retries=2, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
-        retry_total_max_s=None,  # see the note above; per-delay cap only
     )
     with pytest.raises(httpx.HTTPStatusError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
@@ -2648,12 +2639,14 @@ def test_retry_after_delay_parses_both_rfc_forms():
 # Total retry budget — the per-delay caps bound each sleep in isolation, but
 # they multiply against the attempt budget. A persistently rate-limited
 # backend answering every attempt with a long Retry-After (honoured in full
-# by design, and capped only at 6h) could pin a terminal complete/fail
-# report — 6-attempt floor — for up to 36h on one call. The worker runs one
-# task at a time, so that call blocks the whole polling loop: no claims, no
-# cancel polls, no shutdown response. retry_total_max_s (default 600s) caps
-# the sum of one call's sleeps; when the next delay doesn't fit, the loop
-# stops and re-raises instead of firing a futile request inside the window.
+# by design, and capped only at 6h) can pin a terminal complete/fail report —
+# 6-attempt floor, so five inter-attempt sleeps — for up to 5 × 6h = 30h on
+# one call. The worker runs one task at a time, so that call blocks the whole
+# polling loop: no claims, no cancel polls, no shutdown response.
+# retry_total_max_s caps the sum of one call's sleeps; when the next delay
+# doesn't fit, the loop stops and re-raises instead of firing a futile request
+# inside the window. It is opt-in: the default is None (unbounded, exactly as
+# before the knob existed), and 600s is the recommended value to enable.
 # -----------------------------------------------------------------------
 
 
@@ -2665,16 +2658,15 @@ def test_init_rejects_non_positive_retry_total_max():
         BackendClient("http://fake", "x", retry_total_max_s=-5)
 
 
-@pytest.mark.parametrize("knob", ["retry_total_max_s", "retry_backoff_max_s"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
-def test_init_rejects_non_finite_retry_ceilings(knob, value):
-    """A NaN ceiling is worse than a bad one: every comparison against NaN is
+def test_init_rejects_non_finite_retry_total_max(value):
+    """A NaN budget is worse than a bad one: every comparison against NaN is
     False, so it passes a bare ``<= 0`` check and then silently disables the
-    limit it was meant to impose — the caller believes they capped the wait
-    and nothing caps it. ``inf`` is an unbounded ceiling spelled as a number.
+    limit it was meant to impose — the caller believes they bounded the wait
+    and nothing bounds it. ``inf`` is an unbounded budget spelled as a number.
     ``None`` is the one supported way to opt out."""
-    with pytest.raises(ValueError, match=f"{knob} must be"):
-        BackendClient("http://fake", "x", **{knob: value})
+    with pytest.raises(ValueError, match="retry_total_max_s must be"):
+        BackendClient("http://fake", "x", retry_total_max_s=value)
 
 
 def test_init_accepts_none_retry_total_max():
@@ -2683,16 +2675,18 @@ def test_init_accepts_none_retry_total_max():
     assert client.retry_total_max_s is None
 
 
-def test_init_defaults_retry_total_max():
-    """The budget defaults to 600s."""
-    assert BackendClient("http://fake", "x").retry_total_max_s == 600.0
+def test_init_defaults_retry_total_max_to_none():
+    """The budget is opt-in: omitting it leaves retrying unbounded, so an
+    existing consumer's behaviour is unchanged by upgrading the SDK."""
+    assert BackendClient("http://fake", "x").retry_total_max_s is None
 
 
 @pytest.mark.asyncio
 async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatch):
-    """The motivating case: a complete() throttled with Retry-After: 6h must
-    not sleep it out — one such delay already exceeds the whole budget, so the
-    call gives up immediately rather than pinning the polling loop for 36h."""
+    """The motivating case: with the budget enabled, a complete() throttled
+    with Retry-After: 6h must not sleep it out — one such delay already
+    exceeds the whole budget, so the call gives up immediately rather than
+    pinning the polling loop for 30h."""
     sleeps = _sleep_recorder(monkeypatch)
     calls = {"n": 0}
 
@@ -2702,7 +2696,9 @@ async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatc
             429, headers={"Retry-After": "21600"}, text="Too Many Requests",
         )
 
-    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    client = _client_with_handler(
+        handler, max_retries=4, retry_backoff_s=2.0, retry_total_max_s=600.0,
+    )
     with pytest.raises(httpx.HTTPStatusError) as exc_info:
         await client.complete(7, {"output": "done"})
     await client.close()
@@ -2752,7 +2748,9 @@ async def test_budget_exhaustion_logs_warning(monkeypatch, caplog):
             503, headers={"Retry-After": "900"}, text="Service Unavailable",
         )
 
-    client = _client_with_handler(handler, max_retries=4)
+    client = _client_with_handler(
+        handler, max_retries=4, retry_total_max_s=600.0,
+    )
     with caplog.at_level("WARNING"):
         with pytest.raises(httpx.HTTPStatusError):
             await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
@@ -2832,9 +2830,14 @@ async def test_budget_charges_measured_time_not_requested_delay(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_budget_none_restores_unbounded_retrying(monkeypatch):
-    """None disables the budget entirely — the full attempt budget is spent
-    on hour-long delays, exactly as before this knob existed."""
+@pytest.mark.parametrize(
+    "budget", [{}, {"retry_total_max_s": None}], ids=["omitted", "explicit-none"],
+)
+async def test_no_budget_keeps_unbounded_retrying(monkeypatch, budget):
+    """No budget — omitted (the default) or an explicit None — leaves retrying
+    unbounded: the full attempt budget is spent on hour-long Retry-After
+    delays, exactly as before this knob existed. This is what every consumer
+    gets from the SDK bump alone, until it opts in."""
     sleeps = _sleep_recorder(monkeypatch)
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -2843,8 +2846,9 @@ async def test_budget_none_restores_unbounded_retrying(monkeypatch):
         )
 
     client = _client_with_handler(
-        handler, max_retries=3, retry_backoff_s=2.0, retry_total_max_s=None,
+        handler, max_retries=3, retry_backoff_s=2.0, **budget,
     )
+    assert client.retry_total_max_s is None
     with pytest.raises(httpx.HTTPStatusError):
         await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
     await client.close()
@@ -2854,8 +2858,8 @@ async def test_budget_none_restores_unbounded_retrying(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_budget_does_not_disturb_normal_retry_schedules(monkeypatch):
-    """A schedule that fits the budget is untouched — the default 600s is far
-    above the ~14s the default config actually sleeps."""
+    """A schedule that fits the budget is untouched — the recommended 600s is
+    far above the ~14s the default retry config actually sleeps."""
     sleeps = _sleep_recorder(monkeypatch)
     calls = {"n": 0}
 
@@ -2865,7 +2869,9 @@ async def test_budget_does_not_disturb_normal_retry_schedules(monkeypatch):
             return httpx.Response(503, text="Service Unavailable")
         return httpx.Response(200)
 
-    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    client = _client_with_handler(
+        handler, max_retries=4, retry_backoff_s=2.0, retry_total_max_s=600.0,
+    )
     await client.complete(7, {"output": "done"})
     await client.close()
 

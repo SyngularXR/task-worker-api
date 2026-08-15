@@ -28,12 +28,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from .cancel import CancelGuard
-from .client import (
-    BackendClient,
-    _DEFAULT_BACKOFF_MAX_S,
-    _DEFAULT_RETRY_TOTAL_MAX_S,
-    _JITTER_SPREAD,
-)
+from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -190,7 +185,7 @@ class Worker:
         max_retries: int = 4,
         retry_backoff_s: float = 2.0,
         retry_backoff_max_s: Optional[float] = _DEFAULT_BACKOFF_MAX_S,
-        retry_total_max_s: Optional[float] = _DEFAULT_RETRY_TOTAL_MAX_S,
+        retry_total_max_s: Optional[float] = None,
         retry_jitter: bool = True,
         task_timeout_s: float = DEFAULT_TASK_TIMEOUT_S,
         task_timeouts: Optional[dict] = None,

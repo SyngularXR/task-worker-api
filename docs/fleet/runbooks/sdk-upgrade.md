@@ -58,6 +58,23 @@ gh pr create --title "deps: bump task-worker-api wheel to vX.Y.Z" --body "..."
 
 The wheel URL must exist before this PR's CI runs, otherwise pytest install fails with a 404.
 
+## Staged rollout for opt-in behaviour changes
+
+Some SDK releases add a knob that is inert until a consumer sets it — the release is a no-op by design, and the behaviour change lands per worker, on your schedule. `retry_total_max_s` (the total retry-sleep budget, default `None` = unbounded, recommended value `600.0`) is the current example. Roll these out in three passes, never in one:
+
+1. **Release the no-op SDK.** Land the SDK PR and let the wheel publish. Nothing in the fleet changes behaviour — every consumer still gets the old semantics because the new knob defaults to off.
+2. **Bump each consumer's pin** using the per-repo recipes above. Still a no-op: the worker now *has* the knob, but isn't passing it.
+3. **Enable it, service by service**, only after that consumer's pin is merged and its image rebuilt on the compatible SDK. Update that worker's `Worker(...)` construction (or the config/env it reads) to pass the value — for the retry budget:
+   ```python
+   Worker(
+       ...,
+       retry_total_max_s=600.0,   # give up after 10 min of retry backoff
+   )
+   ```
+   Then flip the corresponding deployment setting for that one service in `syngar-deployment-scripts` and watch it for a full task cycle before moving to the next. One worker at a time keeps a bad value from taking the whole fleet down, and keeps the blame obvious if throughput changes.
+
+Never enable a setting on a consumer that hasn't pinned the SDK release that understands it — passing an unknown keyword to `Worker(...)`/`BackendClient(...)` is a `TypeError` at construction, which crashes the worker at startup rather than degrading.
+
 ## Audit step (do every time)
 
 For each worker, verify the entry point passes `shared_volume_path`:
