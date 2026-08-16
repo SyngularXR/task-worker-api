@@ -1085,3 +1085,122 @@ async def test_unremovable_stale_workdir_aborts_the_attempt(
     assert str(stale) in fake_client.failed_tasks[0]["error"], (
         "failure reason must name the workdir an operator has to clear"
     )
+
+
+# ----- heartbeat-through-terminal-report ordering ----------------------------
+#
+# complete()/fail() retry inside BackendClient, so one terminal report can span
+# minutes against a degraded backend. _run_one used to call progress.stop()
+# *before* that report, freezing the task's ``updated_at`` for the whole retry
+# window — long enough for the backend's stale-task sweeper to read the task as
+# abandoned, reclaim it, and hand it to a second worker that recomputes and
+# republishes the same outcome in parallel. These tests pin the new order: the
+# heartbeat stays up through the report, and a try/finally stops it afterwards
+# even when the report never returns normally.
+
+
+class _SlowCompleteClient(FakeBackendClient):
+    """``complete`` that takes a while — modelling BackendClient._retry
+    grinding through its schedule against a degraded backend — and snapshots
+    heartbeat activity on entry and exit so a test can assert ticks landed
+    *during* the report."""
+
+    def __init__(self, *, report_delay_s: float = 0.1) -> None:
+        super().__init__()
+        self._report_delay_s = report_delay_s
+        self.progress_count_at_report_start: int | None = None
+        self.progress_count_at_report_end: int | None = None
+
+    async def complete(self, task_id, result):
+        self.progress_count_at_report_start = len(self.progress_events)
+        await asyncio.sleep(self._report_delay_s)
+        self.progress_count_at_report_end = len(self.progress_events)
+        await super().complete(task_id, result)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_ticks_during_terminal_report(make_worker, tmp_path):
+    """The heartbeat must still be ticking while complete() is in flight —
+    otherwise ``updated_at`` goes stale for the whole retry window and the
+    sweeper can re-queue a task this worker is still reporting on."""
+    stl = tmp_path / "fake.stl"
+    stl.write_bytes(b"solid\nendsolid\n")
+    client = _SlowCompleteClient(report_delay_s=0.1)
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(stl)},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        heartbeat_interval_s=0.01,
+    )
+    await worker.run_one()
+
+    assert client.progress_count_at_report_start is not None
+    assert (
+        client.progress_count_at_report_end
+        > client.progress_count_at_report_start
+    ), (
+        "heartbeat must keep ticking through the terminal report, else the "
+        "stale-task sweeper can reclaim the task mid-complete() and a second "
+        "worker republishes the same outcome"
+    )
+    assert len(client.completed_tasks) == 1
+
+    # ...and it is stopped once the report is done: no ticks after run_one.
+    settled = len(client.progress_events)
+    await asyncio.sleep(0.05)  # several heartbeat intervals
+    assert len(client.progress_events) == settled, (
+        "heartbeat outlived the task — the next task's start_heartbeat "
+        "would reject the double start"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_stopped_when_worker_cancelled_mid_report(
+    make_worker, tmp_path,
+):
+    """A worker cancelled while the terminal report is in flight must still
+    tear the heartbeat down — CancelledError skips the report's own
+    ``except Exception``, so only the try/finally around it stops the loop."""
+    stl = tmp_path / "fake.stl"
+    stl.write_bytes(b"solid\nendsolid\n")
+    client = _SlowCompleteClient(report_delay_s=5.0)
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(stl)},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        heartbeat_interval_s=0.01,
+    )
+    run = asyncio.create_task(worker.run_one())
+    # Bounded wait (5s of 10ms ticks) so a regression that never reaches the
+    # report fails the assert below instead of hanging the suite.
+    for _ in range(500):
+        if client.progress_count_at_report_start is not None:
+            break
+        await asyncio.sleep(0.01)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert client.progress_count_at_report_start is not None, (
+        "the worker never reached the terminal report; the cancel landed "
+        "somewhere else and this test pinned nothing"
+    )
+
+    settled = len(client.progress_events)
+    await asyncio.sleep(0.05)  # several heartbeat intervals
+    assert len(client.progress_events) == settled, (
+        "heartbeat leaked past a cancelled terminal report"
+    )
