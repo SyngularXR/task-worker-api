@@ -193,6 +193,21 @@ def _backoff_delay(
     return delay
 
 
+def _progress_body(
+    stage: str, current: int, total: int, kill_handle: Optional[dict],
+) -> dict[str, Any]:
+    """Wire body for PUT /tasks/{id}/progress.
+
+    Shared by the retried :meth:`BackendClient.report_progress` and the
+    one-shot :meth:`BackendClient.report_progress_once` so the two can never
+    drift into sending different shapes for the same endpoint.
+    """
+    body: dict[str, Any] = {"stage": stage, "current": current, "total": total}
+    if kill_handle is not None:
+        body["kill_handle"] = kill_handle
+    return body
+
+
 async def _cancel_and_drain(task: "asyncio.Future") -> None:
     """Cancel ``task`` and wait for it to actually stop.
 
@@ -737,15 +752,55 @@ class BackendClient:
         schedule, rather than blocking the worker for up to 120s (30s × 4
         retries) on a single slow progress call.
         """
-        body: dict[str, Any] = {
-            "stage": stage, "current": current, "total": total,
-        }
-        if kill_handle is not None:
-            body["kill_handle"] = kill_handle
         resp = await self._request(
-            "PUT", f"/tasks/{task_id}/progress", json=body,
+            "PUT", f"/tasks/{task_id}/progress",
+            json=_progress_body(stage, current, total, kill_handle),
             timeout=self._lifecycle_timeout,
         )
+        return resp.json() or {}
+
+    async def report_progress_once(
+        self,
+        task_id: int,
+        *,
+        stage: str,
+        current: int = 0,
+        total: int = 0,
+        kill_handle: Optional[dict] = None,
+    ) -> dict:
+        """One-shot PUT /tasks/{id}/progress — no retries, same wire format.
+
+        Unlike :meth:`report_progress`, this performs a *single* HTTP request
+        with no exponential-backoff retry. It exists for the caller on a
+        handler's critical path: :meth:`ProgressReporter.update
+        <task_worker_api.progress.ProgressReporter.update>` emits an immediate
+        report on every stage transition, and going through ``_retry`` meant a
+        degraded backend could stall the handler for ``max_retries`` ×
+        ``lifecycle_timeout_s`` plus backoff sleeps (~75s with the default 4
+        attempts, 15s timeout, 2s base backoff) on one progress update — while
+        the work the update was describing sat idle.
+
+        Dropping a *single* progress report is cheap: the state it carries is
+        kept in the reporter and re-sent by the next background heartbeat,
+        which still uses the retried :meth:`report_progress` so the task's
+        ``updated_at`` keeps riding through backend blips (the sweeper reads a
+        stale ``updated_at`` as abandonment). Stage-transition latency is the
+        only thing traded away, and only while the backend is degraded.
+
+        Transport errors and transient HTTP status codes surface immediately
+        rather than being retried; ``ProgressReporter.update`` catches them and
+        logs at WARNING, exactly as it already does when the retried call
+        exhausts its budget.
+
+        Uses the same dedicated ``lifecycle_timeout_s`` deadline as
+        :meth:`report_progress`.
+        """
+        resp = await self._client.request(
+            "PUT", f"/tasks/{task_id}/progress",
+            json=_progress_body(stage, current, total, kill_handle),
+            timeout=self._lifecycle_timeout,
+        )
+        resp.raise_for_status()
         return resp.json() or {}
 
     async def get_cancel_status(self, task_id: int) -> dict:

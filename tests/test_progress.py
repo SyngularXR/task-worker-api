@@ -15,6 +15,7 @@ import asyncio
 
 import pytest
 
+from task_worker_api import progress as progress_mod
 from task_worker_api.errors import TaskCancelled
 from task_worker_api.progress import ProgressReporter, _SharedState
 from task_worker_api.testing import FakeBackendClient
@@ -62,6 +63,114 @@ async def test_update_swallows_backend_error(caplog):
 
     assert any("progress update failed" in r.message for r in caplog.records)
     assert pr.is_cancelled is False
+
+
+# ----- update() routes through the one-shot report ---------------------------
+
+
+class _RoutingClient(FakeBackendClient):
+    """Records which of the two progress methods each call went through."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+
+    async def report_progress(self, task_id, *, stage, current=0, total=0,
+                              kill_handle=None):
+        self.calls.append("report_progress")
+        return await super().report_progress(
+            task_id, stage=stage, current=current, total=total,
+            kill_handle=kill_handle,
+        )
+
+    async def report_progress_once(self, task_id, *, stage, current=0, total=0,
+                                   kill_handle=None):
+        self.calls.append("report_progress_once")
+        self.progress_events.append({
+            "task_id": task_id, "stage": stage,
+            "current": current, "total": total,
+        })
+        return {"cancelled": task_id in self.cancelled_task_ids}
+
+
+@pytest.mark.asyncio
+async def test_update_uses_report_progress_once_not_the_retried_call():
+    """update() runs on the handler's critical path, so its immediate report
+    must be the one-shot call — the retried one can block for ~75s
+    (max_retries x lifecycle_timeout_s plus backoff) on a degraded backend."""
+    client = _RoutingClient()
+    pr = ProgressReporter(client, task_id=1)
+    await pr.update("processing", current=1, total=4)
+
+    assert client.calls == ["report_progress_once"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_still_uses_the_retried_report_progress():
+    """The background heartbeat keeps the retried call: it's off the critical
+    path, and it's what rides through a blip to keep updated_at fresh so the
+    sweeper doesn't read the task as abandoned."""
+    client = _RoutingClient()
+    pr = ProgressReporter(client, task_id=1, heartbeat_interval_s=0.01)
+    await pr.start_heartbeat()
+    await asyncio.sleep(0.05)
+    await pr.stop()
+
+    assert client.calls, "heartbeat never ticked"
+    assert set(client.calls) == {"report_progress"}
+
+
+@pytest.mark.asyncio
+async def test_update_falls_back_to_report_progress_on_legacy_client(caplog):
+    """A duck-typed client predating report_progress_once must keep working
+    — the immediate report goes through the retried call instead."""
+
+    class _LegacyClient:
+        def __init__(self):
+            self.events = []
+
+        async def report_progress(self, task_id, *, stage, current=0, total=0,
+                                  kill_handle=None):
+            self.events.append(stage)
+            return {"cancelled": False}
+
+    # Process-wide flag — reset so this test is order-independent.
+    progress_mod._warned_legacy_progress_client = False
+
+    client = _LegacyClient()
+    pr = ProgressReporter(client, task_id=1)
+    with caplog.at_level("WARNING"):
+        await pr.update("processing")
+
+    assert client.events == ["processing"]
+    assert sum(
+        "report_progress_once" in r.message for r in caplog.records
+    ) == 1, "legacy fallback must warn exactly once"
+
+
+@pytest.mark.asyncio
+async def test_legacy_fallback_warns_only_once_per_process(caplog):
+    """The condition is per-update; one line per stage transition of every
+    task would be noise, so the warning fires once per process."""
+
+    class _LegacyClient:
+        async def report_progress(self, task_id, *, stage, current=0, total=0,
+                                  kill_handle=None):
+            return {"cancelled": False}
+
+    # The module-level flag is process-wide; a prior test may already have
+    # tripped it, so reset it to make this test order-independent.
+    progress_mod._warned_legacy_progress_client = False
+
+    pr = ProgressReporter(_LegacyClient(), task_id=1)
+    with caplog.at_level("WARNING"):
+        await pr.update("a")
+        await pr.update("b")
+        await ProgressReporter(_LegacyClient(), task_id=2).update("c")
+
+    assert sum(
+        "report_progress_once" in r.message for r in caplog.records
+    ) == 1
 
 
 # ----- start_heartbeat / stop ------------------------------------------------

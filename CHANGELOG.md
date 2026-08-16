@@ -3,6 +3,29 @@
 ## Unreleased
 
 **Fixes:**
+- `ProgressReporter.update()` no longer stalls a handler on a degraded
+  backend. The immediate progress report it emits on every stage transition
+  runs on the handler's critical path, but went through the retried
+  `BackendClient.report_progress` — so one update could block the handler for
+  `max_retries` × `lifecycle_timeout_s` plus backoff sleeps (~75s with the
+  SDK defaults: 4 attempts, 15s lifecycle timeout, 2s base backoff) while the
+  work it was describing sat idle. `update()` now calls a new
+  `BackendClient.report_progress_once` — a one-shot PUT to the same
+  `/tasks/{id}/progress` endpoint, same body, same `lifecycle_timeout_s`
+  deadline, no retry loop — so a stalled report costs at most one 15s
+  timeout. Dropping a single immediate report only costs stage-transition
+  latency: the state is already in the reporter, and the **background
+  heartbeat still uses the retried `report_progress`**, which is what keeps
+  `updated_at` fresh through a backend blip so the sweeper doesn't read the
+  task as abandoned. Errors surface to `update()`'s existing WARNING, exactly
+  as an exhausted retry budget already did. This mirrors what
+  `poll_cancel_status` did for the `CancelGuard`'s hot poll path.
+  **Additive and backward-compatible**: a duck-typed client without
+  `report_progress_once` (a worker repo's own client, a test double, a
+  `FakeBackendClient` subclass — `Worker(client=...)` accepts any of them)
+  keeps the retried call it always had, and logs one WARNING per process
+  naming the method to add. `FakeBackendClient` gained the method, delegating
+  to `report_progress` so subclasses that override it still see both paths.
 - `BackendClient` (and `Worker`, which forwards it) takes a new optional
   `retry_sleep_budget_s` — a budget for the time one call may spend *sleeping*
   between retry attempts. **It defaults to `None`, which is

@@ -15,6 +15,7 @@ HTTP paths, which were previously only tested via the in-memory test double.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 
 import httpx
@@ -2183,6 +2184,210 @@ async def test_poll_cancel_status_cancel_timeout_none_falls_back():
     assert seen[0] is not None
     assert seen[0]["read"] is None
     assert seen[0]["write"] is None
+
+
+# -----------------------------------------------------------------------
+# report_progress_once — one-shot progress PUT with NO retries, for the
+# immediate report ProgressReporter.update() emits on the handler's
+# critical path. Going through _retry there meant a degraded backend could
+# stall the handler for ~75s (4 attempts x 15s lifecycle timeout plus
+# backoff) on a single progress update. The background heartbeat keeps
+# using the retried report_progress, so updated_at still rides out blips.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_does_not_retry_transport_error():
+    """A transient TransportError must surface immediately — exactly one
+    attempt, no backoff. The next heartbeat re-sends the state."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.TransportError("transient hiccup")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.TransportError, match="transient hiccup"):
+        await client.report_progress_once(7, stage="working")
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_does_not_retry_transient_5xx():
+    """A 503 must surface immediately — unlike report_progress, which
+    retries it."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, text="Service Unavailable")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.report_progress_once(7, stage="working")
+    await client.close()
+
+    assert calls["n"] == 1
+    assert exc_info.value.response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_does_not_retry_429():
+    """A 429 must surface immediately — same one-shot contract as 5xx."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, text="Too Many Requests")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.report_progress_once(7, stage="working")
+    await client.close()
+
+    assert calls["n"] == 1
+    assert exc_info.value.response.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_no_backoff_sleeps(monkeypatch):
+    """The one-shot report must not schedule any backoff sleeps — that
+    sleep would be spent on the handler's critical path."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("read timed out")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.TimeoutException):
+        await client.report_progress_once(7, stage="working")
+    await client.close()
+
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_sends_same_body_as_retried():
+    """Same wire format as report_progress — path, method, and body
+    (including the kill_handle) must be byte-identical."""
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({
+            "method": request.method,
+            "path": request.url.path,
+            "body": json.loads(request.content),
+        })
+        return httpx.Response(200, json={"cancelled": True})
+
+    kill_handle = {"pid": None, "container": None, "host": "remote"}
+    client = _client_with_handler(handler)
+    result = await client.report_progress_once(
+        7, stage="rendering", current=3, total=10, kill_handle=kill_handle,
+    )
+    await client.report_progress(
+        7, stage="rendering", current=3, total=10, kill_handle=kill_handle,
+    )
+    await client.close()
+
+    assert result == {"cancelled": True}
+    assert len(seen) == 2
+    assert seen[0] == seen[1]
+    assert seen[0]["method"] == "PUT"
+    assert seen[0]["path"] == "/api/v1/tasks/7/progress"
+    assert seen[0]["body"] == {
+        "stage": "rendering", "current": 3, "total": 10,
+        "kill_handle": kill_handle,
+    }
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_omits_absent_kill_handle():
+    """No kill_handle → the key is absent, matching report_progress."""
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(handler)
+    assert await client.report_progress_once(7, stage="working") == {}
+    await client.close()
+
+    assert seen == [{"stage": "working", "current": 0, "total": 0}]
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_uses_lifecycle_timeout_not_general():
+    """The one-shot report must apply lifecycle_timeout_s, not the 30s
+    general request timeout — same deadline as report_progress."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json={"cancelled": False})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=transport,
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0, lifecycle_timeout_s=15.0,
+        client=http,
+    )
+    await client.report_progress_once(7, stage="working")
+    await client.close()
+
+    assert len(seen) == 1
+    assert seen[0] is not None
+    assert seen[0]["read"] == 15.0
+    assert seen[0]["write"] == 15.0
+    assert seen[0]["connect"] == 15.0
+    assert seen[0]["pool"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_report_progress_once_raises_on_500():
+    """A 500 is non-transient — must surface immediately (one attempt)."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="Internal Server Error")
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.report_progress_once(7, stage="working")
+    await client.close()
+
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_report_progress_still_retries_transient_5xx():
+    """The retried path is unchanged — the heartbeat still rides through a
+    backend blip that the one-shot path now surfaces immediately."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(200, json={"cancelled": False})
+
+    client = _client_with_handler(handler, max_retries=4)
+    assert await client.report_progress(7, stage="working") == {"cancelled": False}
+    await client.close()
+
+    assert calls["n"] == 3
 
 
 # -----------------------------------------------------------------------
