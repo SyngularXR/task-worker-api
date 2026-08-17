@@ -3,6 +3,21 @@
 ## Unreleased
 
 **Fixes:**
+- `CancelGuard` no longer silently loses cancel detection on a duck-typed
+  client that predates `BackendClient.poll_cancel_status`. The guard's poll
+  loop called `client.poll_cancel_status(task_id)` unconditionally; on a
+  legacy client (a worker repo's own client, a test double, a
+  `FakeBackendClient` subclass — `Worker(client=...)` accepts any of them)
+  every tick raised `AttributeError`, which the loop swallows at DEBUG — so
+  the `cancelled` event never set, the `on_cancel` hook never fired (a
+  subprocess handler like Blender/colmap was never terminated), and the
+  event threaded into `prepare_inputs`/`upload_outputs` never aborted a file
+  transfer. The guard now falls back to the retried `get_cancel_status` for
+  such clients — exactly the behaviour it had before the one-shot poll
+  existed — and logs one WARNING per process naming the method to add,
+  mirroring the `report_progress_once` fallback. **Additive and
+  backward-compatible**: clients with `poll_cancel_status` (including the
+  SDK's own `BackendClient`) are unaffected and keep the one-shot poll.
 - `Worker._run_one` now keeps the progress heartbeat running *through* the
   terminal `complete()`/`fail()` report, instead of stopping it just before.
   Those calls retry inside `BackendClient`, so against a degraded backend one

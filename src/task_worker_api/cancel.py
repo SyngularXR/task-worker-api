@@ -27,6 +27,45 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
+#: Set once a client without ``poll_cancel_status`` has been warned about, so
+#: a legacy client logs one WARNING per process rather than one per poll tick
+#: of every task the worker runs.
+_warned_legacy_cancel_client = False
+
+
+def _cancel_status_poller(client: "BackendClient"):
+    """``client.poll_cancel_status`` if it has one, else ``get_cancel_status``.
+
+    ``poll_cancel_status`` (a single-shot GET with no client-level retries)
+    was added after worker repos and test doubles had already grown their own
+    clients against the older protocol (``Worker(client=...)`` takes any
+    duck-typed client). Calling it unconditionally would raise
+    ``AttributeError`` on the guard's very first tick of every such client;
+    the poll loop swallows exceptions at DEBUG, so the failure mode is silent
+    and total: the ``cancelled`` event never sets, ``on_cancel`` never fires
+    (a subprocess handler like Blender/colmap is never terminated), and the
+    event threaded into ``prepare_inputs``/``upload_outputs`` never aborts
+    file transfers — the cancel-abort guarantees from the one-shot poll all
+    quietly vanish. Falling back to ``get_cancel_status`` keeps those clients
+    functional; they just keep the old worst case, where a degraded backend
+    can delay cancel detection by the client's retry chain.
+    """
+    poll = getattr(client, "poll_cancel_status", None)
+    if poll is not None:
+        return poll
+    global _warned_legacy_cancel_client
+    if not _warned_legacy_cancel_client:
+        _warned_legacy_cancel_client = True
+        log.warning(
+            "%s has no 'poll_cancel_status'; cancel polling falls back to "
+            "the retried 'get_cancel_status', so a degraded backend can "
+            "delay cancel detection by max_retries x cancel_timeout_s plus "
+            "backoff (~50s with SDK defaults). Add a one-shot (no-retry) "
+            "'poll_cancel_status' with the same signature.",
+            type(client).__qualname__,
+        )
+    return client.get_cancel_status
+
 
 @asynccontextmanager
 async def CancelGuard(
@@ -46,6 +85,12 @@ async def CancelGuard(
     with exponential backoff); a slow backend could stall the guard for
     ~50s while the worker kept computing on a cancelled task.
 
+    A duck-typed client that predates ``poll_cancel_status`` (``Worker(
+    client=...)`` accepts any client) keeps working through the retried
+    ``get_cancel_status``, with a one-time WARNING naming the method to
+    add — cancel detection degrades to that call's worst case but is never
+    silently dead.
+
     When cancelled:
       - Calls ``on_cancel()`` synchronously. This runs on the guard's
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
@@ -59,11 +104,12 @@ async def CancelGuard(
     only after they return.
     """
     cancelled = asyncio.Event()
+    poll_status = _cancel_status_poller(client)
 
     async def _poll():
         while not cancelled.is_set():
             try:
-                resp = await client.poll_cancel_status(task_id)
+                resp = await poll_status(task_id)
                 if resp.get("cancelled"):
                     cancelled.set()
                     if on_cancel is not None:

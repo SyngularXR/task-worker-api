@@ -14,6 +14,7 @@ import asyncio
 
 import pytest
 
+import task_worker_api.cancel as cancel_mod
 from task_worker_api.cancel import CancelGuard
 from task_worker_api.enums import TaskStatus
 from task_worker_api.errors import TaskCancelled
@@ -198,3 +199,62 @@ async def test_guard_poll_error_uses_one_shot_no_retries():
         "poll_cancel_status should not retry"
     )
     assert call_count["n"] >= 2, "expected at least 2 poll cycles"
+
+
+@pytest.mark.asyncio
+async def test_legacy_client_without_poll_cancel_status_still_detects_cancel():
+    """A duck-typed client predating ``poll_cancel_status`` must not lose
+    cancel detection. Before the fallback, every tick raised
+    ``AttributeError`` on such a client; the poll loop swallows exceptions
+    at DEBUG, so the guard silently never set its ``cancelled`` event —
+    ``on_cancel`` (e.g. terminating a subprocess handler) never fired and
+    the event threaded into prepare_inputs/upload_outputs never aborted a
+    file transfer."""
+
+    class _LegacyClient:
+        """The pre-``poll_cancel_status`` protocol: only the retried poll."""
+
+        def __init__(self):
+            self.cancelled = False
+
+        async def get_cancel_status(self, task_id):
+            return {"cancelled": self.cancelled}
+
+    client = _LegacyClient()
+    client.cancelled = True
+    on_cancel_fired = []
+
+    with pytest.raises(TaskCancelled):
+        async with CancelGuard(
+            client, task_id=1, poll_interval_s=0.01,
+            on_cancel=lambda: on_cancel_fired.append(True),
+        ) as cancelled:
+            await asyncio.wait_for(cancelled.wait(), timeout=2)
+
+    assert on_cancel_fired == [True]
+
+
+@pytest.mark.asyncio
+async def test_legacy_fallback_warns_once_per_process(caplog):
+    """The fallback condition is per-poll; one line per tick of every task
+    would be noise, so the warning fires once per process (mirrors the
+    ``report_progress_once`` fallback warning)."""
+
+    class _LegacyClient:
+        async def get_cancel_status(self, task_id):
+            return {"cancelled": False}
+
+    # The module-level flag is process-wide; a prior test may already have
+    # tripped it, so reset it to make this test order-independent.
+    cancel_mod._warned_legacy_cancel_client = False
+
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            async with CancelGuard(
+                _LegacyClient(), task_id=1, poll_interval_s=0.01,
+            ):
+                await asyncio.sleep(0.03)
+
+    assert sum(
+        "poll_cancel_status" in r.message for r in caplog.records
+    ) == 1
