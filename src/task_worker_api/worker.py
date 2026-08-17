@@ -519,6 +519,12 @@ class Worker:
         reclaim it while the worker is still fetching — the worker then
         processes and completes a task the backend no longer owns.
 
+        The heartbeat also stays up *through* the terminal complete()/fail()
+        report and is only stopped afterwards, for the same reason: those
+        calls retry inside BackendClient and can span minutes against a
+        degraded backend, and a task whose ``updated_at`` freezes for that
+        window is exactly what the sweeper reclaims.
+
         The CancelGuard is also started *before* ``prepare_inputs`` and its
         ``cancelled`` event is threaded into both the download and upload
         loops. Remote-mode ``prepare_inputs`` can spend minutes streaming
@@ -690,66 +696,85 @@ class Worker:
             outcome = ("fail", f"{type(e).__name__}: {e}\n{tb}")
         finally:
             fired = wd.stop() if wd is not None else False
-            await progress.stop()
-            # Single terminal report. If the watchdog fired, the deadline won;
-            # otherwise report the handler outcome. The guard makes this
-            # exactly-once even against the watchdog's hard-exit path.
-            if guard.claim():
-                # Determine the terminal method + payload up front so the
-                # except handler can log *which* report failed and on which
-                # task — a bare ``except: pass`` here was silently swallowing
-                # failures of the complete()/fail() call itself. BackendClient
-                # already retries transient transport/5xx errors inside
-                # _retry, so an exception reaching this block means retries
-                # were exhausted (backend down longer than the retry window)
-                # or a non-transient error surfaced. Either way the backend
-                # never learns the task's terminal status: a completed task
-                # stays "in_progress" until the sweeper marks it stale, and
-                # the operator had zero visibility. Surface it at ERROR so
-                # it's not invisible, while keeping the non-raising contract
-                # (the polling loop must keep running other tasks).
-                # ``terminal`` mirrors the branch the try-block will take, so
-                # the except handler can name the call that failed even when
-                # the exception fires before the method returns. ``fired`` wins
-                # over outcome because a timeout overrides a late completion.
-                if fired:
-                    terminal = "fail"
-                elif outcome[0] == "complete":
-                    terminal = "complete"
-                else:
-                    terminal = "fail"
-                try:
+            # The heartbeat keeps ticking *through* the terminal report and is
+            # only stopped in the finally below. complete()/fail() go through
+            # BackendClient._retry, so against a degraded backend one report
+            # can span minutes of retries and backoff. Stopping the heartbeat
+            # first froze the task's ``updated_at`` for that whole window, and
+            # the backend's stale-task sweeper reads a stale ``updated_at`` as
+            # abandonment: it reclaims and re-queues the task mid-report, a
+            # second worker claims it, and both compute and publish the same
+            # outcome in parallel. Ticks during the report are what tell the
+            # sweeper this worker is still alive and finishing the task.
+            try:
+                # Single terminal report. If the watchdog fired, the deadline
+                # won; otherwise report the handler outcome. The guard makes
+                # this exactly-once even against the watchdog's hard-exit path.
+                if guard.claim():
+                    # Determine the terminal method + payload up front so the
+                    # except handler can log *which* report failed and on which
+                    # task — a bare ``except: pass`` here was silently swallowing
+                    # failures of the complete()/fail() call itself. BackendClient
+                    # already retries transient transport/5xx errors inside
+                    # _retry, so an exception reaching this block means retries
+                    # were exhausted (backend down longer than the retry window)
+                    # or a non-transient error surfaced. Either way the backend
+                    # never learns the task's terminal status: a completed task
+                    # stays "in_progress" until the sweeper marks it stale, and
+                    # the operator had zero visibility. Surface it at ERROR so
+                    # it's not invisible, while keeping the non-raising contract
+                    # (the polling loop must keep running other tasks).
+                    # ``terminal`` mirrors the branch the try-block will take, so
+                    # the except handler can name the call that failed even when
+                    # the exception fires before the method returns. ``fired`` wins
+                    # over outcome because a timeout overrides a late completion.
                     if fired:
-                        await self._client.fail(
-                            task.id, f"timeout: exceeded {timeout_s:.0f}s",
-                        )
-                        log.warning(
-                            "task %s timed out (%s)", task.id, task.task_type.value
-                        )
+                        terminal = "fail"
                     elif outcome[0] == "complete":
-                        await self._client.complete(task.id, outcome[1])
-                        log.info(
-                            "task %s completed (%s)", task.id, task.task_type.value
-                        )
+                        terminal = "complete"
                     else:
-                        await self._client.fail(task.id, outcome[1])
-                        if outcome[1] == "cancelled by user":
-                            log.info("task %s cancelled by user", task.id)
-                except Exception as report_exc:  # noqa: BLE001
-                    # The terminal status call itself failed after exhausting
-                    # the client's own retries. Log at ERROR (not WARNING) —
-                    # this is a task whose handler outcome is *lost*: the
-                    # backend will leave it in_progress and eventually sweep
-                    # it as stale. The handler result was computed but never
-                    # delivered, so an operator needs to know which task and
-                    # which terminal method failed. We intentionally do NOT
-                    # re-raise: a single failed terminal report must not
-                    # kill the polling loop and strand every subsequent task.
-                    log.error(
-                        "task %s: terminal %s report failed after retries; "
-                        "backend did not record outcome=%r: %s",
-                        task.id, terminal, outcome[1], report_exc,
-                    )
+                        terminal = "fail"
+                    try:
+                        if fired:
+                            await self._client.fail(
+                                task.id, f"timeout: exceeded {timeout_s:.0f}s",
+                            )
+                            log.warning(
+                                "task %s timed out (%s)",
+                                task.id, task.task_type.value,
+                            )
+                        elif outcome[0] == "complete":
+                            await self._client.complete(task.id, outcome[1])
+                            log.info(
+                                "task %s completed (%s)",
+                                task.id, task.task_type.value,
+                            )
+                        else:
+                            await self._client.fail(task.id, outcome[1])
+                            if outcome[1] == "cancelled by user":
+                                log.info("task %s cancelled by user", task.id)
+                    except Exception as report_exc:  # noqa: BLE001
+                        # The terminal status call itself failed after exhausting
+                        # the client's own retries. Log at ERROR (not WARNING) —
+                        # this is a task whose handler outcome is *lost*: the
+                        # backend will leave it in_progress and eventually sweep
+                        # it as stale. The handler result was computed but never
+                        # delivered, so an operator needs to know which task and
+                        # which terminal method failed. We intentionally do NOT
+                        # re-raise: a single failed terminal report must not
+                        # kill the polling loop and strand every subsequent task.
+                        log.error(
+                            "task %s: terminal %s report failed after retries; "
+                            "backend did not record outcome=%r: %s",
+                            task.id, terminal, outcome[1], report_exc,
+                        )
+            finally:
+                # Always tear the heartbeat down, even if the report block
+                # raised something the except above doesn't catch (guard.claim
+                # blowing up) or the worker task was cancelled mid-report — a
+                # leaked heartbeat outlives the task and double-starts the next
+                # one (start_heartbeat rejects a double start).
+                await progress.stop()
             # Off the event loop: a finished task's workdir holds its staged
             # inputs *and* its outputs (colmap-splat PLYs, Neural-Canvas
             # splats), so a synchronous rmtree freezes the loop for the whole

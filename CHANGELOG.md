@@ -3,6 +3,21 @@
 ## Unreleased
 
 **Fixes:**
+- `Worker._run_one` now keeps the progress heartbeat running *through* the
+  terminal `complete()`/`fail()` report, instead of stopping it just before.
+  Those calls retry inside `BackendClient`, so against a degraded backend one
+  report can span minutes of attempts and backoff — and with the heartbeat
+  already stopped, the task's `updated_at` stayed frozen for that entire
+  window. That is exactly what the backend's stale-task sweeper reads as
+  abandonment: it reclaimed and re-queued a task this worker was still
+  reporting on, a second worker claimed it, and both computed and published
+  the same outcome in parallel. Heartbeat ticks during the report are what
+  tell the sweeper the worker is alive and finishing. The report block is
+  wrapped in `try`/`finally` so `progress.stop()` still runs if the report
+  raises something its own `except Exception` doesn't catch, or if the worker
+  task is cancelled mid-report — a leaked heartbeat would outlive the task and
+  make the next task's `start_heartbeat()` reject a double start. No API
+  change; consumers get the new ordering by upgrading.
 - `ProgressReporter.update()` no longer stalls a handler on a degraded
   backend. The immediate progress report it emits on every stage transition
   runs on the handler's critical path, but went through the retried
