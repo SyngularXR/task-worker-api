@@ -21,7 +21,7 @@ import random
 import httpx
 import pytest
 
-from task_worker_api.client import BackendClient
+from task_worker_api.client import _DOWNLOAD_CHUNK_BYTES, BackendClient
 from task_worker_api.enums import TaskType
 from task_worker_api.errors import TaskCancelled
 
@@ -243,6 +243,92 @@ async def test_download_file_streams_bytes_to_disk(tmp_path):
     await client.close()
 
     assert dest.read_bytes() == body
+
+
+@pytest.mark.asyncio
+async def test_download_file_writes_off_the_event_loop_in_1mb_chunks(
+    tmp_path, monkeypatch,
+):
+    """Disk writes must run in a worker thread, on 1 MB chunk boundaries.
+
+    ``aiter_bytes()`` yields whatever the transport hands over (~64 KB), and
+    the write of each one used to run inline: a multi-GB PLY/splat on slow
+    storage froze the event loop for the whole download, so the heartbeat
+    stopped ticking (the sweeper reclaims the task), the CancelGuard poll
+    froze, and a hybrid-mode FastAPI app stopped serving. Writing every wire
+    chunk off-loop instead would be tens of thousands of dispatches per GB,
+    hence the re-chunking.
+
+    The wire chunks below are deliberately small (64 KB, the realistic
+    transport size), so the recorded write sizes distinguish "re-chunked to
+    1 MB" from "one write per wire chunk".
+    """
+    import threading
+
+    from task_worker_api import client as client_mod
+
+    wire_chunk = 64 * 1024
+    n_wire_chunks = 40  # 2.5 MB → two full 1 MB writes plus a partial tail
+    payload = bytes(range(256)) * (wire_chunk // 256)
+
+    async def body():
+        for _ in range(n_wire_chunks):
+            yield payload
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body())
+
+    loop_thread = threading.current_thread()
+    writes: list[tuple[int, threading.Thread]] = []
+    real_open = open
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+
+        def write(self, data):
+            writes.append((len(data), threading.current_thread()))
+            return self._f.write(data)
+
+        def close(self):
+            return self._f.close()
+
+        # The pre-fix code used ``with open(dest, "wb") as f``; supporting the
+        # protocol keeps this test failing on its actual assertions there
+        # rather than on a missing ``__exit__``.
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+            return False
+
+    def spy_open(path, mode, *a, **kw):
+        return _SpyFile(real_open(path, mode, *a, **kw))
+
+    # ``client.py`` calls the builtin ``open`` unqualified, so a module-level
+    # name shadows it for the duration of the test only.
+    monkeypatch.setattr(client_mod, "open", spy_open, raising=False)
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert writes, "download wrote nothing"
+    assert all(t is not loop_thread for _, t in writes), (
+        "download_file wrote to disk on the event-loop thread; a multi-GB "
+        "transfer on slow storage freezes the heartbeat and the cancel poll"
+    )
+    sizes = [n for n, _ in writes]
+    assert sizes[:-1] == [_DOWNLOAD_CHUNK_BYTES] * (len(sizes) - 1), (
+        f"stream must be re-chunked to {_DOWNLOAD_CHUNK_BYTES} B before "
+        f"writing, got {sizes}"
+    )
+    assert 0 < sizes[-1] <= _DOWNLOAD_CHUNK_BYTES
+    assert sum(sizes) == wire_chunk * n_wire_chunks
+    # Re-chunking must not corrupt or reorder the body.
+    assert dest.read_bytes() == payload * n_wire_chunks
 
 
 @pytest.mark.asyncio
@@ -482,7 +568,14 @@ async def test_download_file_aborts_mid_stream_when_cancel_set(tmp_path):
 
     The handler counts the chunks it hands out, so draining the body to
     completion (the pre-fix behaviour) is distinguishable from aborting.
+
+    The cancellation boundary is a written 1 MB chunk, not a wire chunk, so
+    the wire chunks here are half of ``_DOWNLOAD_CHUNK_BYTES``: two of them
+    fill the re-chunk buffer and the abort lands on the first write. Wire
+    chunks smaller than that would all be buffered into a single final chunk
+    and the body would drain in full before the check ever ran.
     """
+    chunk = _DOWNLOAD_CHUNK_BYTES // 2
     chunks_sent = {"n": 0}
     cancelled = asyncio.Event()
 
@@ -492,7 +585,7 @@ async def test_download_file_aborts_mid_stream_when_cancel_set(tmp_path):
             if chunks_sent["n"] == 2:
                 # A CancelGuard poll observing the user's cancel, mid-stream.
                 cancelled.set()
-            yield b"x" * 1024
+            yield b"x" * chunk
 
     requests = {"n": 0}
 

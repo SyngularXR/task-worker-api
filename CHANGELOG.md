@@ -3,6 +3,23 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient.download_file` no longer blocks the event loop while writing
+  to disk. It streamed straight from `aiter_bytes()` — whatever the transport
+  handed over, typically ~64 KB — and wrote each chunk inline, along with
+  opening and closing `dest`. On slow or network-mounted storage a multi-GB
+  input (a colmap-splat PLY, a Neural-Canvas splat) therefore froze the loop
+  for the whole transfer: the heartbeat stopped ticking, so the backend's
+  stale-task sweeper read the frozen `updated_at` as abandonment and reclaimed
+  a task the worker was actively downloading for; the `CancelGuard` poll froze
+  with it, so a user cancel stayed invisible; and in hybrid mode the worker's
+  FastAPI app stopped serving requests. The stream is now re-chunked to 1 MB
+  and every filesystem call — open, each write, close — runs through
+  `asyncio.to_thread`, mirroring `files._copyfile_async` (which fixed the same
+  bug class for local-mode copies). Re-chunking keeps the thread dispatches
+  proportional to the file size instead of to the transport's chunking; the
+  cancellation boundary is correspondingly a 1 MB write rather than a wire
+  chunk, which is still well inside a heartbeat interval. No API change —
+  same signature, same bytes, same retry/cleanup/cancel semantics.
 - `CancelGuard` no longer silently loses cancel detection on a duck-typed
   client that predates `BackendClient.poll_cancel_status`. The guard's poll
   loop called `client.poll_cancel_status(task_id)` unconditionally; on a
