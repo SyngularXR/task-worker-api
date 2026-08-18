@@ -93,14 +93,15 @@ _JITTER_SPREAD = 0.25
 # parameter; consumers can override it per Worker/BackendClient.
 _DEFAULT_FILE_TIMEOUT_S = 300.0
 
-# Bytes written per ``download_file`` iteration. ``aiter_bytes()`` yields
+# Bytes buffered per ``download_file`` disk write. ``aiter_bytes()`` yields
 # whatever the transport hands over — typically ~64 KB — and each write is a
-# blocking filesystem call. Writing every wire chunk straight through would
-# mean tens of thousands of thread dispatches per GB, so the stream is
-# re-chunked to this size and each chunk is written off the event-loop thread.
-# Same trade-off as ``files._COPY_CHUNK_BYTES``: large enough that a multi-GB
-# transfer is not dispatch-bound, small enough that ``cancelled`` still aborts
-# promptly mid-file (a 1 MB write is the cancellation granularity).
+# blocking filesystem call, so writing every wire chunk straight through would
+# mean tens of thousands of thread dispatches per GB. Chunks are accumulated
+# to this size and the buffer is written off the event-loop thread. Same
+# trade-off as ``files._COPY_CHUNK_BYTES``: large enough that a multi-GB
+# transfer is not dispatch-bound, small enough that memory stays bounded.
+# This is a *write* granularity only — ``cancelled`` is still checked at every
+# chunk the transport delivers, so it does not delay a cancel.
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
@@ -934,10 +935,10 @@ class BackendClient:
         so the heartbeat stopped ticking (the backend's stale-task sweeper
         reads the frozen ``updated_at`` as abandonment and reclaims a task the
         worker is actively downloading for), the ``CancelGuard`` poll froze
-        with it, and a hybrid-mode FastAPI app stopped serving. The stream is
-        re-chunked to ``_DOWNLOAD_CHUNK_BYTES`` (1 MB) first, so the thread
-        dispatches stay proportional to the file size rather than to the
-        transport's ~64 KB chunking.
+        with it, and a hybrid-mode FastAPI app stopped serving. Wire chunks
+        are accumulated into a ``_DOWNLOAD_CHUNK_BYTES`` (1 MB) buffer before
+        each write, so the thread dispatches stay proportional to the file
+        size rather than to the transport's ~64 KB chunking.
 
         If every attempt fails (retries exhausted or a non-retryable error),
         any partial file left at ``dest`` is removed so callers never see a
@@ -945,8 +946,9 @@ class BackendClient:
 
         When ``cancelled`` is supplied (an ``asyncio.Event`` from a
         ``CancelGuard`` active during input staging), the event is checked
-        before the request goes out and again before each chunk is written,
-        raising :class:`TaskCancelled` at the next 1 MB boundary. Without
+        before the request goes out and again on every chunk the transport
+        delivers, raising :class:`TaskCancelled` at that chunk boundary
+        rather than waiting for the 1 MB write buffer to fill. Without
         the in-stream check, a cancel arriving mid-download was invisible
         until the whole file finished: ``prepare_inputs`` only looked between
         batch files, so a single-file input set (a lone colmap-splat PLY, a
@@ -975,9 +977,22 @@ class BackendClient:
                 resp.raise_for_status()
                 f = await asyncio.to_thread(open, dest, "wb")
                 try:
-                    async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                    # The stream is iterated at the transport's own
+                    # granularity (~64 KB) so ``cancelled`` is seen at every
+                    # chunk that arrives; the writes are what get batched into
+                    # _DOWNLOAD_CHUNK_BYTES buffers. Re-chunking the iteration
+                    # itself instead would tie the cancel check to the buffer
+                    # filling up: a stalled response, or a body smaller than
+                    # one buffer, hides the cancel until the transfer ends.
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes():
                         _raise_if_cancelled()
-                        await asyncio.to_thread(f.write, chunk)
+                        buf += chunk
+                        if len(buf) >= _DOWNLOAD_CHUNK_BYTES:
+                            await asyncio.to_thread(f.write, buf)
+                            buf = bytearray()
+                    if buf:
+                        await asyncio.to_thread(f.write, buf)
                 finally:
                     # close() flushes the last buffered write, so it blocks
                     # like any other write and belongs off the loop too.

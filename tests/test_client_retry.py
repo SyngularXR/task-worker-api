@@ -260,7 +260,7 @@ async def test_download_file_writes_off_the_event_loop_in_1mb_chunks(
     hence the re-chunking.
 
     The wire chunks below are deliberately small (64 KB, the realistic
-    transport size), so the recorded write sizes distinguish "re-chunked to
+    transport size), so the recorded write sizes distinguish "buffered to
     1 MB" from "one write per wire chunk".
     """
     import threading
@@ -321,13 +321,13 @@ async def test_download_file_writes_off_the_event_loop_in_1mb_chunks(
         "transfer on slow storage freezes the heartbeat and the cancel poll"
     )
     sizes = [n for n, _ in writes]
-    assert sizes[:-1] == [_DOWNLOAD_CHUNK_BYTES] * (len(sizes) - 1), (
-        f"stream must be re-chunked to {_DOWNLOAD_CHUNK_BYTES} B before "
+    assert all(n >= _DOWNLOAD_CHUNK_BYTES for n in sizes[:-1]), (
+        f"wire chunks must be buffered to {_DOWNLOAD_CHUNK_BYTES} B before "
         f"writing, got {sizes}"
     )
     assert 0 < sizes[-1] <= _DOWNLOAD_CHUNK_BYTES
     assert sum(sizes) == wire_chunk * n_wire_chunks
-    # Re-chunking must not corrupt or reorder the body.
+    # Buffering must not corrupt or reorder the body.
     assert dest.read_bytes() == payload * n_wire_chunks
 
 
@@ -569,13 +569,14 @@ async def test_download_file_aborts_mid_stream_when_cancel_set(tmp_path):
     The handler counts the chunks it hands out, so draining the body to
     completion (the pre-fix behaviour) is distinguishable from aborting.
 
-    The cancellation boundary is a written 1 MB chunk, not a wire chunk, so
-    the wire chunks here are half of ``_DOWNLOAD_CHUNK_BYTES``: two of them
-    fill the re-chunk buffer and the abort lands on the first write. Wire
-    chunks smaller than that would all be buffered into a single final chunk
-    and the body would drain in full before the check ever ran.
+    The chunks are deliberately tiny (1 KB, a 10 KB body — far under the
+    ``_DOWNLOAD_CHUNK_BYTES`` write buffer) and the boundary is a wire chunk,
+    not a write: batching disk writes must not batch the cancel check with
+    them. Iterating ``aiter_bytes(_DOWNLOAD_CHUNK_BYTES)`` instead would
+    buffer this whole body into one chunk and drain it in full before the
+    check ever ran, and on a real transfer would hide a cancel for as long as
+    a slow or stalled response takes to fill 1 MB.
     """
-    chunk = _DOWNLOAD_CHUNK_BYTES // 2
     chunks_sent = {"n": 0}
     cancelled = asyncio.Event()
 
@@ -585,7 +586,7 @@ async def test_download_file_aborts_mid_stream_when_cancel_set(tmp_path):
             if chunks_sent["n"] == 2:
                 # A CancelGuard poll observing the user's cancel, mid-stream.
                 cancelled.set()
-            yield b"x" * chunk
+            yield b"x" * 1024
 
     requests = {"n": 0}
 
@@ -600,8 +601,8 @@ async def test_download_file_aborts_mid_stream_when_cancel_set(tmp_path):
     await client.close()
 
     assert chunks_sent["n"] < 10, (
-        "download must abort at a chunk boundary, not stream the rest of a "
-        "multi-GB file to a task the user already cancelled"
+        "download must abort at a wire-chunk boundary, not stream the rest "
+        "of a multi-GB file to a task the user already cancelled"
     )
     # A cancel is a failure like any other for cleanup purposes: no partial
     # input may survive for a retried task to mistake for a complete one.

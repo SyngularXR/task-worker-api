@@ -12,14 +12,15 @@
   stale-task sweeper read the frozen `updated_at` as abandonment and reclaimed
   a task the worker was actively downloading for; the `CancelGuard` poll froze
   with it, so a user cancel stayed invisible; and in hybrid mode the worker's
-  FastAPI app stopped serving requests. The stream is now re-chunked to 1 MB
-  and every filesystem call — open, each write, close — runs through
-  `asyncio.to_thread`, mirroring `files._copyfile_async` (which fixed the same
-  bug class for local-mode copies). Re-chunking keeps the thread dispatches
-  proportional to the file size instead of to the transport's chunking; the
-  cancellation boundary is correspondingly a 1 MB write rather than a wire
-  chunk, which is still well inside a heartbeat interval. No API change —
-  same signature, same bytes, same retry/cleanup/cancel semantics.
+  FastAPI app stopped serving requests. Every filesystem call — open, each
+  write, close — now runs through `asyncio.to_thread`, mirroring
+  `files._copyfile_async` (which fixed the same bug class for local-mode
+  copies), and wire chunks are accumulated into a 1 MB buffer so the thread
+  dispatches stay proportional to the file size instead of to the transport's
+  chunking. The stream is still *iterated* at the transport's own granularity,
+  so `cancelled` is checked on every chunk that arrives and the cancellation
+  boundary is unchanged. No API change — same signature, same bytes, same
+  retry/cleanup/cancel semantics.
 - `CancelGuard` no longer silently loses cancel detection on a duck-typed
   client that predates `BackendClient.poll_cancel_status`. The guard's poll
   loop called `client.poll_cancel_status(task_id)` unconditionally; on a
