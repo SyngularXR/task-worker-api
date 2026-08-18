@@ -239,6 +239,20 @@ async def _cancel_and_drain(task: "asyncio.Future") -> None:
         pass
 
 
+async def _to_thread_complete(func, /, *args, cancel_cleanup=None):
+    """Do not let task cancellation race a blocking thread operation."""
+    import asyncio
+
+    task = asyncio.create_task(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        result = await task
+        if cancel_cleanup is not None:
+            await asyncio.to_thread(cancel_cleanup, result)
+        raise
+
+
 async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str):
     """Await ``coro``, aborting it as soon as ``cancelled`` is set.
 
@@ -968,14 +982,14 @@ class BackendClient:
                 raise TaskCancelled(cancel_message)
 
         async def _stream_once() -> None:
-            import asyncio
-
             _raise_if_cancelled()
             async with self._client.stream(
                 "GET", path, timeout=self._file_timeout,
             ) as resp:
                 resp.raise_for_status()
-                f = await asyncio.to_thread(open, dest, "wb")
+                f = await _to_thread_complete(
+                    open, dest, "wb", cancel_cleanup=lambda opened: opened.close(),
+                )
                 try:
                     # The stream is iterated at the transport's own
                     # granularity (~64 KB) so ``cancelled`` is seen at every
@@ -989,14 +1003,14 @@ class BackendClient:
                         _raise_if_cancelled()
                         buf += chunk
                         if len(buf) >= _DOWNLOAD_CHUNK_BYTES:
-                            await asyncio.to_thread(f.write, buf)
+                            await _to_thread_complete(f.write, buf)
                             buf = bytearray()
                     if buf:
-                        await asyncio.to_thread(f.write, buf)
+                        await _to_thread_complete(f.write, buf)
                 finally:
                     # close() flushes the last buffered write, so it blocks
                     # like any other write and belongs off the loop too.
-                    await asyncio.to_thread(f.close)
+                    await _to_thread_complete(f.close)
 
         operation = self._retry(_stream_once, method="GET", path=path)
         try:

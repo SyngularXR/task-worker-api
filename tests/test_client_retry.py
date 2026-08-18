@@ -332,6 +332,62 @@ async def test_download_file_writes_off_the_event_loop_in_1mb_chunks(
 
 
 @pytest.mark.asyncio
+async def test_download_cancel_waits_for_inflight_write_before_close(
+    tmp_path, monkeypatch,
+):
+    """Cancelling a to_thread write must not close its file underneath it."""
+    import threading
+
+    from task_worker_api import client as client_mod
+
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    real_open = open
+
+    class _SlowFile:
+        def __init__(self, file):
+            self._file = file
+
+        def write(self, data):
+            entered.set()
+            assert release.wait(2), "test never released the blocked write"
+            assert not closed.is_set(), "file closed while write was still running"
+            return self._file.write(data)
+
+        def close(self):
+            self._file.close()
+            closed.set()
+
+    def slow_open(path, mode):
+        return _SlowFile(real_open(path, mode))
+
+    monkeypatch.setattr(client_mod, "open", slow_open, raising=False)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * _DOWNLOAD_CHUNK_BYTES)
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    cancelled = asyncio.Event()
+    download = asyncio.create_task(
+        client.download_file(5, "scene.ply", dest, cancelled=cancelled)
+    )
+    assert await asyncio.to_thread(entered.wait, 2)
+    cancelled.set()
+    await asyncio.sleep(0.05)
+    assert not closed.is_set()
+
+    release.set()
+    with pytest.raises(TaskCancelled):
+        await download
+    await client.close()
+
+    assert closed.is_set()
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
 async def test_download_file_raises_on_404(tmp_path):
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, text="not found")
