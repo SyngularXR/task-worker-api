@@ -14,6 +14,7 @@ import pytest
 from task_worker_api import (
     TaskCancelled,
     TaskContext,
+    TaskStatus,
     TaskType,
     Worker,
 )
@@ -331,6 +332,14 @@ async def test_worker_writes_typed_record_even_on_schema_rejection(
 # which lands in exactly the cases complete() can't (the classic
 # numpy/Path/datetime unserializable result, a backend rejection). The ERROR
 # log is now reserved for the case where that fallback *also* fails.
+#
+# The fallback is *gated on reconciliation*, because a failed complete() is
+# ambiguous — the write may have committed and only its response been lost.
+# The worker reads the task's real status back (GET /tasks/{id}/cancel-status)
+# and only fails the task when the backend itself still reports it unsettled;
+# terminal, re-queued, or unreadable means hands off. These tests pin every
+# branch, including the "complete committed, then the response failed" case
+# that must never be downgraded to ``failed``.
 
 
 class _FlakyCompleteClient(FakeBackendClient):
@@ -355,6 +364,45 @@ class _FlakyFailClient(FakeBackendClient):
 
     async def fail(self, task_id: int, error: str) -> None:
         raise self._exc
+
+
+class _LostCompleteResponseClient(FakeBackendClient):
+    """The ambiguous case: ``complete`` *commits* on the backend and then the
+    response is lost (read timeout after the write), so the call raises even
+    though the task is now COMPLETED. Cancel-status reports the committed
+    state, which is exactly what reconciliation is supposed to see."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+
+    async def complete(self, task_id: int, result: dict) -> None:
+        await super().complete(task_id, result)   # the write lands...
+        raise self._exc                           # ...and the response doesn't
+
+    async def get_cancel_status(self, task_id: int) -> dict:
+        if any(c["task_id"] == task_id for c in self.completed_tasks):
+            return {"cancelled": False, "status": int(TaskStatus.COMPLETED),
+                    "cancelled_reason": None}
+        return await super().get_cancel_status(task_id)
+
+
+class _RequeuedTaskClient(_FlakyCompleteClient):
+    """``complete`` fails and the backend has already swept the task back to
+    PENDING. It will be retried by whoever claims it next, so failing it here
+    would kill a live retry (and cascade to its dependents)."""
+
+    async def get_cancel_status(self, task_id: int) -> dict:
+        return {"cancelled": False, "status": int(TaskStatus.PENDING),
+                "cancelled_reason": None}
+
+
+class _UnreadableStatusClient(_FlakyCompleteClient):
+    """``complete`` fails *and* the state read fails — the worker cannot tell
+    a lost response from a lost write, so it must not fall back."""
+
+    async def get_cancel_status(self, task_id: int) -> dict:
+        raise RuntimeError("backend unreachable")
 
 
 class _FlakyTerminalClient(FakeBackendClient):
@@ -412,6 +460,102 @@ async def test_worker_falls_back_to_fail_when_complete_report_fails(
         if r.levelname == "WARNING" and "terminal complete report failed" in r.getMessage()
     ]
     assert len(warnings) == 1
+    # It only fired because the backend confirmed the task was still unsettled.
+    assert "still has the task unsettled" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_downgrade_when_only_the_complete_response_was_lost(
+    make_worker, tmp_path, caplog,
+):
+    """The ambiguous case the fallback must not get wrong: the backend
+    *committed* the completion and only the response was lost. Reconciling
+    the task's real state before falling back is what keeps a succeeded task
+    from being downgraded to ``failed`` — this must hold on the worker's own
+    evidence, not on a promise about how some backend version handles a
+    duplicate terminal write."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    flaky = _LostCompleteResponseClient(RuntimeError("read timeout after write"))
+    flaky.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    with caplog.at_level("WARNING"):
+        worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    # The completion is on the backend, and the worker left it that way.
+    assert len(flaky.completed_tasks) == 1
+    assert flaky.failed_tasks == []
+    # Not a lost outcome, so not an ERROR — one WARNING naming the real state.
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+    warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "terminal complete report failed" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "no longer has the task in flight" in warnings[0].getMessage()
+    assert f"status={int(TaskStatus.COMPLETED)}" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_fail_a_task_the_sweeper_already_requeued(
+    make_worker, tmp_path, caplog,
+):
+    """A task already swept back to PENDING is not orphaned — it is queued for
+    another attempt. fail() would end that attempt and cascade to dependents,
+    so the fallback must stay out of it."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    flaky = _RequeuedTaskClient(RuntimeError("backend unreachable"))
+    flaky.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    with caplog.at_level("WARNING"):
+        worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    assert flaky.completed_tasks == []
+    assert flaky.failed_tasks == []
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_fallback_when_task_state_cannot_be_read(
+    make_worker, tmp_path, caplog,
+):
+    """If the state read fails too, the worker cannot tell a lost response
+    from a lost write — so it must not fire fail() on a guess. It falls back
+    to the old behaviour instead: no downgrade, one ERROR naming the task."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    flaky = _UnreadableStatusClient(RuntimeError("backend unreachable"))
+    flaky.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    with caplog.at_level("WARNING"):
+        worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    assert flaky.completed_tasks == []
+    assert flaky.failed_tasks == []
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(error_records) == 1
+    msg = error_records[0].getMessage()
+    assert "task state unreadable" in msg
+    assert "backend unreachable" in msg
 
 
 @pytest.mark.asyncio

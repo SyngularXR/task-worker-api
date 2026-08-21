@@ -30,7 +30,7 @@ from typing import Awaitable, Callable, Optional
 from .cancel import CancelGuard
 from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
 from .context import ClaimedTask, TaskContext
-from .enums import TaskType
+from .enums import TaskStatus, TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
 from .files import prepare_inputs, upload_outputs
 from .payload_log import PayloadLogger, sanitize_worker_id
@@ -146,6 +146,43 @@ def _clear_workdir(task_dir: Path) -> None:
             "attempt in a dead attempt's directory (its outputs would be "
             "published as this attempt's results)"
         )
+
+
+#: The only statuses in which a task is still held open by *this* attempt, and
+#: so would orphan if the worker never lands a terminal report. Everything else
+#: is either already settled (COMPLETED/FAILED/CANCELLED — an outcome is
+#: recorded and nothing the worker says afterwards should change it) or back on
+#: the queue (PENDING — the sweeper re-queued it, and failing it would kill a
+#: legitimate retry *and* cascade to its dependents).
+_IN_FLIGHT_STATUSES = frozenset({
+    int(TaskStatus.CLAIMED), int(TaskStatus.IN_PROGRESS),
+})
+
+
+async def _read_task_status(client, task_id: int) -> Optional[int]:
+    """The task's status as the backend currently sees it, or ``None``.
+
+    ``None`` means *unknown*, not "not terminal": the client has no
+    ``get_cancel_status``, the read failed, or the payload carried no usable
+    status. Callers must treat unknown as "don't touch the task".
+
+    Reuses ``GET /tasks/{id}/cancel-status`` — the read-only endpoint the
+    CancelGuard already polls every couple of seconds. It returns
+    ``{"cancelled", "status", "cancelled_reason"}``, writes nothing, and has
+    shipped for as long as cancel support has, so reading it needs no new
+    route and no backend version bump. ``getattr`` rather than a direct call
+    because ``Worker`` accepts any duck-typed client (see
+    ``cancel._cancel_status_poller`` for the same accommodation).
+    """
+    read = getattr(client, "get_cancel_status", None)
+    if read is None:
+        return None
+    try:
+        status = (await read(task_id) or {}).get("status")
+        return None if status is None else int(status)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("task %s: status read failed: %s", task_id, exc)
+        return None
 
 
 class Worker:
@@ -778,46 +815,80 @@ class Worker:
                         # beats a silent orphan: the operator sees why, and the
                         # backend stops holding the task open.
                         #
-                        # Safe in the one case where complete() *did* land and
-                        # only its response was lost (read timeout after the
-                        # backend's write): the backend's terminal transition is
-                        # idempotent — ``mark_failed`` returns early once the row
-                        # is in a terminal state — so the fallback is a no-op on
-                        # an already-completed task. It does not downgrade the
-                        # task to ``failed``, and it does not raise either (the
-                        # endpoint answers 200 with the row's real state, so the
-                        # SDK doesn't burn its retry budget on a settled task);
-                        # it simply logs the WARNING below. That means the
-                        # fallback can only ever *add* a terminal state, never
-                        # replace one — which is what makes firing it blind, with
-                        # no way to tell a lost response from a lost write, the
-                        # right call.
+                        # But a failed complete() is *ambiguous*: the request
+                        # may have committed on the backend and only its
+                        # response been lost (read timeout after the write).
+                        # Firing fail() blind would then downgrade a task that
+                        # actually succeeded — and "the backend's terminal
+                        # transition is idempotent, so the downgrade is a no-op"
+                        # is a promise of some other repo's code at some other
+                        # version, which this SDK ships independently of and
+                        # cannot verify at runtime. So don't assume it: read the
+                        # task's real state back first, and only fall back when
+                        # the backend itself still shows the task in flight.
+                        # Unknown (no reader on a duck-typed client, or the read
+                        # failed) counts as "don't touch it" — a backend too far
+                        # gone to answer a read wasn't going to accept the fail()
+                        # either, so skipping it costs nothing the ERROR log
+                        # below doesn't already cover.
+                        #
+                        # Residual race, deliberately accepted: an in-flight
+                        # complete() write could commit in the gap between the
+                        # read and the fail(). It is a far narrower window than
+                        # firing blind, and the dominant cause (an unserializable
+                        # result, a 4xx) never has a write in flight at all.
                         unreported = f"{type(report_exc).__name__}: {report_exc}"
                         if terminal == "complete":
-                            try:
-                                await self._client.fail(
-                                    task.id,
-                                    "handler succeeded but the complete "
-                                    f"report failed: {unreported}",
-                                )
-                            except Exception as fallback_exc:  # noqa: BLE001
-                                # Both terminal routes are gone (backend down
-                                # past both retry windows) — nothing left to
-                                # try, so fall through to the ERROR log.
+                            status = await _read_task_status(self._client, task.id)
+                            if status is None:
                                 unreported += (
-                                    " (fail fallback also failed: "
-                                    f"{type(fallback_exc).__name__}: "
-                                    f"{fallback_exc})"
+                                    " (task state unreadable, so the fail "
+                                    "fallback was skipped rather than risk "
+                                    "downgrading a completion that landed)"
                                 )
-                            else:
+                            elif status not in _IN_FLIGHT_STATUSES:
+                                # Nothing to rescue: the task is either settled
+                                # (complete() landed after all and only the
+                                # response was lost) or already back on the
+                                # queue. Either way it is not orphaned, and
+                                # fail() here would only destroy an outcome.
                                 log.warning(
                                     "task %s: terminal complete report failed "
-                                    "(%s); reported as failed instead so the "
-                                    "task lands terminal rather than orphaning "
-                                    "in_progress",
-                                    task.id, unreported,
+                                    "(%s), but the backend no longer has the "
+                                    "task in flight (status=%s — terminal means "
+                                    "the completion landed and only the response "
+                                    "was lost; pending means the sweeper already "
+                                    "re-queued it); leaving it as-is",
+                                    task.id, unreported, status,
                                 )
                                 unreported = None
+                            else:
+                                try:
+                                    await self._client.fail(
+                                        task.id,
+                                        "handler succeeded but the complete "
+                                        f"report failed: {unreported}",
+                                    )
+                                except Exception as fallback_exc:  # noqa: BLE001
+                                    # Both terminal routes are gone (backend down
+                                    # past both retry windows) — nothing left to
+                                    # try, so fall through to the ERROR log.
+                                    unreported += (
+                                        " (fail fallback also failed: "
+                                        f"{type(fallback_exc).__name__}: "
+                                        f"{fallback_exc})"
+                                    )
+                                else:
+                                    log.warning(
+                                        "task %s: terminal complete report "
+                                        "failed (%s) and the backend still has "
+                                        "the task unsettled (status=%s); "
+                                        "reported as failed instead so it lands "
+                                        "terminal rather than orphaning "
+                                        "in_progress",
+                                        task.id, unreported, status,
+                                    )
+                                    unreported = None
                         if unreported is not None:
                             log.error(
                                 "task %s: terminal %s report failed after "

@@ -18,11 +18,21 @@
   in exactly the cases `complete()` can't. The ERROR log is now reserved for
   the case where the fallback *also* fails (backend down past both retry
   windows); the successful fallback logs one WARNING naming the task. Still
-  non-raising — a failed report must not kill the polling loop. Safe in the one
-  case where `complete()` actually landed and only its response was lost: the
-  backend's terminal transition is idempotent, so the fallback is a no-op on an
-  already-completed task rather than a downgrade to `failed`. Purely
-  worker-side: no API, wire-format, or consumer-visible contract change.
+  non-raising — a failed report must not kill the polling loop.
+  The fallback is **gated on reconciling the task's real state** first, because
+  a failed `complete()` is ambiguous: the write may have committed and only its
+  response been lost. The worker reads the task back over the existing
+  read-only `GET /tasks/{id}/cancel-status` (the endpoint `CancelGuard` already
+  polls — no new route, no backend change) and only reports `fail()` when the
+  backend itself still shows the task in flight. A task already terminal is
+  left alone (one WARNING: outcome recorded, response lost), as is one the
+  sweeper has already re-queued to `pending` — failing that would kill a live
+  retry and cascade to its dependents. A state read that fails or is
+  unavailable also skips the fallback and takes the ERROR path, on the grounds
+  that a backend too degraded to answer a read would not have accepted the
+  `fail()` either. So the worker never downgrades a completion on a guess, and
+  never leans on the backend's duplicate-terminal-write handling to undo one.
+  Purely worker-side: no API, wire-format, or consumer-visible contract change.
 - `BackendClient.download_file` no longer blocks the event loop while writing
   to disk. It streamed straight from `aiter_bytes()` — whatever the transport
   handed over, typically ~64 KB — and wrote each chunk inline, along with
