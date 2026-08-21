@@ -27,10 +27,12 @@ import urllib.request
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+import httpx
+
 from .cancel import CancelGuard
 from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
 from .context import ClaimedTask, TaskContext
-from .enums import TaskStatus, TaskType
+from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
 from .files import prepare_inputs, upload_outputs
 from .payload_log import PayloadLogger, sanitize_worker_id
@@ -148,41 +150,23 @@ def _clear_workdir(task_dir: Path) -> None:
         )
 
 
-#: The only statuses in which a task is still held open by *this* attempt, and
-#: so would orphan if the worker never lands a terminal report. Everything else
-#: is either already settled (COMPLETED/FAILED/CANCELLED — an outcome is
-#: recorded and nothing the worker says afterwards should change it) or back on
-#: the queue (PENDING — the sweeper re-queued it, and failing it would kill a
-#: legitimate retry *and* cascade to its dependents).
-_IN_FLIGHT_STATUSES = frozenset({
-    int(TaskStatus.CLAIMED), int(TaskStatus.IN_PROGRESS),
-})
+def _result_encode_error(result: object) -> Optional[str]:
+    """The error ``complete()`` would raise encoding ``result``, or ``None``.
 
-
-async def _read_task_status(client, task_id: int) -> Optional[int]:
-    """The task's status as the backend currently sees it, or ``None``.
-
-    ``None`` means *unknown*, not "not terminal": the client has no
-    ``get_cancel_status``, the read failed, or the payload carried no usable
-    status. Callers must treat unknown as "don't touch the task".
-
-    Reuses ``GET /tasks/{id}/cancel-status`` — the read-only endpoint the
-    CancelGuard already polls every couple of seconds. It returns
-    ``{"cancelled", "status", "cancelled_reason"}``, writes nothing, and has
-    shipped for as long as cancel support has, so reading it needs no new
-    route and no backend version bump. ``getattr`` rather than a direct call
-    because ``Worker`` accepts any duck-typed client (see
-    ``cancel._cancel_status_poller`` for the same accommodation).
+    Asks httpx itself — building a request encodes the body, and building one
+    transmits nothing — rather than re-implementing its JSON encoding. The
+    encoder's flags have moved across the httpx 0.23-0.28 range this SDK
+    supports (0.28 passes ``allow_nan=False``, so a NaN metric that older
+    httpx would have put on the wire is now rejected), and a check stricter
+    than the real encoder would fail a task the backend would have accepted.
     """
-    read = getattr(client, "get_cancel_status", None)
-    if read is None:
-        return None
     try:
-        status = (await read(task_id) or {}).get("status")
-        return None if status is None else int(status)
+        httpx.Request(
+            "PUT", "http://encode-check.invalid/", json={"result": result},
+        )
     except Exception as exc:  # noqa: BLE001
-        log.debug("task %s: status read failed: %s", task_id, exc)
-        return None
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 class Worker:
@@ -765,6 +749,47 @@ class Worker:
                     # the except handler can name the call that failed even when
                     # the exception fires before the method returns. ``fired`` wins
                     # over outcome because a timeout overrides a late completion.
+                    #
+                    # A result the wire can't encode is a terminal report that
+                    # can never land: complete() raises while *building* the
+                    # request, so nothing is ever sent, and the task orphans in
+                    # in_progress until the backend's sweeper reclaims and
+                    # *recomputes* it — hours of GPU work redone over a stray
+                    # numpy scalar, Path or datetime left in a handler's dict.
+                    # Catch it here and report the failure instead, so the task
+                    # lands terminal carrying the real cause.
+                    #
+                    # Deciding this *before* the request is what makes it safe,
+                    # and is why there is no post-hoc "complete() raised, so
+                    # fail() it" fallback in the handler below. Once a complete
+                    # request has gone out, its failure is ambiguous — the write
+                    # may have committed with only the response lost — and no
+                    # amount of reading the task back closes that window: the
+                    # write can still commit (or a cancel/requeue land) between
+                    # the read and the fail(), which would overwrite a real
+                    # outcome with a bogus failure. Ruling that out needs an
+                    # atomic conditional transition (CAS) or a backend
+                    # idempotency contract this SDK ships independently of and
+                    # can't verify at runtime. Here there is nothing to race:
+                    # no complete request was ever transmitted, and the fail()
+                    # below is the same single terminal report this worker
+                    # already owed the task.
+                    if not fired and outcome[0] == "complete":
+                        encode_error = _result_encode_error(outcome[1])
+                        if encode_error is not None:
+                            log.error(
+                                "task %s: handler result is not JSON-"
+                                "serializable (%s); reporting the task failed "
+                                "instead — complete() could never have been "
+                                "sent, and leaving it unreported orphans the "
+                                "task in_progress",
+                                task.id, encode_error,
+                            )
+                            outcome = (
+                                "fail",
+                                "handler succeeded but its result could not be "
+                                f"encoded for the complete report: {encode_error}",
+                            )
                     if fired:
                         terminal = "fail"
                     elif outcome[0] == "complete":
@@ -792,109 +817,25 @@ class Worker:
                                 log.info("task %s cancelled by user", task.id)
                     except Exception as report_exc:  # noqa: BLE001
                         # The terminal status call itself failed after exhausting
-                        # the client's own retries. Either way the handler's
-                        # outcome is at risk of being *lost*: the backend leaves
-                        # the task in_progress and eventually sweeps it as stale.
-                        # We intentionally do NOT re-raise: a single failed
-                        # terminal report must not kill the polling loop and
-                        # strand every subsequent task.
+                        # the client's own retries. Log at ERROR (not WARNING) —
+                        # this is a task whose handler outcome is *lost*: the
+                        # backend will leave it in_progress and eventually sweep
+                        # it as stale. The handler result was computed but never
+                        # delivered, so an operator needs to know which task and
+                        # which terminal method failed. We intentionally do NOT
+                        # re-raise: a single failed terminal report must not
+                        # kill the polling loop and strand every subsequent task.
                         #
-                        # When it was ``complete`` that failed, don't leave it
-                        # there — fall back to ``fail`` carrying the complete
-                        # error. The common cause is a result payload the wire
-                        # can't take (a numpy scalar, a Path, a datetime in the
-                        # handler's dict) or a backend rejection: a 4xx/encode
-                        # error no amount of retrying fixes, so complete() will
-                        # never land no matter how long we wait. Orphaning the
-                        # task means the sweeper reclaims and *recomputes* it —
-                        # hours of GPU work redone, and until then the UI shows
-                        # a task stuck running. fail() is a separate route with
-                        # its own payload (a plain string) and its own retry
-                        # window, so it lands in exactly the cases complete()
-                        # can't. A terminal ``failed`` naming the real cause
-                        # beats a silent orphan: the operator sees why, and the
-                        # backend stops holding the task open.
-                        #
-                        # But a failed complete() is *ambiguous*: the request
-                        # may have committed on the backend and only its
-                        # response been lost (read timeout after the write).
-                        # Firing fail() blind would then downgrade a task that
-                        # actually succeeded — and "the backend's terminal
-                        # transition is idempotent, so the downgrade is a no-op"
-                        # is a promise of some other repo's code at some other
-                        # version, which this SDK ships independently of and
-                        # cannot verify at runtime. So don't assume it: read the
-                        # task's real state back first, and only fall back when
-                        # the backend itself still shows the task in flight.
-                        # Unknown (no reader on a duck-typed client, or the read
-                        # failed) counts as "don't touch it" — a backend too far
-                        # gone to answer a read wasn't going to accept the fail()
-                        # either, so skipping it costs nothing the ERROR log
-                        # below doesn't already cover.
-                        #
-                        # Residual race, deliberately accepted: an in-flight
-                        # complete() write could commit in the gap between the
-                        # read and the fail(). It is a far narrower window than
-                        # firing blind, and the dominant cause (an unserializable
-                        # result, a 4xx) never has a write in flight at all.
-                        unreported = f"{type(report_exc).__name__}: {report_exc}"
-                        if terminal == "complete":
-                            status = await _read_task_status(self._client, task.id)
-                            if status is None:
-                                unreported += (
-                                    " (task state unreadable, so the fail "
-                                    "fallback was skipped rather than risk "
-                                    "downgrading a completion that landed)"
-                                )
-                            elif status not in _IN_FLIGHT_STATUSES:
-                                # Nothing to rescue: the task is either settled
-                                # (complete() landed after all and only the
-                                # response was lost) or already back on the
-                                # queue. Either way it is not orphaned, and
-                                # fail() here would only destroy an outcome.
-                                log.warning(
-                                    "task %s: terminal complete report failed "
-                                    "(%s), but the backend no longer has the "
-                                    "task in flight (status=%s — terminal means "
-                                    "the completion landed and only the response "
-                                    "was lost; pending means the sweeper already "
-                                    "re-queued it); leaving it as-is",
-                                    task.id, unreported, status,
-                                )
-                                unreported = None
-                            else:
-                                try:
-                                    await self._client.fail(
-                                        task.id,
-                                        "handler succeeded but the complete "
-                                        f"report failed: {unreported}",
-                                    )
-                                except Exception as fallback_exc:  # noqa: BLE001
-                                    # Both terminal routes are gone (backend down
-                                    # past both retry windows) — nothing left to
-                                    # try, so fall through to the ERROR log.
-                                    unreported += (
-                                        " (fail fallback also failed: "
-                                        f"{type(fallback_exc).__name__}: "
-                                        f"{fallback_exc})"
-                                    )
-                                else:
-                                    log.warning(
-                                        "task %s: terminal complete report "
-                                        "failed (%s) and the backend still has "
-                                        "the task unsettled (status=%s); "
-                                        "reported as failed instead so it lands "
-                                        "terminal rather than orphaning "
-                                        "in_progress",
-                                        task.id, unreported, status,
-                                    )
-                                    unreported = None
-                        if unreported is not None:
-                            log.error(
-                                "task %s: terminal %s report failed after "
-                                "retries; backend did not record outcome=%r: %s",
-                                task.id, terminal, outcome[1], unreported,
-                            )
+                        # And we do NOT retry the other terminal route here (see
+                        # the encode pre-check above): the request is already on
+                        # the wire, so this failure can't tell a lost write from
+                        # a lost *response*, and a second terminal write would
+                        # risk stamping ``failed`` over a completion that landed.
+                        log.error(
+                            "task %s: terminal %s report failed after retries; "
+                            "backend did not record outcome=%r: %s",
+                            task.id, terminal, outcome[1], report_exc,
+                        )
             finally:
                 # Always tear the heartbeat down, even if the report block
                 # raised something the except above doesn't catch (guard.claim
