@@ -3,6 +3,29 @@
 ## Unreleased
 
 **Fixes:**
+- A task whose handler produced a result the wire can't encode no longer
+  orphans in `in_progress`. The classic trigger is a stray numpy scalar,
+  `Path` or `datetime` left in a handler's dict: `complete()` raised while
+  *building* the request — nothing was ever sent, and no amount of retrying
+  would have helped — `Worker._run_one` logged the failure at ERROR and moved
+  on, so the backend went on believing the task was still running until its
+  stale-task sweeper reclaimed and **recomputed** it (hours of GPU work thrown
+  away, and until then a task stuck "running" in the UI). The worker now
+  checks the result against httpx's own encoder before the call and, when it
+  can't be encoded, reports `fail()` with the encode error instead — the task
+  lands terminal and the operator sees the real cause.
+  Checking *before* the request is what makes this safe, and is why there is
+  deliberately no fallback after a failed `complete()`: once the request is on
+  the wire its failure is ambiguous (the write may have committed with only
+  the response lost), and reading the task back doesn't close that window —
+  the write can still commit, or a cancel/requeue land, between the read and
+  the `fail()`, stamping `failed` over a real outcome. Ruling that out needs
+  an atomic conditional transition or a backend idempotency contract that this
+  independently-shipped SDK can't verify at runtime, so a genuinely ambiguous
+  terminal-report failure keeps its existing behaviour: one ERROR log, no
+  second write. Still non-raising — a failed report must not kill the polling
+  loop. Purely worker-side: no API, wire-format, or consumer-visible contract
+  change.
 - `BackendClient.download_file` no longer blocks the event loop while writing
   to disk. It streamed straight from `aiter_bytes()` — whatever the transport
   handed over, typically ~64 KB — and wrote each chunk inline, along with

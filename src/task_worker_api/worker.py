@@ -27,6 +27,8 @@ import urllib.request
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+import httpx
+
 from .cancel import CancelGuard
 from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
 from .context import ClaimedTask, TaskContext
@@ -146,6 +148,25 @@ def _clear_workdir(task_dir: Path) -> None:
             "attempt in a dead attempt's directory (its outputs would be "
             "published as this attempt's results)"
         )
+
+
+def _result_encode_error(result: object) -> Optional[str]:
+    """The error ``complete()`` would raise encoding ``result``, or ``None``.
+
+    Asks httpx itself — building a request encodes the body, and building one
+    transmits nothing — rather than re-implementing its JSON encoding. The
+    encoder's flags have moved across the httpx 0.23-0.28 range this SDK
+    supports (0.28 passes ``allow_nan=False``, so a NaN metric that older
+    httpx would have put on the wire is now rejected), and a check stricter
+    than the real encoder would fail a task the backend would have accepted.
+    """
+    try:
+        httpx.Request(
+            "PUT", "http://encode-check.invalid/", json={"result": result},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 class Worker:
@@ -728,6 +749,47 @@ class Worker:
                     # the except handler can name the call that failed even when
                     # the exception fires before the method returns. ``fired`` wins
                     # over outcome because a timeout overrides a late completion.
+                    #
+                    # A result the wire can't encode is a terminal report that
+                    # can never land: complete() raises while *building* the
+                    # request, so nothing is ever sent, and the task orphans in
+                    # in_progress until the backend's sweeper reclaims and
+                    # *recomputes* it — hours of GPU work redone over a stray
+                    # numpy scalar, Path or datetime left in a handler's dict.
+                    # Catch it here and report the failure instead, so the task
+                    # lands terminal carrying the real cause.
+                    #
+                    # Deciding this *before* the request is what makes it safe,
+                    # and is why there is no post-hoc "complete() raised, so
+                    # fail() it" fallback in the handler below. Once a complete
+                    # request has gone out, its failure is ambiguous — the write
+                    # may have committed with only the response lost — and no
+                    # amount of reading the task back closes that window: the
+                    # write can still commit (or a cancel/requeue land) between
+                    # the read and the fail(), which would overwrite a real
+                    # outcome with a bogus failure. Ruling that out needs an
+                    # atomic conditional transition (CAS) or a backend
+                    # idempotency contract this SDK ships independently of and
+                    # can't verify at runtime. Here there is nothing to race:
+                    # no complete request was ever transmitted, and the fail()
+                    # below is the same single terminal report this worker
+                    # already owed the task.
+                    if not fired and outcome[0] == "complete":
+                        encode_error = _result_encode_error(outcome[1])
+                        if encode_error is not None:
+                            log.error(
+                                "task %s: handler result is not JSON-"
+                                "serializable (%s); reporting the task failed "
+                                "instead — complete() could never have been "
+                                "sent, and leaving it unreported orphans the "
+                                "task in_progress",
+                                task.id, encode_error,
+                            )
+                            outcome = (
+                                "fail",
+                                "handler succeeded but its result could not be "
+                                f"encoded for the complete report: {encode_error}",
+                            )
                     if fired:
                         terminal = "fail"
                     elif outcome[0] == "complete":
@@ -763,6 +825,12 @@ class Worker:
                         # which terminal method failed. We intentionally do NOT
                         # re-raise: a single failed terminal report must not
                         # kill the polling loop and strand every subsequent task.
+                        #
+                        # And we do NOT retry the other terminal route here (see
+                        # the encode pre-check above): the request is already on
+                        # the wire, so this failure can't tell a lost write from
+                        # a lost *response*, and a second terminal write would
+                        # risk stamping ``failed`` over a completion that landed.
                         log.error(
                             "task %s: terminal %s report failed after retries; "
                             "backend did not record outcome=%r: %s",

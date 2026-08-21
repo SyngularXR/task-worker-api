@@ -323,6 +323,18 @@ async def test_worker_writes_typed_record_even_on_schema_rejection(
 # visibility. The fix logs at ERROR (naming the task, the terminal method,
 # and the outcome) without re-raising — the polling loop must keep running
 # other tasks. These tests pin that contract.
+#
+# The ERROR log alone still loses the task when the *result payload* is at
+# fault (the classic numpy scalar / Path / datetime left in a handler's dict):
+# complete() raises while building the request, nothing is ever sent, and the
+# task orphans in_progress until the sweeper reclaims and recomputes it. That
+# case is now caught before the call and reported via fail() instead.
+#
+# It is caught *before* the request on purpose. Once a complete request is on
+# the wire, its failure is ambiguous — the write may have committed with only
+# its response lost — so the worker must never follow it with a second
+# terminal write (no read-then-fail either: the write can commit in the gap).
+# The tests below pin both halves.
 
 
 class _FlakyCompleteClient(FakeBackendClient):
@@ -372,12 +384,62 @@ async def test_worker_logs_error_when_complete_report_fails(
 
     # The worker did not crash and did not record the completion.
     assert flaky.completed_tasks == []
+    # And it did NOT chase the failure with a second terminal write. This
+    # failure is ambiguous — "backend unreachable" after the client's retries
+    # cannot distinguish a lost write from a lost response — so a fail() here
+    # would risk stamping ``failed`` over a completion that actually landed.
+    # Reading the task back first wouldn't fix that: the in-flight write can
+    # still commit between the read and the fail().
+    assert flaky.failed_tasks == []
     # An ERROR log surfaced the lost terminal report.
     error_records = [r for r in caplog.records if r.levelname == "ERROR"]
     assert len(error_records) == 1
     msg = error_records[0].getMessage()
     assert "terminal complete report failed" in msg
     assert "backend unreachable" in msg
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_task_when_result_is_not_json_serializable(
+    make_worker, tmp_path, caplog,
+):
+    """A handler result the wire can't encode must not orphan the task.
+
+    complete() would raise while *building* the request — no bytes leave the
+    process, no amount of retrying helps — so the worker converts the outcome
+    to a failure before the call and lands the task terminal with the encode
+    error attached. Because the check runs before the request, this is still
+    exactly one terminal write: there is no committed-or-not ambiguity to
+    race, unlike a post-hoc fallback after a failed complete().
+    """
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        # The classic: a Path (or numpy scalar, or datetime) left in the dict.
+        return {"planes": [], "source": tmp_path / "fake.stl"}
+
+    with caplog.at_level("ERROR"):
+        worker = make_worker(client=client, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    # complete() was never attempted — the fake would have accepted anything.
+    assert client.completed_tasks == []
+    # The task landed terminal, carrying the real cause.
+    assert len(client.failed_tasks) == 1
+    error = client.failed_tasks[0]["error"]
+    assert "could not be encoded" in error
+    assert "PosixPath" in error or "Path" in error
+    # And the operator sees why the result never made it.
+    error_records = [
+        r for r in caplog.records
+        if r.levelname == "ERROR" and "not JSON-serializable" in r.getMessage()
+    ]
+    assert len(error_records) == 1
 
 
 @pytest.mark.asyncio
