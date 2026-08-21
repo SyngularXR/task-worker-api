@@ -18,7 +18,10 @@
   in exactly the cases `complete()` can't. The ERROR log is now reserved for
   the case where the fallback *also* fails (backend down past both retry
   windows); the successful fallback logs one WARNING naming the task. Still
-  non-raising — a failed report must not kill the polling loop. Purely
+  non-raising — a failed report must not kill the polling loop. Safe in the one
+  case where `complete()` actually landed and only its response was lost: the
+  backend's terminal transition is idempotent, so the fallback is a no-op on an
+  already-completed task rather than a downgrade to `failed`. Purely
   worker-side: no API, wire-format, or consumer-visible contract change.
 - `BackendClient.download_file` no longer blocks the event loop while writing
   to disk. It streamed straight from `aiter_bytes()` — whatever the transport

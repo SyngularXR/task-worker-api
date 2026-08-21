@@ -780,11 +780,18 @@ class Worker:
                         #
                         # Safe in the one case where complete() *did* land and
                         # only its response was lost (read timeout after the
-                        # backend's write): both terminal routes are guarded
-                        # transitions (see client.py's retry notes), so the
-                        # backend rejects failing an already-terminal task —
-                        # the fallback raises, the task stays ``completed``,
-                        # and we fall through to the ERROR log below.
+                        # backend's write): the backend's terminal transition is
+                        # idempotent — ``mark_failed`` returns early once the row
+                        # is in a terminal state — so the fallback is a no-op on
+                        # an already-completed task. It does not downgrade the
+                        # task to ``failed``, and it does not raise either (the
+                        # endpoint answers 200 with the row's real state, so the
+                        # SDK doesn't burn its retry budget on a settled task);
+                        # it simply logs the WARNING below. That means the
+                        # fallback can only ever *add* a terminal state, never
+                        # replace one — which is what makes firing it blind, with
+                        # no way to tell a lost response from a lost write, the
+                        # right call.
                         unreported = f"{type(report_exc).__name__}: {report_exc}"
                         if terminal == "complete":
                             try:
