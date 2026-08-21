@@ -3,6 +3,23 @@
 ## Unreleased
 
 **Fixes:**
+- A task whose handler finished but whose terminal `complete()` report failed
+  no longer orphans in `in_progress`. `Worker._run_one` logged the failure at
+  ERROR and moved on, which left the backend believing the task was still
+  running until its stale-task sweeper reclaimed and **recomputed** it — hours
+  of GPU work thrown away, and until then a task stuck "running" in the UI.
+  The common trigger is a result payload the wire can't take (the classic
+  numpy scalar / `Path` / `datetime` left in a handler's dict), plus backend
+  rejections and exhausted retry windows; the encode/4xx cases will never
+  land no matter how long `complete()` retries. The worker now falls back to
+  `fail()` with the complete error embedded in the message, so the task always
+  reaches a terminal state and the operator sees the real cause. `fail()` is a
+  separate route carrying a plain string and its own retry window, so it lands
+  in exactly the cases `complete()` can't. The ERROR log is now reserved for
+  the case where the fallback *also* fails (backend down past both retry
+  windows); the successful fallback logs one WARNING naming the task. Still
+  non-raising — a failed report must not kill the polling loop. Purely
+  worker-side: no API, wire-format, or consumer-visible contract change.
 - `BackendClient.download_file` no longer blocks the event loop while writing
   to disk. It streamed straight from `aiter_bytes()` — whatever the transport
   handed over, typically ~64 KB — and wrote each chunk inline, along with

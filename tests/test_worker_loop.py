@@ -323,6 +323,14 @@ async def test_worker_writes_typed_record_even_on_schema_rejection(
 # visibility. The fix logs at ERROR (naming the task, the terminal method,
 # and the outcome) without re-raising — the polling loop must keep running
 # other tasks. These tests pin that contract.
+#
+# Logging alone still lost the task: it stayed in_progress until the sweeper
+# reclaimed and *recomputed* it (hours of GPU work redone, a task stuck
+# "running" in the UI). So a failed ``complete`` now falls back to ``fail``
+# carrying the complete error — a separate route with a plain-string payload,
+# which lands in exactly the cases complete() can't (the classic
+# numpy/Path/datetime unserializable result, a backend rejection). The ERROR
+# log is now reserved for the case where that fallback *also* fails.
 
 
 class _FlakyCompleteClient(FakeBackendClient):
@@ -349,15 +357,75 @@ class _FlakyFailClient(FakeBackendClient):
         raise self._exc
 
 
+class _FlakyTerminalClient(FakeBackendClient):
+    """FakeBackendClient whose ``complete`` *and* ``fail`` both raise — the
+    backend is down past both terminal retry windows, so nothing lands."""
+
+    def __init__(self, exc: Exception, fallback_exc: Exception) -> None:
+        super().__init__()
+        self._exc = exc
+        self._fallback_exc = fallback_exc
+
+    async def complete(self, task_id: int, result: dict) -> None:
+        raise self._exc
+
+    async def fail(self, task_id: int, error: str) -> None:
+        raise self._fallback_exc
+
+
 @pytest.mark.asyncio
-async def test_worker_logs_error_when_complete_report_fails(
+async def test_worker_falls_back_to_fail_when_complete_report_fails(
     make_worker, tmp_path, caplog,
 ):
-    """A handler that succeeds but whose complete() call fails (backend down
-    past the retry window) must not crash the worker, and must be logged at
-    ERROR so the operator sees the task was never recorded as complete."""
+    """A handler that succeeds but whose complete() call fails (the classic
+    unserializable result, a backend rejection, exhausted retries) must land
+    the task in a terminal state anyway: the worker falls back to fail() with
+    the complete error embedded, rather than orphaning it in_progress for the
+    sweeper to reclaim and recompute."""
     (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
-    flaky = _FlakyCompleteClient(RuntimeError("backend unreachable"))
+    flaky = _FlakyCompleteClient(TypeError("Object of type ndarray is not JSON serializable"))
+    flaky.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    with caplog.at_level("WARNING"):
+        worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    # The worker did not crash and did not record the completion...
+    assert flaky.completed_tasks == []
+    # ...but the task landed terminal via the fail fallback, carrying the
+    # complete error so an operator can see the real cause.
+    assert len(flaky.failed_tasks) == 1
+    error = flaky.failed_tasks[0]["error"]
+    assert "complete report failed" in error
+    assert "Object of type ndarray is not JSON serializable" in error
+
+    # The fallback is a degraded outcome, not a lost one: WARNING, not ERROR.
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+    warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "terminal complete report failed" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_logs_error_when_complete_and_fail_fallback_both_fail(
+    make_worker, tmp_path, caplog,
+):
+    """Only when the fail() fallback *also* fails (backend down past both
+    retry windows) is the outcome truly lost — that is what the ERROR log is
+    for, and it must name both failures."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    flaky = _FlakyTerminalClient(
+        RuntimeError("backend unreachable"),
+        RuntimeError("still unreachable"),
+    )
     flaky.queue_task(
         task_type=TaskType.DETECT_CUT_PLANES,
         params={"input_path": str(tmp_path / "fake.stl")},
@@ -370,14 +438,15 @@ async def test_worker_logs_error_when_complete_report_fails(
         worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
         await worker.run_one()
 
-    # The worker did not crash and did not record the completion.
+    # Nothing landed, and the worker still did not crash.
     assert flaky.completed_tasks == []
-    # An ERROR log surfaced the lost terminal report.
+    assert flaky.failed_tasks == []
     error_records = [r for r in caplog.records if r.levelname == "ERROR"]
     assert len(error_records) == 1
     msg = error_records[0].getMessage()
     assert "terminal complete report failed" in msg
     assert "backend unreachable" in msg
+    assert "still unreachable" in msg
 
 
 @pytest.mark.asyncio

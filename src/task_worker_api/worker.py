@@ -755,19 +755,68 @@ class Worker:
                                 log.info("task %s cancelled by user", task.id)
                     except Exception as report_exc:  # noqa: BLE001
                         # The terminal status call itself failed after exhausting
-                        # the client's own retries. Log at ERROR (not WARNING) —
-                        # this is a task whose handler outcome is *lost*: the
-                        # backend will leave it in_progress and eventually sweep
-                        # it as stale. The handler result was computed but never
-                        # delivered, so an operator needs to know which task and
-                        # which terminal method failed. We intentionally do NOT
-                        # re-raise: a single failed terminal report must not
-                        # kill the polling loop and strand every subsequent task.
-                        log.error(
-                            "task %s: terminal %s report failed after retries; "
-                            "backend did not record outcome=%r: %s",
-                            task.id, terminal, outcome[1], report_exc,
-                        )
+                        # the client's own retries. Either way the handler's
+                        # outcome is at risk of being *lost*: the backend leaves
+                        # the task in_progress and eventually sweeps it as stale.
+                        # We intentionally do NOT re-raise: a single failed
+                        # terminal report must not kill the polling loop and
+                        # strand every subsequent task.
+                        #
+                        # When it was ``complete`` that failed, don't leave it
+                        # there — fall back to ``fail`` carrying the complete
+                        # error. The common cause is a result payload the wire
+                        # can't take (a numpy scalar, a Path, a datetime in the
+                        # handler's dict) or a backend rejection: a 4xx/encode
+                        # error no amount of retrying fixes, so complete() will
+                        # never land no matter how long we wait. Orphaning the
+                        # task means the sweeper reclaims and *recomputes* it —
+                        # hours of GPU work redone, and until then the UI shows
+                        # a task stuck running. fail() is a separate route with
+                        # its own payload (a plain string) and its own retry
+                        # window, so it lands in exactly the cases complete()
+                        # can't. A terminal ``failed`` naming the real cause
+                        # beats a silent orphan: the operator sees why, and the
+                        # backend stops holding the task open.
+                        #
+                        # Safe in the one case where complete() *did* land and
+                        # only its response was lost (read timeout after the
+                        # backend's write): both terminal routes are guarded
+                        # transitions (see client.py's retry notes), so the
+                        # backend rejects failing an already-terminal task —
+                        # the fallback raises, the task stays ``completed``,
+                        # and we fall through to the ERROR log below.
+                        unreported = f"{type(report_exc).__name__}: {report_exc}"
+                        if terminal == "complete":
+                            try:
+                                await self._client.fail(
+                                    task.id,
+                                    "handler succeeded but the complete "
+                                    f"report failed: {unreported}",
+                                )
+                            except Exception as fallback_exc:  # noqa: BLE001
+                                # Both terminal routes are gone (backend down
+                                # past both retry windows) — nothing left to
+                                # try, so fall through to the ERROR log.
+                                unreported += (
+                                    " (fail fallback also failed: "
+                                    f"{type(fallback_exc).__name__}: "
+                                    f"{fallback_exc})"
+                                )
+                            else:
+                                log.warning(
+                                    "task %s: terminal complete report failed "
+                                    "(%s); reported as failed instead so the "
+                                    "task lands terminal rather than orphaning "
+                                    "in_progress",
+                                    task.id, unreported,
+                                )
+                                unreported = None
+                        if unreported is not None:
+                            log.error(
+                                "task %s: terminal %s report failed after "
+                                "retries; backend did not record outcome=%r: %s",
+                                task.id, terminal, outcome[1], unreported,
+                            )
             finally:
                 # Always tear the heartbeat down, even if the report block
                 # raised something the except above doesn't catch (guard.claim
