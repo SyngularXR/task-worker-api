@@ -3,6 +3,35 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient` now treats **408 Request Timeout** as a transient status and
+  retries it with the same exponential backoff as 429/502/503/504. A 408 is
+  not a client error in the sense the rest of the 4xx range is: it is the
+  gateway reporting that a request's headers or body did not arrive inside
+  `client_header_timeout`/`client_body_timeout` — the same slow-link blip
+  already retried when it surfaces as an `httpx.TimeoutException` instead of
+  a status, and RFC 9110 §15.5.9 says the client "MAY repeat the request
+  without modifications at any later time". The case that hits it is
+  `upload_file` streaming a GB-scale output (a colmap-splat PLY, a
+  Neural-Canvas splat) over a congested link: the upload failed outright on
+  the timeout, failing a task whose GPU work was already finished. Every
+  route this client calls is an idempotent guarded transition, and
+  `upload_file` re-opens `src` per attempt, so the retry re-sends the whole
+  file rather than an already-consumed handle. The other 4xx codes are
+  unchanged — still non-transient, still surfaced immediately.
+- Jitter no longer pushes a retry delay past `retry_backoff_max_s`. The ±25%
+  spread was applied to the capped delay and handed straight back, so any
+  delay from `0.8 * max_s` upward — every delay once the exponential has
+  climbed to the ceiling — could return as much as `max_s * 1.25`: a worker
+  that set a 60s cap to bound how long one call may block its single-task
+  polling loop got up to 75s of blocking from it. The jitter *band* is now
+  clipped to `max_s`, so the returned delay never exceeds the cap while
+  staying a continuous spread (`[0.75 * max_s, max_s]` at the ceiling).
+  Clamping the drawn value instead would have honoured the cap but piled
+  every over-cap draw onto `max_s` exactly, re-synchronising the workers that
+  jittered upward — the thundering herd jitter is there to break up. This is
+  the same band-clipping `Worker._claim_wait_s` already does for the claim
+  backoff. Delays whose whole band fits under the cap are unchanged, and
+  `retry_jitter=False` is unaffected.
 - A task whose handler produced a result the wire can't encode no longer
   orphans in `in_progress`. The classic trigger is a stray numpy scalar,
   `Path` or `datetime` left in a handler's dict: `complete()` raised while

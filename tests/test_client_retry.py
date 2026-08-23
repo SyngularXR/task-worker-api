@@ -1210,8 +1210,14 @@ def test_init_accepts_max_retries_one():
 # overloaded. Previously every HTTPStatusError (including these transient
 # gateway codes) surfaced immediately, failing the task on a blip that clears
 # in seconds. Now 502/503/504 are retried with the same backoff as transport
-# errors; 500 and non-429 4xx still surface immediately (500 = app logic
+# errors; 500 and the remaining 4xx still surface immediately (500 = app logic
 # error, 4xx = client error — retrying won't help).
+#
+# 408 (Request Timeout) is retried too: it is the server reporting a transport
+# timeout (nginx client_header_timeout/client_body_timeout on a slow link),
+# which is the same blip already retried when it arrives as a
+# TimeoutException instead of a status. RFC 9110 §15.5.9 says the client "MAY
+# repeat the request without modifications at any later time".
 #
 # 429 (Too Many Requests) is also retried: the shared backend rate-limits
 # lifecycle calls (complete/fail/progress) under fleet burst load, and
@@ -1220,11 +1226,11 @@ def test_init_accepts_max_retries_one():
 # -----------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [429, 502, 503, 504])
+@pytest.mark.parametrize("status", [408, 429, 502, 503, 504])
 async def test_request_retries_on_transient_gateway_status_then_succeeds(status):
-    """A 429/502/503/504 from the backend is transient (rate-limit /
-    upstream restart/overload) and must be retried with backoff, not failed
-    immediately."""
+    """A 408/429/502/503/504 from the backend is transient (request timeout /
+    rate-limit / upstream restart/overload) and must be retried with backoff,
+    not failed immediately."""
     calls = {"n": 0}
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -1264,6 +1270,10 @@ async def test_request_does_not_retry_500():
 async def test_request_does_not_retry_4xx(status):
     """4xx client errors are never transient — retrying won't change the
     outcome, so they must surface immediately without retry budget.
+
+    408 is deliberately absent from this list: it reports a transport timeout
+    rather than a defect in the request, and is retried (see
+    test_request_retries_on_transient_gateway_status_then_succeeds).
 
     claim_next treats 404 as no-task (returns None); every other 4xx raises
     HTTPStatusError. Either way only one attempt must fire."""
@@ -1420,6 +1430,39 @@ async def test_upload_file_retries_on_503_then_succeeds(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_upload_file_retries_on_408_then_sends_full_body(tmp_path):
+    """The motivating 408 case: nginx times out a slow multipart body.
+
+    A GB-scale output over a congested link can exceed the gateway's
+    client_body_timeout, which answers 408 rather than dropping the
+    connection. That must be retried like any other transport timeout, and
+    the retry must re-open ``src`` so the backend receives the whole file —
+    not a body already consumed by the failed attempt.
+    """
+    body = b"\x07\x08" * 500
+    calls = {"n": 0}
+    received: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        received.append(await request.aread())
+        if calls["n"] < 3:
+            return httpx.Response(408, text="Request Timeout")
+        return httpx.Response(200)
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(body)
+
+    client = _client_with_handler(handler, max_retries=4)
+    await client.upload_file(9, "output.ply", src)
+    await client.close()
+
+    assert calls["n"] == 3
+    # Every attempt — including the one that answered 200 — carried the file.
+    assert all(body in sent for sent in received)
+
+
+@pytest.mark.asyncio
 async def test_upload_file_does_not_retry_500(tmp_path):
     """A 500 during upload is not transient — it must surface immediately."""
     calls = {"n": 0}
@@ -1483,6 +1526,43 @@ def test_backoff_delay_jitter_stays_within_spread_band():
     for _ in range(200):
         d = _backoff_delay(2, base_s=2.0, max_s=60.0, jitter=True)
         assert 8.0 * (1 - _JITTER_SPREAD) <= d <= 8.0 * (1 + _JITTER_SPREAD)
+
+
+def test_backoff_delay_jitter_never_exceeds_cap():
+    """The jitter band is clipped to max_s — the ceiling is a real ceiling.
+
+    Handing back a symmetrically jittered delay would return up to
+    max_s * 1.25, blocking the worker's polling loop past the bound
+    retry_backoff_max_s exists to enforce. Two cases must hold it:
+    attempt=7 (256s un-capped, drawn at the 30s cap), and a delay that starts
+    *under* the cap but whose +25% would clear it (50s against a 60s cap).
+    """
+    from task_worker_api.client import _JITTER_SPREAD, _backoff_delay
+
+    for _ in range(200):
+        d = _backoff_delay(7, base_s=2.0, max_s=30.0, jitter=True)
+        assert 30.0 * (1 - _JITTER_SPREAD) <= d <= 30.0
+    for _ in range(200):
+        # base=25, attempt=1 → 50s, under the 60s cap; 50 * 1.25 = 62.5 is not.
+        d = _backoff_delay(1, base_s=25.0, max_s=60.0, jitter=True)
+        assert 50.0 * (1 - _JITTER_SPREAD) <= d <= 60.0
+
+
+def test_backoff_delay_jitter_at_cap_still_spreads_the_fleet():
+    """Capped delays must stay a spread, not a point mass at max_s.
+
+    Clamping after a symmetric multiply would honour the ceiling but collapse
+    every upward draw onto max_s exactly — re-synchronising half the fleet on
+    the deep attempts, which is the thundering herd jitter exists to break.
+    Narrowing the band instead keeps the delays distinct.
+    """
+    from task_worker_api.client import _backoff_delay
+
+    draws = {_backoff_delay(7, base_s=2.0, max_s=30.0, jitter=True)
+             for _ in range(200)}
+    # A point mass at the cap would leave a handful of distinct values.
+    assert len(draws) > 150
+    assert draws != {30.0}
 
 
 def test_backoff_delay_jitter_is_deterministic_with_injected_rng():

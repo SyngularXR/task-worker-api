@@ -44,11 +44,24 @@ _RETRYABLE_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 # status on a 429 leaves the task stuck in_progress until the sweeper reclaims
 # it — retrying with backoff lets the worker self-heal instead.
 #
+# 408 (Request Timeout) is included because it is a *timeout*, not a client
+# error: nginx returns it when a request's headers or body did not arrive
+# inside ``client_header_timeout``/``client_body_timeout``, i.e. exactly the
+# slow-link blip that already gets retried when it surfaces as an
+# ``httpx.TimeoutException`` instead of a status. A worker streaming a
+# GB-scale output (colmap-splat PLY, Neural-Canvas splat) over a congested
+# link is the case that hits it, and failing the upload there fails a task
+# whose work is already done. RFC 9110 §15.5.9 sanctions the retry directly:
+# the client "MAY repeat the request without modifications at any later
+# time". Every route this client calls is an idempotent guarded transition,
+# so re-sending is safe.
+#
 # 500 is intentionally excluded: a 500 is the application's own error
 # response, which usually signals a logic bug or a bad payload, not a
 # transient outage — retrying it just burns budget and re-logs the same error.
-# Other 4xx codes are excluded for the same reason (client error, retrying
-# won't help).
+# The other 4xx codes are excluded for the same reason (client error, retrying
+# won't help) — 408 is the exception because the server is reporting a
+# transport-level timeout rather than a defect in the request.
 #
 # Exception: terminal reports (``complete``/``fail``) opt in to retrying 500
 # via ``_retry``'s ``extra_transient`` parameter. A 500 there can also mean
@@ -56,7 +69,7 @@ _RETRYABLE_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 # dropping the report orphans a fully computed outcome — the task stays
 # RUNNING until the sweeper reclaims it. Both terminal routes are idempotent
 # guarded transitions, so re-PUTting is safe.
-_TRANSIENT_STATUS_CODES = frozenset({429, 502, 503, 504})
+_TRANSIENT_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 
 # Extra transient set + attempt floor for terminal reports (see above).
 _TERMINAL_EXTRA_TRANSIENT = frozenset({500})
@@ -186,11 +199,24 @@ def _backoff_delay(
 
     - **Cap**: the delay is clamped to ``max_s`` so a high ``max_retries``
       can't produce a single multi-minute sleep.
-    - **Jitter**: when enabled, the (capped) delay is multiplied by a uniform
-      random factor in ``[1 - _JITTER_SPREAD, 1 + _JITTER_SPREAD]``. The three
-      fleet workers share one backend; without jitter they'd all retry on the
+    - **Jitter**: when enabled, the delay is multiplied by a uniform random
+      factor in ``[1 - _JITTER_SPREAD, 1 + _JITTER_SPREAD]``. The three fleet
+      workers share one backend; without jitter they'd all retry on the
       identical deterministic schedule and re-overload it the instant it
       recovers (thundering herd). Jitter decorrelates them.
+
+    The two compose one way only: the jitter **band** is clipped to ``max_s``,
+    so the returned delay never exceeds the cap. Jittering symmetrically and
+    handing the result straight back would return up to ``max_s * 1.25`` —
+    overshooting the ceiling that exists precisely to bound how long one call
+    may block the worker's single-task polling loop, and doing it on every
+    delay from ``0.8 * max_s`` upward, which is most of them once the
+    exponential has climbed. Clamping the drawn *value* instead would honour
+    the ceiling but pile every over-cap draw onto ``max_s`` exactly, re-syncing
+    the workers that jittered upward — the herd this is here to break up.
+    Clipping the band keeps the delay a continuous spread (at the cap:
+    ``[0.75 * max_s, max_s]``): still decorrelated, never over budget. Same
+    shape, and the same reasoning, as ``Worker._claim_wait_s``.
 
     ``rng`` is injectable so tests can assert on exact delays deterministically.
     """
@@ -199,8 +225,11 @@ def _backoff_delay(
         delay = max_s
     if jitter and delay > 0:
         r = rng if rng is not None else random
-        factor = 1.0 + r.uniform(-_JITTER_SPREAD, _JITTER_SPREAD)
-        delay *= factor
+        spread = delay * _JITTER_SPREAD
+        high = delay + spread
+        if max_s is not None and high > max_s:
+            high = max_s
+        delay = r.uniform(delay - spread, high)
     return delay
 
 
@@ -495,11 +524,13 @@ class BackendClient:
         - ``httpx.TransportError`` / ``httpx.TimeoutException`` — the request
           never reached the backend or the connection dropped.
         - ``httpx.HTTPStatusError`` whose status is a transient code
-          (429/502/503/504) — 429 means the backend rate-limited the call
+          (408/429/502/503/504) — 408 is the server reporting a transport
+          timeout on a slow request (nginx's client_body_timeout on a
+          GB-scale upload), 429 means the backend rate-limited the call
           (the shared backend serves the whole fleet), while 502/503/504 mean
           the gateway is up but the upstream Flask app is momentarily
           unavailable (restart, overload, deploy). Other status errors
-          (500, non-429 4xx) surface immediately without consuming retry
+          (500, other 4xx) surface immediately without consuming retry
           budget, matching the pre-existing non-transient pass-through contract.
 
         The backoff is exponential (``retry_backoff_s * 2**n``), capped at
@@ -664,7 +695,7 @@ class BackendClient:
         """Request with exponential-backoff retry on transient errors.
 
         Retries ``httpx.TransportError`` / ``httpx.TimeoutException`` and
-        transient status codes (429/502/503/504); other HTTP status
+        transient status codes (408/429/502/503/504); other HTTP status
         errors surface immediately. Uses no third-party retry library to keep
         SDK dependencies minimal.
 
@@ -711,7 +742,7 @@ class BackendClient:
         # /tasks/next route) as success variants, so it can't reuse _request's
         # blanket raise_for_status. It calls _retry directly with a closure
         # that returns the response for 204/404 and raises for everything else
-        # — so a transient 429/502/503/504 is still retried here, matching every
+        # — so a transient 408/429/502/503/504 is still retried here, matching every
         # other backend call.
         async def _claim_once() -> Optional[httpx.Response]:
             resp = await self._client.request(
@@ -840,8 +871,8 @@ class BackendClient:
         timeout and the next poll fires on schedule.
 
         .. note::
-            This method retries transient errors (transport errors and 429/
-            502/503/504) via the standard ``_retry`` loop. For the
+            This method retries transient errors (transport errors and 408/
+            429/502/503/504) via the standard ``_retry`` loop. For the
             CancelGuard's hot poll path, prefer :meth:`poll_cancel_status`,
             which is a single-shot GET with no retries — the guard has its
             own poll-interval retry and the client-level backoff chain
@@ -930,7 +961,7 @@ class BackendClient:
 
         Retries on the same transient errors as every other backend call
         (``httpx.TransportError`` / ``httpx.TimeoutException``, plus transient
-        status codes 429/502/503/504).  Each attempt re-opens ``dest``
+        status codes 408/429/502/503/504).  Each attempt re-opens ``dest``
         with ``"wb"`` (truncating), so a retry after a mid-stream failure
         writes a clean file rather than appending to a partial one.  A
         non-transient HTTP status error (e.g. 404/500) is raised immediately
@@ -1040,7 +1071,7 @@ class BackendClient:
 
         Retries on the same transient errors as every other backend call
         (``httpx.TransportError`` / ``httpx.TimeoutException``, plus transient
-        status codes 429/502/503/504).  The source file is opened
+        status codes 408/429/502/503/504).  The source file is opened
         **inside** the per-attempt closure, so each retry gets a fresh handle
         starting at byte 0 — opening it once outside the loop would exhaust
         the handle on the first attempt and send zero bytes on every
