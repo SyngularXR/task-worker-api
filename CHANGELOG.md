@@ -3,6 +3,35 @@
 ## Unreleased
 
 **Fixes:**
+- `BackendClient`'s per-call deadlines no longer disable timeouts entirely when
+  a consumer opts out of one. `file_timeout_s`, `cancel_timeout_s` and
+  `lifecycle_timeout_s` each document `None` as "fall back to the client's own
+  timeout", and each passed that `None` straight to httpx as the request's
+  `timeout=`. httpx resolves a per-request timeout in `build_request`, where an
+  explicit `None` becomes `Timeout(None)` — connect, read, write and pool all
+  disabled, i.e. **no timeout at all** — so every documented opt-out was in fact
+  an unbounded request against an unresponsive backend, and one below the level
+  `_retry` can see (the hang is inside a single attempt, so there is never a
+  failure to retry). A cancel poll that never returns leaves the `CancelGuard`
+  blind for the rest of the task, so a user cancel is never acted on; a
+  heartbeat or terminal `complete`/`fail` that never returns wedges the worker's
+  single-task polling loop — no claims, no cancel polls, no shutdown response —
+  while the sweeper reclaims the task as abandoned; a `download_file` that never
+  returns strands its partial file at `dest`. The fallback is now httpx's
+  `USE_CLIENT_DEFAULT` sentinel, which is the only spelling that actually
+  inherits the client's timeout. SDK defaults were never affected (`Worker`
+  passes 300s/5s/15s), so this changes behaviour only for consumers that
+  explicitly opted a deadline out — and only by bounding a call that previously
+  could not be bounded.
+- `BackendClient.download_file` now removes its partial file when the *caller*
+  is cancelled, not just when the download itself fails. The cleanup caught
+  `Exception`, and `asyncio.CancelledError` is not one, so a worker shutting
+  down (or a task watchdog unwinding a run) mid-transfer left a truncated file
+  at `dest`. `prepare_inputs` stages into a stable per-task input dir, so that
+  truncated file is one a retried task can pick up as a complete input. The
+  cleanup now catches `BaseException` — the same contract `files._copyfile_async`
+  already applied to the local-mode copy, and which its docstring already
+  described as mirroring `download_file`.
 - `BackendClient` now treats **408 Request Timeout** as a transient status and
   retries it with the same exponential backoff as 429/502/503/504. A 408 is
   not a client error in the sense the rest of the 4xx range is: it is the

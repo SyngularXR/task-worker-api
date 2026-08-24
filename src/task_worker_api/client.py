@@ -248,6 +248,34 @@ def _progress_body(
     return body
 
 
+def _per_request_timeout(seconds: Optional[float]):
+    """``httpx.Timeout(seconds)``, or the inherit-the-client-default sentinel.
+
+    The sentinel must be ``httpx.USE_CLIENT_DEFAULT`` and **not** ``None``.
+    httpx resolves a per-request ``timeout=`` in ``build_request``, before the
+    transport ever runs: an explicit ``None`` there becomes ``Timeout(None)``
+    — every facet (connect/read/write/pool) disabled, i.e. *no timeout at
+    all* — and only the sentinel falls through to the client's own timeout.
+
+    Passing ``None`` therefore inverted each of the documented opt-outs
+    (``file_timeout_s=None``, ``cancel_timeout_s=None``,
+    ``lifecycle_timeout_s=None``, all described as "falls back to the client's
+    own timeout") into an *unbounded* request against an unresponsive backend:
+
+    - a cancel poll that never returns leaves the ``CancelGuard`` blind for
+      the rest of the task, so a user cancel is never acted on;
+    - a heartbeat or terminal ``complete``/``fail`` that never returns wedges
+      the worker's single-task polling loop — no claims, no cancel polls, no
+      shutdown response — while the sweeper reclaims the task as abandoned;
+    - a ``download_file`` that never returns strands a partial file at
+      ``dest``, because the cleanup only runs on the way out.
+
+    None of it is reachable via retry or backoff: the hang is inside one
+    request, so ``_retry`` never sees a failure to retry.
+    """
+    return httpx.USE_CLIENT_DEFAULT if seconds is None else httpx.Timeout(seconds)
+
+
 async def _cancel_and_drain(task: "asyncio.Future") -> None:
     """Cancel ``task`` and wait for it to actually stop.
 
@@ -450,10 +478,9 @@ class BackendClient:
         # lifecycle latency (claim, heartbeat, cancel-poll) untouched. ``None``
         # falls back to the client's own timeout (legacy behaviour) for
         # consumers that supply their own client and don't want the SDK to
-        # impose a separate file deadline.
-        self._file_timeout: Optional[httpx.Timeout] = (
-            httpx.Timeout(file_timeout_s) if file_timeout_s is not None else None
-        )
+        # impose a separate file deadline — see _per_request_timeout for why
+        # that fallback is a sentinel rather than a literal ``None``.
+        self._file_timeout = _per_request_timeout(file_timeout_s)
         # Cancel polling (get_cancel_status) is a cheap read-only GET that the
         # CancelGuard fires every ``cancel_poll_interval_s`` (default 2s). It
         # used the 30s general request timeout, meaning a single slow poll
@@ -466,10 +493,8 @@ class BackendClient:
         # general timeout still governs claim; report_progress/complete/fail
         # have their own ``lifecycle_timeout_s`` deadline. ``None`` falls back
         # to the client's own timeout for consumers that don't want a separate
-        # cancel deadline.
-        self._cancel_timeout: Optional[httpx.Timeout] = (
-            httpx.Timeout(cancel_timeout_s) if cancel_timeout_s is not None else None
-        )
+        # cancel deadline (see _per_request_timeout).
+        self._cancel_timeout = _per_request_timeout(cancel_timeout_s)
         # Lifecycle writes (report_progress / complete / fail) are the worker's
         # terminal-ish status calls. They used the 30s general request timeout,
         # so a temporarily-slow backend could block the polling loop for up to
@@ -484,10 +509,8 @@ class BackendClient:
         # (cancel-poll) and file_timeout_s (file transfers): the 30s general
         # timeout now governs only claim_next. ``None`` falls back to the
         # client's own timeout for consumers that don't want a separate
-        # lifecycle deadline.
-        self._lifecycle_timeout: Optional[httpx.Timeout] = (
-            httpx.Timeout(lifecycle_timeout_s) if lifecycle_timeout_s is not None else None
-        )
+        # lifecycle deadline (see _per_request_timeout).
+        self._lifecycle_timeout = _per_request_timeout(lifecycle_timeout_s)
         self._payload_logger = payload_logger
 
     async def __aenter__(self) -> "BackendClient":
@@ -985,9 +1008,16 @@ class BackendClient:
         each write, so the thread dispatches stay proportional to the file
         size rather than to the transport's ~64 KB chunking.
 
-        If every attempt fails (retries exhausted or a non-retryable error),
-        any partial file left at ``dest`` is removed so callers never see a
-        truncated/stale artifact from a failed download.
+        If the download does not finish — retries exhausted, a non-retryable
+        error, a cancel, or the *caller* being cancelled (worker shutdown, or
+        the task watchdog unwinding a run) — any partial file left at ``dest``
+        is removed so callers never see a truncated/stale artifact. The
+        caller-cancelled case is why the cleanup catches ``BaseException``
+        rather than ``Exception``: ``asyncio.CancelledError`` is not an
+        ``Exception``, and ``prepare_inputs`` stages into a stable per-task
+        input dir, so a truncated file surviving a shutdown is a file a
+        retried task can pick up as a complete input. Same contract, and the
+        same reasoning, as ``files._copyfile_async``.
 
         When ``cancelled`` is supplied (an ``asyncio.Event`` from a
         ``CancelGuard`` active during input staging), the event is checked
@@ -1051,14 +1081,16 @@ class BackendClient:
                 await _await_unless_cancelled(
                     operation, cancelled, cancel_message,
                 )
-        except Exception:
-            # A mid-stream transport failure can leave a partial file at dest
-            # (each retry truncates via "wb", but the final failed attempt's
-            # partial content survives). Remove it so a failed download never
-            # leaves a truncated/stale artifact behind.
+        except BaseException:
+            # A mid-stream transport failure, a cancel, or the caller being
+            # cancelled can leave a partial file at dest (each retry truncates
+            # via "wb", but the final unfinished attempt's partial content
+            # survives). Remove it so an unfinished download never leaves a
+            # truncated/stale artifact behind. FileNotFoundError is an OSError,
+            # so the one clause covers the already-absent case too.
             try:
                 dest.unlink()
-            except (FileNotFoundError, OSError):
+            except OSError:
                 pass
             raise
 

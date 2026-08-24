@@ -1650,13 +1650,18 @@ def test_init_defaults_backoff_max_and_jitter():
 # -----------------------------------------------------------------------
 
 
-def test_init_defaults_file_timeout_to_none_when_client_supplied():
-    """When no file_timeout_s is passed, _file_timeout is None — the file
-    calls fall back to the client's own default timeout (legacy behaviour
-    for consumers that build their own client and don't want the SDK to
-    impose a separate file deadline)."""
+def test_init_defaults_file_timeout_to_client_default_sentinel():
+    """When no file_timeout_s is passed, the file calls fall back to the
+    client's own default timeout (legacy behaviour for consumers that build
+    their own client and don't want the SDK to impose a separate file
+    deadline).
+
+    The fallback must be httpx's USE_CLIENT_DEFAULT sentinel, never a literal
+    None: httpx reads an explicit ``timeout=None`` as Timeout(None), i.e.
+    *no* timeout on any facet, which turns the opt-out into an unbounded
+    request against an unresponsive backend."""
     client = BackendClient("http://fake", "x")
-    assert client._file_timeout is None
+    assert client._file_timeout is httpx.USE_CLIENT_DEFAULT
     # close the real httpx client it created
     import asyncio
     asyncio.run(client.close())
@@ -1803,15 +1808,14 @@ async def test_file_timeout_none_falls_back_to_client_default(tmp_path):
     await client.close()
 
     assert len(seen) == 1
-    # timeout=None passed to httpx means "use client default" — at the
-    # request-extension level httpx records None for each facet (the
-    # resolution to the client's 30s happens at the real transport layer,
-    # which MockTransport doesn't simulate). The point is that no separate
-    # file deadline is imposed: _file_timeout is None, so the call inherits
-    # the client default rather than overriding it.
-    assert seen[0] is not None
-    assert seen[0]["read"] is None
-    assert seen[0]["write"] is None
+    # httpx resolves the per-request timeout in build_request, so the
+    # extension already carries the *effective* deadline. Falling back must
+    # therefore land on the client's own 30s. It used to record None on every
+    # facet — httpx's spelling of "no timeout at all" — which left a stalled
+    # GB-scale download hanging forever with its partial file at dest.
+    assert seen[0] == {
+        "connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0,
+    }
 
 
 # -----------------------------------------------------------------------
@@ -1852,12 +1856,13 @@ def test_init_cancel_timeout_builds_explicit_timeout():
 
 
 def test_init_cancel_timeout_none_falls_back_to_client_default():
-    """When cancel_timeout_s is None, _cancel_timeout is None — the
-    cancel-poll call falls back to the client's own default timeout (legacy
-    behaviour for consumers that build their own client and don't want the
-    SDK to impose a separate cancel deadline)."""
+    """When cancel_timeout_s is None, the cancel-poll call falls back to the
+    client's own default timeout (legacy behaviour for consumers that build
+    their own client and don't want the SDK to impose a separate cancel
+    deadline) — via the USE_CLIENT_DEFAULT sentinel, not a literal None,
+    which httpx would read as "no timeout at all"."""
     client = BackendClient("http://fake", "x", cancel_timeout_s=None)
-    assert client._cancel_timeout is None
+    assert client._cancel_timeout is httpx.USE_CLIENT_DEFAULT
     import asyncio
     asyncio.run(client.close())
 
@@ -1975,12 +1980,13 @@ def test_init_lifecycle_timeout_builds_explicit_timeout():
 
 
 def test_init_lifecycle_timeout_none_falls_back_to_client_default():
-    """When lifecycle_timeout_s is None, _lifecycle_timeout is None — the
-    lifecycle calls fall back to the client's own default timeout (legacy
-    behaviour for consumers that build their own client and don't want the
-    SDK to impose a separate lifecycle deadline)."""
+    """When lifecycle_timeout_s is None, the lifecycle calls fall back to the
+    client's own default timeout (legacy behaviour for consumers that build
+    their own client and don't want the SDK to impose a separate lifecycle
+    deadline) — via the USE_CLIENT_DEFAULT sentinel, not a literal None,
+    which httpx would read as "no timeout at all"."""
     client = BackendClient("http://fake", "x", lifecycle_timeout_s=None)
-    assert client._lifecycle_timeout is None
+    assert client._lifecycle_timeout is httpx.USE_CLIENT_DEFAULT
     import asyncio
     asyncio.run(client.close())
 
@@ -2140,15 +2146,12 @@ async def test_lifecycle_timeout_none_falls_back_to_client_default():
     await client.close()
 
     assert len(seen) == 1
-    # timeout=None passed to httpx means "use client default" — at the
-    # request-extension level httpx records None for each facet (the
-    # resolution to the client's 30s happens at the real transport layer,
-    # which MockTransport doesn't simulate). The point is that no separate
-    # lifecycle deadline is imposed: _lifecycle_timeout is None, so the call
-    # inherits the client default rather than overriding it.
-    assert seen[0] is not None
-    assert seen[0]["read"] is None
-    assert seen[0]["write"] is None
+    # The fallback must resolve to the client's own 30s, not to httpx's
+    # "no timeout at all" (None on every facet) — a heartbeat or terminal
+    # report that never returns wedges the single-task polling loop.
+    assert seen[0] == {
+        "connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0,
+    }
 
 
 # -----------------------------------------------------------------------
@@ -2411,9 +2414,11 @@ async def test_poll_cancel_status_cancel_timeout_none_falls_back():
     await client.close()
 
     assert len(seen) == 1
-    assert seen[0] is not None
-    assert seen[0]["read"] is None
-    assert seen[0]["write"] is None
+    # As above: the fallback resolves to the client's 30s. An unbounded poll
+    # would leave the CancelGuard blind for the rest of the task.
+    assert seen[0] == {
+        "connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0,
+    }
 
 
 # -----------------------------------------------------------------------
@@ -3366,3 +3371,123 @@ def test_retry_knobs_are_keyword_only_on_both_public_constructors():
         BackendClient("http://fake", "x", 4)
     with pytest.raises(TypeError):
         Worker("http://fake", "x", "w", {})
+
+
+# -----------------------------------------------------------------------
+# No per-request timeout may ever be unbounded.
+#
+# Every dedicated deadline (file_timeout_s / cancel_timeout_s /
+# lifecycle_timeout_s) documents ``None`` as "fall back to the client's own
+# timeout". httpx resolves a per-request ``timeout=`` in build_request, where
+# an explicit None means Timeout(None) — no connect/read/write/pool deadline
+# at all — so spelling that fallback as None inverted it: an unresponsive
+# backend could hang a single request forever, below the level _retry can see.
+# The consequences are per-call-site (blind CancelGuard, wedged polling loop,
+# stranded partial download), so pin every call site, not just one.
+# -----------------------------------------------------------------------
+
+async def _timeout_extension_for(client, call) -> dict:
+    """Run ``call(client)`` against a MockTransport; return the seen timeout."""
+    seen: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200, json={"cancelled": False})
+
+    client._client = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=httpx.MockTransport(handler),
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    await call(client)
+    await client._client.aclose()
+    assert len(seen) == 1
+    return seen[0]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda c: c.get_cancel_status(5), id="get_cancel_status"),
+        pytest.param(lambda c: c.poll_cancel_status(5), id="poll_cancel_status"),
+        pytest.param(
+            lambda c: c.report_progress(5, stage="working"), id="report_progress",
+        ),
+        pytest.param(
+            lambda c: c.report_progress_once(5, stage="working"),
+            id="report_progress_once",
+        ),
+        pytest.param(lambda c: c.complete(5, {"ok": True}), id="complete"),
+        pytest.param(lambda c: c.fail(5, "boom"), id="fail"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_no_call_site_sends_an_unbounded_timeout(call):
+    """With every dedicated deadline opted out, each call must still inherit
+    the client's 30s — never httpx's all-None "no timeout at all"."""
+    client = BackendClient(
+        "http://fake/api/v1", "x", timeout_s=30.0,
+        file_timeout_s=None, cancel_timeout_s=None, lifecycle_timeout_s=None,
+    )
+    await client.close()  # drop the real client _timeout_extension_for replaces
+    assert await _timeout_extension_for(client, call) == {
+        "connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_file_transfers_never_send_an_unbounded_timeout(tmp_path):
+    """Same contract for the streaming/multipart pair, which take the longest
+    to notice a stall and are the ones that strand a partial file."""
+    src = tmp_path / "in.ply"
+    src.write_bytes(b"payload")
+    expected = {"connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0}
+
+    for call in (
+        lambda c: c.download_file(5, "scene.ply", tmp_path / "out.ply"),
+        lambda c: c.upload_file(5, "scene.ply", src),
+    ):
+        client = BackendClient(
+            "http://fake/api/v1", "x", timeout_s=30.0, file_timeout_s=None,
+        )
+        await client.close()
+        assert await _timeout_extension_for(client, call) == expected
+
+
+# -----------------------------------------------------------------------
+# download_file partial-file cleanup must survive caller cancellation.
+#
+# The cleanup used to catch Exception, and asyncio.CancelledError is not one:
+# a worker shutting down (or a task watchdog unwinding a run) mid-download
+# left a truncated file at dest. prepare_inputs stages into a stable per-task
+# input dir, so that truncated file can be picked up as a complete input by a
+# retried task. files._copyfile_async already catches BaseException here.
+# -----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_download_file_removes_partial_file_when_caller_cancelled(tmp_path):
+    """Cancelling the awaiting task mid-stream must leave no file at dest."""
+    started = asyncio.Event()
+
+    async def body():
+        yield b"partial-bytes"
+        started.set()
+        await asyncio.sleep(3600)  # unresponsive backend: stream never ends
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body())
+
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=httpx.MockTransport(handler),
+        timeout=30.0, headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient("http://fake/api/v1", "x", client=http)
+    dest = tmp_path / "scene.ply"
+
+    task = asyncio.create_task(client.download_file(5, "scene.ply", dest))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await client.close()
+
+    assert not dest.exists()
