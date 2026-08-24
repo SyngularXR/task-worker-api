@@ -23,6 +23,7 @@ import shutil
 import tempfile
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -78,7 +79,7 @@ def _positive_finite_s(name: str, value: float) -> float:
 
 
 def _make_sync_fail(
-    base_url: str, api_key: str, task_id: int, *, timeout_s: float = 3.0,
+    base_url: str, api_key: str, task_id: int, worker_id: str, *, timeout_s: float = 3.0,
     attempts: int = 3, retry_sleep_s: float = 2.0,
 ):
     """Build a synchronous ``fail(error)`` callable for the watchdog thread.
@@ -93,7 +94,10 @@ def _make_sync_fail(
     a single attempt against a momentarily unavailable backend (restart, DB
     blip) would silently orphan the task as RUNNING until the sweeper.
     """
-    url = f"{base_url.rstrip('/')}/tasks/{task_id}/fail"
+    url = (
+        f"{base_url.rstrip('/')}/tasks/{task_id}/fail"
+        f"?worker_id={urllib.parse.quote(worker_id, safe='')}"
+    )
 
     def _sync_fail(error: str) -> None:
         data = json.dumps({"error": error}).encode("utf-8")
@@ -249,6 +253,7 @@ class Worker:
         if client is None:
             self._client = BackendClient(
                 backend_url, api_key, timeout_s=request_timeout_s,
+                worker_id=worker_id,
                 file_timeout_s=file_timeout_s,
                 cancel_timeout_s=cancel_timeout_s,
                 lifecycle_timeout_s=lifecycle_timeout_s,
@@ -594,7 +599,9 @@ class Worker:
                 timeout_s=timeout_s,
                 grace_s=self.timeout_grace_s,
                 guard=guard,
-                sync_fail=_make_sync_fail(self.backend_url, self.api_key, task.id),
+                sync_fail=_make_sync_fail(
+                    self.backend_url, self.api_key, task.id, self.worker_id,
+                ),
                 on_hard_exit=self._on_hard_exit,
                 children_before=list_descendants(os.getpid()),
             )

@@ -28,10 +28,14 @@ def test_make_sync_fail_builds_put_request(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
-    fn = _make_sync_fail("http://bk/api/v1/", "secret", 42, timeout_s=3.0)
+    fn = _make_sync_fail(
+        "http://bk/api/v1/", "secret", 42, "worker / 1", timeout_s=3.0
+    )
     fn("timeout: exceeded 1800s (hard-exit)")
 
-    assert captured["url"] == "http://bk/api/v1/tasks/42/fail"
+    assert captured["url"] == (
+        "http://bk/api/v1/tasks/42/fail?worker_id=worker%20%2F%201"
+    )
     assert captured["method"] == "PUT"
     assert captured["timeout"] == 3.0
     assert captured["auth"] == "Bearer secret"

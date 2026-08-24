@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "coordinate_frame": "syngar_anchor_v1",
+  "units": "meters",
+  "matrix_layout": "row_major",
+  "coordinate_convention": "unity_left_handed",
+  "pixel_projection": {
+    "image_origin": "top_left",
+    "pixel_axes": "x_right_y_down",
+    "camera_axes": "x_right_y_up_z_forward",
+    "camera_point_formula": [
+      "(u-cx)*depth/fx",
+      "-(v-cy)*depth/fy",
+      "depth"
+    ]
+  },
+  "tracking_from_anchor": [
+    0.0, 0.0, 1.0, 1.0,
+    0.0, 1.0, 0.0, 2.0,
+    -1.0, 0.0, 0.0, 3.0,
+    0.0, 0.0, 0.0, 1.0
+  ],
+  "frames": [
+    {
+      "frame_id": "frame-a",
+      "intrinsics": [
+        [2.0, 0.0, 1.0],
+        [0.0, 2.0, 1.0],
+        [0.0, 0.0, 1.0]
+      ],
+      "tracking_from_camera": [
+        0.0, 0.0, 1.0, 0.7,
+        0.0, 1.0, 0.0, 2.2,
+        -1.0, 0.0, 0.0, 2.9,
+        0.0, 0.0, 0.0, 1.0
+      ],
+      "expected_anchor_from_camera": [
+        1.0, 0.0, 0.0, 0.1,
+        0.0, 1.0, 0.0, 0.2,
+        0.0, 0.0, 1.0, -0.3,
+        0.0, 0.0, 0.0, 1.0
+      ],
+      "depth_m": [
+        [0.0, 0.0, 2.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0]
+      ],
+      "expected_anchor_points": [
+        {"pixel_uv": [2, 0], "point": [1.1, 1.2, 1.7]},
+        {"pixel_uv": [1, 1], "point": [0.1, 0.2, 0.7]}
+      ]
+    },
+    {
+      "frame_id": "frame-b",
+      "intrinsics": [
+        [2.0, 0.0, 1.0],
+        [0.0, 2.0, 1.0],
+        [0.0, 0.0, 1.0]
+      ],
+      "tracking_from_camera": [
+        -1.0, 0.0, 0.0, 1.4,
+        0.0, 1.0, 0.0, 2.1,
+        0.0, 0.0, -1.0, 3.2,
+        0.0, 0.0, 0.0, 1.0
+      ],
+      "expected_anchor_from_camera": [
+        0.0, 0.0, 1.0, -0.2,
+        0.0, 1.0, 0.0, 0.1,
+        -1.0, 0.0, 0.0, 0.4,
+        0.0, 0.0, 0.0, 1.0
+      ],
+      "depth_m": [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [2.0, 0.0, 0.0]
+      ],
+      "expected_anchor_points": [
+        {"pixel_uv": [1, 1], "point": [0.8, 0.1, 0.4]},
+        {"pixel_uv": [0, 2], "point": [1.8, -0.9, 1.4]}
+      ]
+    }
+  ],
+  "capture_volume": {
+    "shape": "oriented_box",
+    "anchor_from_volume": [
+      0.0, 0.0, 1.0, 0.5,
+      0.0, 1.0, 0.0, 0.25,
+      -1.0, 0.0, 0.0, 0.75,
+      0.0, 0.0, 0.0, 1.0
+    ],
+    "size_m": [0.8, 0.6, 0.4],
+    "crop_padding_m": 0.01,
+    "crop_cases": [
+      {
+        "anchor_point": [0.5, 0.25, 0.36],
+        "expected_volume_point": [0.39, 0.0, 0.0],
+        "inside": true
+      },
+      {
+        "anchor_point": [0.5, 0.25, 0.33],
+        "expected_volume_point": [0.42, 0.0, 0.0],
+        "inside": false
+      },
+      {
+        "anchor_point": [0.5, 0.555, 0.75],
+        "expected_volume_point": [0.0, 0.305, 0.0],
+        "inside": true
+      },
+      {
+        "anchor_point": [0.715, 0.25, 0.75],
+        "expected_volume_point": [0.0, 0.0, 0.215],
+        "inside": false
+      }
+    ]
+  }
+}

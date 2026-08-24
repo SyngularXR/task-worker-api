@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+**Features:**
+- Add the strict `spatial_recon` task params contract and packaged
+  `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
+
 **Fixes:**
 - `BackendClient`'s per-call deadlines no longer disable timeouts entirely when
   a consumer opts out of one. `file_timeout_s`, `cancel_timeout_s` and

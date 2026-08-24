@@ -3491,3 +3491,39 @@ async def test_download_file_removes_partial_file_when_caller_cancelled(tmp_path
     await client.close()
 
     assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_worker_mutations_send_claiming_worker_id(tmp_path):
+    seen: list[tuple[str, str, str | None]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (request.method, request.url.path, request.url.params.get("worker_id"))
+        )
+        if request.method == "GET":
+            return httpx.Response(200, content=b"input")
+        return httpx.Response(200, json={})
+
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1",
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer x"},
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x", worker_id="worker-7", client=http,
+        max_retries=1,
+    )
+    source = tmp_path / "out.bin"
+    source.write_bytes(b"output")
+
+    await client.report_progress(7, stage="running")
+    await client.report_progress_once(7, stage="running")
+    await client.complete(7, {"ok": True})
+    await client.fail(7, "boom")
+    await client.download_file(7, "in.bin", tmp_path / "in.bin")
+    await client.upload_file(7, "out.bin", source)
+    await client.close()
+
+    assert len(seen) == 6
+    assert all(worker_id == "worker-7" for _, _, worker_id in seen)
