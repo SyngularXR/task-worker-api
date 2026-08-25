@@ -539,6 +539,43 @@ async def test_backend_refusal_stops_re_sends_but_keeps_the_outcome(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 429])
+async def test_transient_4xx_keeps_the_report_sendable(
+    make_worker, tmp_path, status,
+):
+    """408 and 429 are 4xx but *transient*: the client already retried them
+    and merely ran out of budget. Retiring the entry on one of those would
+    leave a rate-limited outcome held but never sent again — the dropped
+    report and duplicate GPU work this ledger exists to prevent."""
+    client = FakeBackendClient()
+    worker = make_worker(client=client)
+    worker._unconfirmed.record(_report(1))
+
+    request = httpx.Request("PUT", "http://fake/api/v1/tasks/1/complete")
+    calls = []
+
+    async def throttled_complete(task_id, result, *, idempotency_key=None):
+        calls.append(task_id)
+        raise httpx.HTTPStatusError(
+            str(status), request=request,
+            response=httpx.Response(status, request=request),
+        )
+
+    client.complete = throttled_complete
+    await worker._flush_unconfirmed_reports()
+    await worker._flush_unconfirmed_reports()
+
+    assert calls == [1, 1], "a throttled report keeps being re-sent"
+    assert worker._unconfirmed.sendable(), "and stays in the sendable set"
+
+    # ...and once the rate-limit window passes, it lands.
+    client.complete = FakeBackendClient.complete.__get__(client)
+    await worker._flush_unconfirmed_reports()
+    assert len(client.completed_tasks) == 1
+    assert len(worker._unconfirmed) == 0
+
+
+@pytest.mark.asyncio
 async def test_flush_stops_at_the_first_degraded_send(make_worker, tmp_path):
     """A transport failure means the backend went away again mid-flush.
     Walking the rest of the ledger into the same wall would stall the poll

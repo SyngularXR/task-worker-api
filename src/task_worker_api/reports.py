@@ -53,12 +53,14 @@ class TerminalReport:
     :meth:`BackendClient.complete <task_worker_api.client.BackendClient.complete>`
     / :meth:`BackendClient.fail <task_worker_api.client.BackendClient.fail>`.
 
-    ``sendable`` goes False when the backend *answered* and refused the report
-    (a 4xx — most often the ownership check after the sweeper handed the task
-    to someone else). Re-sending that on a timer would just repeat the same
-    rejection every poll cycle, but the entry is kept: if this worker claims
-    the task again, :meth:`UnconfirmedReports.take` can still replay the
-    outcome instead of recomputing it.
+    ``sendable`` goes False when the backend *answered* and permanently
+    refused the report (a non-transient 4xx — most often the ownership check
+    after the sweeper handed the task to someone else). Re-sending that on a
+    timer would just repeat the same rejection every poll cycle, but the entry
+    is kept: if this worker claims the task again,
+    :meth:`UnconfirmedReports.take` can still replay the outcome instead of
+    recomputing it. A transient 4xx (408, or a 429 whose retry budget ran out)
+    is *not* a refusal and leaves the entry sendable.
     """
 
     task_id: int

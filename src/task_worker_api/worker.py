@@ -33,7 +33,13 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from .cancel import CancelGuard
-from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
+from .client import (
+    BackendClient,
+    _DEFAULT_BACKOFF_MAX_S,
+    _JITTER_SPREAD,
+    _TERMINAL_EXTRA_TRANSIENT,
+    _is_transient_status,
+)
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -646,21 +652,30 @@ class Worker:
         Per entry:
 
         * accepted → drop it; the task is terminal at last.
-        * refused with a 4xx → the backend answered and will not take this
-          report from this worker (almost always the ownership check, after
-          the sweeper handed the task to someone else). Stop re-sending it,
-          but keep the outcome: if this worker claims that task again,
-          :meth:`_run_one` replays it instead of recomputing the work.
-        * anything else (transport error, or a 5xx that outlived the client's
-          own retries) → the backend is degraded again. Keep the entry and
-          end the flush for this cycle rather than walking the rest of the
-          ledger into the same wall.
+        * refused with a *permanent* 4xx → the backend answered and will not
+          take this report from this worker (almost always the ownership
+          check, after the sweeper handed the task to someone else). Stop
+          re-sending it, but keep the outcome: if this worker claims that task
+          again, :meth:`_run_one` replays it instead of recomputing the work.
+        * anything else (transport error, a 5xx that outlived the client's own
+          retries, or a *transient* 4xx — 408/429 — whose retry budget the
+          client merely exhausted) → the backend is degraded again. Keep the
+          entry sendable and end the flush for this cycle rather than walking
+          the rest of the ledger into the same wall.
         """
         for report in self._unconfirmed.sendable():
             try:
                 await self._put_terminal(report)
             except httpx.HTTPStatusError as exc:
-                if 400 <= exc.response.status_code < 500:
+                # Only a status that says "this task is not yours" retires an
+                # entry. 408/429 are 4xx but transient — the client ran out of
+                # retry budget, not out of ownership — so they take the
+                # degraded path below and stay sendable; retiring a
+                # rate-limited report here would drop the outcome for good,
+                # which is the failure this ledger exists to prevent.
+                if 400 <= exc.response.status_code < 500 and not (
+                    _is_transient_status(exc, _TERMINAL_EXTRA_TRANSIENT)
+                ):
                     report.sendable = False
                     log.warning(
                         "task %s: backend refused the unconfirmed %s report "
