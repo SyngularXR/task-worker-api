@@ -103,16 +103,17 @@ If you implement a custom `BackendClient` subclass or override `Worker._run_one`
 
 A worker's last act on a task is one terminal report — `PUT /tasks/{id}/complete` or `PUT /tasks/{id}/fail`. Two things about that report are now contractual:
 
-**Every terminal report carries an `Idempotency-Key` header.** The value is `task-<id>-<complete|fail>-<uuid4 hex>`, minted once per attempt. All deliveries of one outcome share it: the client's own retry loop, the watchdog thread's last-resort sync `fail`, and any re-send from the ledger below. A *different* attempt on the same task (the backend re-queued it) mints a fresh key, so a retry is never mistaken for a replay.
+**Every terminal report carries an `Idempotency-Key` header.** The value is `task-<id>-<complete|fail>-<uuid4 hex>`, minted once per attempt. All deliveries of one outcome share it: the client's own retry loop, the watchdog thread's last-resort sync `fail`, and any re-send from the ledger below. A *different* attempt on the same task (the backend re-queued it) mints a fresh key, so a genuine second attempt is never mistaken for a duplicate of the first.
 
 The header is additive and one-directional. Nexus Core is free to ignore it — its terminal transitions are already guarded server-side, so a duplicate `/complete` on a terminal row is dropped and behaviour is unchanged. When the backend does want to dedupe (post-complete hooks, cascade side effects), the key is the name to dedupe on; no fleet-wide SDK upgrade is needed first.
 
 **A report the backend never confirmed is kept and re-sent.** When `complete`/`fail` outlives the client's retry budget (backend down longer than ~60s), the worker holds the outcome in a bounded in-memory ledger (`task_worker_api.reports`) and:
 
 - re-sends it at the top of the next poll cycle **whose claim reached the backend** — busy or idle, because a worker whose queue never empties never gets an idle cycle and its outcome would sit until the bounded ledger evicted it; never while claims are failing, so this can't fight the claim backoff during an outage;
-- stops re-sending on a 4xx (the ownership check, once the sweeper hands the task elsewhere) but keeps the outcome;
-- **replays** it if this worker claims the same task again — the completed work's outputs were already published before the report, so re-running the handler would redo GPU-hours for artifacts that already exist;
-- treats a re-claim after an unconfirmed *failure* as a genuine retry: the handler runs, and the stale failure report is discarded rather than left to stamp `failed` over the new attempt.
+- stops re-sending, and drops the outcome, on a permanent 4xx (the ownership check, once the sweeper hands the task elsewhere) — whoever owns the task now reports it. A *transient* 4xx (408/429) is not a refusal and stays queued;
+- **drops** it the moment the same task is delivered to this worker again, and runs the handler.
+
+That last rule is the load-bearing one, and it is deliberately conservative. A re-delivery is a **new attempt**: `GET /tasks/next` returns no attempt or lease identity (see `ClaimedTask`), so a worker cannot tell "the task whose report I lost came back" from "the backend legitimately re-queued this task for a genuine re-run" — including the case where the completion *did* commit and only its response was lost. Answering a re-delivery from the ledger would report a stale result and silently skip the work that was asked for, so the SDK never does. Re-enabling that shortcut is a protocol change, not an SDK change: it needs either an attempt/lease token in the claim envelope that a held report can be matched against, or an explicit Nexus Core guarantee that a re-delivery implies the earlier terminal report never committed.
 
 The ledger is per-process and in-memory. Reports still unconfirmed when the worker stops are logged at ERROR with their task ids — those outcomes are lost and their tasks will be swept as stale.
 

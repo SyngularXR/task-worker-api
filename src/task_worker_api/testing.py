@@ -177,9 +177,11 @@ class FakeBackendClient:
     def keys_for(self, task_id: int, kind: "Optional[str]" = None) -> list:
         """Idempotency keys this task was reported under, in send order.
 
-        The assertion a replay test wants: every delivery of one outcome
+        The assertion a re-send test wants: every delivery of one outcome
         carries the same key, so ``len(set(fake.keys_for(7))) == 1`` says the
-        re-send was the *same* logical report rather than a second one.
+        re-send was the *same* logical report rather than a second one. A
+        *later attempt* on the same task mints a fresh key, so a differing
+        pair says the worker ran the task again rather than re-reporting.
         """
         return [
             r["idempotency_key"] for r in self.idempotency_keys

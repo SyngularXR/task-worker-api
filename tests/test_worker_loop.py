@@ -508,11 +508,10 @@ async def test_worker_continues_polling_after_terminal_report_failure(
     # if the first failure had escaped, run_one() would have raised and this
     # second cycle would never run.
     healthy = FakeBackendClient()
-    # A *different* task, not a re-delivery of the one whose report was lost:
-    # each FakeBackendClient numbers from 1, and a task id the worker still
-    # holds an unconfirmed report for is replayed rather than run (see
-    # test_reports.py). This test is about the loop surviving, so keep the
-    # ids distinct.
+    # A *different* task, not a re-delivery of the one whose report was lost
+    # (each FakeBackendClient numbers from 1): a re-delivery has its own
+    # documented behaviour in test_reports.py, and this test is about the loop
+    # surviving a failed report, so keep the ids distinct.
     healthy._next_id = 2
     healthy.queue_task(
         task_type=TaskType.DETECT_CUT_PLANES,

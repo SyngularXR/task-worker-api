@@ -79,7 +79,7 @@ async def test_fail_captures_error():
 @pytest.mark.asyncio
 async def test_terminal_reports_capture_their_idempotency_key():
     """The key is what makes a re-sent report the *same* report; tests that
-    assert on replay behaviour read it back from here.
+    assert on re-send behaviour read it back from here.
 
     It is recorded *beside* completed_tasks / failed_tasks, not inside them:
     fleet worker suites compare those records whole, and widening them would

@@ -25,16 +25,21 @@
   per-worker ledger (`task_worker_api.reports`) and re-sent at the top of the
   next poll cycle — busy or idle — **whose claim reached the backend**, so a
   saturated queue still settles its lost reports while a flush can never fight
-  the claim backoff during an outage. A 4xx (the ownership check, once the
-  sweeper hands the task to someone else) stops the re-sends but keeps the
-  outcome.
-- A re-claim of a task this worker already completed but could not report now
-  **replays the stored result instead of re-running the handler** — the work is
-  done and its artifacts are already delivered, so the only thing missing was
-  the report. A re-claim after an unconfirmed *failure* is treated as what it
-  is — the backend re-queuing the task for another attempt — so the handler
-  runs normally and the stale failure report is discarded rather than left to
-  stamp `failed` over the new attempt's outcome.
+  the claim backoff during an outage. A permanent 4xx (the ownership check,
+  once the sweeper hands the task to someone else) stops the re-sends and
+  drops the outcome — whoever owns the task now reports it; a *transient* 4xx
+  (408/429) is not a refusal and stays queued.
+- A re-delivery of a task the worker still holds an unconfirmed report for is
+  treated as **a new attempt**: the handler runs and the stale report is
+  discarded, rather than left to stamp `failed` over the new attempt's outcome
+  or answer a request for work with a stale result. The SDK deliberately does
+  *not* replay a held completion here, tempting as it looks when the work
+  really was already done: `GET /tasks/next` carries no attempt or lease
+  identity, so a worker cannot tell a task whose report it lost from one the
+  backend legitimately re-queued (including a completion that committed while
+  only its response was lost). Enabling that shortcut is a protocol change —
+  an attempt token in the claim envelope, or an explicit backend guarantee —
+  not an SDK one.
 - Reports still unconfirmed when a worker stops are logged at ERROR with their
   task ids: the ledger dies with the process, so those outcomes are lost and
   their tasks will be swept as stale.

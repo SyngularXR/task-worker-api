@@ -12,13 +12,13 @@ from scratch — GPU-hours redone for a result that already exists, and a
 
 This ledger keeps those reports so the worker can re-send them:
 
-* :meth:`UnconfirmedReports.sendable` drives the poll loop's flush — one more
+* :meth:`UnconfirmedReports.pending` drives the poll loop's flush — one more
   attempt per poll cycle (busy or idle; a saturated queue never goes idle,
   and its reports must not sit here until they are evicted), and only while
   the backend is answering claims.
-* :meth:`UnconfirmedReports.take` is the re-claim path: when the sweeper
-  re-queues a task this worker already finished, the worker re-reports the
-  stored outcome instead of running the handler over again.
+* :meth:`UnconfirmedReports.take` is the re-claim path, and it *discards*:
+  a fresh delivery of a task we hold a report for is a new attempt, so the
+  handler runs and the stale report is dropped. See ``Worker._run_one``.
 
 Every entry carries the ``Idempotency-Key`` its first attempt used, so a
 re-send is the *same* logical report rather than a second one: a backend that
@@ -53,21 +53,15 @@ class TerminalReport:
     :meth:`BackendClient.complete <task_worker_api.client.BackendClient.complete>`
     / :meth:`BackendClient.fail <task_worker_api.client.BackendClient.fail>`.
 
-    ``sendable`` goes False when the backend *answered* and permanently
-    refused the report (a non-transient 4xx — most often the ownership check
-    after the sweeper handed the task to someone else). Re-sending that on a
-    timer would just repeat the same rejection every poll cycle, but the entry
-    is kept: if this worker claims the task again,
-    :meth:`UnconfirmedReports.take` can still replay the outcome instead of
-    recomputing it. A transient 4xx (408, or a 429 whose retry budget ran out)
-    is *not* a refusal and leaves the entry sendable.
+    ``idempotency_key`` is the name every delivery of this one outcome
+    travels under, so a backend that dedupes on it applies the report once no
+    matter how many times the wire ate the response.
     """
 
     task_id: int
     kind: str
     payload: object
     idempotency_key: str
-    sendable: bool = True
 
 
 class UnconfirmedReports:
@@ -106,17 +100,13 @@ class UnconfirmedReports:
         self._entries.pop(task_id, None)
 
     def take(self, task_id: int) -> Optional[TerminalReport]:
-        """Pop a task's report, or None. Used when the task is re-claimed."""
+        """Pop a task's report, or None. Used when the task is re-delivered."""
         return self._entries.pop(task_id, None)
 
-    def sendable(self) -> list:
-        """Snapshot of the entries still worth re-sending, oldest first.
+    def pending(self) -> list:
+        """Snapshot of every held report, oldest first.
 
         A snapshot (not a view) so the caller can discard entries as it
         delivers them without mutating what it is iterating over.
         """
-        return [r for r in self._entries.values() if r.sendable]
-
-    def task_ids(self) -> list:
-        """Every task id in the ledger, oldest first — for shutdown logging."""
-        return list(self._entries)
+        return list(self._entries.values())

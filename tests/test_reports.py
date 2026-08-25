@@ -1,4 +1,4 @@
-"""Idempotent terminal reporting: the ledger, the replay, and the flush.
+"""Idempotent terminal reporting: the ledger and the flush.
 
 A terminal report that never lands used to be dropped, and that dropped
 outcome is what makes a worker do the same job twice: the row stays
@@ -12,9 +12,9 @@ These tests pin the three parts of the fix:
 * the poll loop re-sends it once the backend answers claims again, under the
   *same* ``Idempotency-Key`` as the attempt that failed, so a backend that
   dedupes on the key sees one terminal write, not two;
-* a re-claim of a task we already completed replays the stored result instead
-  of running the handler again — while a re-claim after an unconfirmed
-  *failure* is a fresh attempt and must run normally.
+* a re-delivery of a task we hold a report for is a *new attempt*: the
+  handler runs and the stale report is dropped, because nothing in the claim
+  envelope proves the delivery belongs to the attempt that filed the report.
 """
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def test_ledger_records_takes_and_discards():
     ledger.record(_report(1))
     assert len(ledger) == 1
     assert ledger.take(1).task_id == 1
-    # take() removes it — a replayed outcome must not stay queued.
+    # take() removes it — a superseded outcome must not stay queued.
     assert len(ledger) == 0
     assert ledger.take(1) is None
 
@@ -114,21 +114,10 @@ def test_ledger_evicts_oldest_and_says_so(caplog):
         for task_id in (1, 2, 3):
             ledger.record(_report(task_id))
 
-    assert ledger.task_ids() == [2, 3]
+    assert [r.task_id for r in ledger.pending()] == [2, 3]
     errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
     assert len(errors) == 1
     assert "task 1" in errors[0]
-
-
-def test_ledger_sendable_skips_refused_entries():
-    ledger = UnconfirmedReports()
-    refused = _report(1)
-    refused.sendable = False
-    ledger.record(refused)
-    ledger.record(_report(2))
-    assert [r.task_id for r in ledger.sendable()] == [2]
-    # ...but the refused entry is still there for a re-claim replay.
-    assert ledger.take(1) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +222,7 @@ async def test_client_override_without_the_key_still_reports(
 
 
 # ---------------------------------------------------------------------------
-# The worker: keeping, re-sending, and replaying an unconfirmed report
+# The worker: keeping and re-sending an unconfirmed report
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -389,12 +378,19 @@ async def test_unconfirmed_report_is_re_sent_while_the_queue_never_goes_idle(
 
 
 @pytest.mark.asyncio
-async def test_re_claimed_completed_task_is_replayed_not_recomputed(
+async def test_re_delivered_completed_task_runs_again_and_drops_the_report(
     make_worker, tmp_path, caplog,
 ):
-    """The sweeper re-queues the task whose completion we could not report.
-    Re-running the handler would redo work whose outputs are already
-    published — replay the stored result instead."""
+    """A re-delivery is a new attempt, never an answer from the ledger.
+
+    The held report says nothing about *which* attempt this delivery is: the
+    claim envelope carries no backend-issued attempt or lease id, so a task
+    coming back after a completion whose *response* was merely lost looks
+    exactly like the backend legitimately re-queuing it for a genuine re-run
+    (an operator requeue, a retry of work that has to happen again). Answering
+    from the ledger would report a stale result and silently skip the work
+    that was asked for, so the handler runs and the stale report is dropped.
+    """
     client = _FailingTerminalClient(fail_times=1)
     task = _queue_stl_task(client, tmp_path)
 
@@ -402,75 +398,38 @@ async def test_re_claimed_completed_task_is_replayed_not_recomputed(
 
     async def handler(ctx, params):
         runs.append(ctx.task.id)
-        return {"planes": [{"rank": 0}]}
+        return {"planes": [{"rank": len(runs) - 1}]}
 
     worker = make_worker(
         client=client, handlers={TaskType.DETECT_CUT_PLANES: handler},
     )
     await worker.run_one()
     assert runs == [task.id]
-    assert len(worker._unconfirmed) == 1
+    assert len(worker._unconfirmed) == 1     # complete() was lost
 
-    # Same row, re-queued and handed back to this worker.
+    # The same row, re-queued and handed back to this worker.
     _queue_stl_task(client, tmp_path, task_id=task.id)
     with caplog.at_level("WARNING"):
         await worker.run_one()
 
-    assert runs == [task.id], "the handler must not run a second time"
+    assert runs == [task.id, task.id], "the re-delivery must run the handler"
+    # ...and what the backend records is *this* attempt's result, not the
+    # stale one the ledger was holding.
     assert len(client.completed_tasks) == 1
-    assert client.completed_tasks[0]["result"] == {"planes": [{"rank": 0}]}
-    assert client.complete_calls[0][1] == client.complete_calls[1][1]
-    assert len(worker._unconfirmed) == 0
-    assert any(
-        "already completed" in r.getMessage() for r in caplog.records
-    )
-
-
-@pytest.mark.asyncio
-async def test_replay_heartbeats_while_it_re_sends(make_worker, tmp_path):
-    """The replay goes through the client's retry schedule like any terminal
-    report, so it needs the same heartbeat cover: a task whose ``updated_at``
-    freezes for that window is what the sweeper reclaims — which is how the
-    task came back here to begin with."""
-
-    class _SlowReplayClient(_FailingTerminalClient):
-        def __init__(self) -> None:
-            super().__init__(fail_times=1)
-            self.progress_events_during_replay: int | None = None
-
-        async def complete(self, task_id, result, *, idempotency_key=None):
-            if self._remaining == 0:      # the replay, not the first attempt
-                await asyncio.sleep(0.05)
-                self.progress_events_during_replay = len(self.progress_events)
-            await super().complete(task_id, result, idempotency_key=idempotency_key)
-
-    client = _SlowReplayClient()
-    task = _queue_stl_task(client, tmp_path)
-
-    async def handler(ctx, params):
-        return {"planes": []}
-
-    worker = make_worker(
-        client=client, handlers={TaskType.DETECT_CUT_PLANES: handler},
-        heartbeat_interval_s=0.01,
-    )
-    await worker.run_one()
-    before_replay = len(client.progress_events)
-
-    _queue_stl_task(client, tmp_path, task_id=task.id)
-    await worker.run_one()
-
-    assert len(client.completed_tasks) == 1
-    assert client.progress_events_during_replay > before_replay
+    assert client.completed_tasks[0]["result"] == {"planes": [{"rank": 1}]}
+    # A new attempt reports under a new identity, so a deduping backend does
+    # not collapse it into the earlier report.
+    assert client.complete_calls[0][1] != client.complete_calls[1][1]
+    assert len(worker._unconfirmed) == 0, "the superseded report is dropped"
+    assert any("supersedes it" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_re_claimed_task_after_a_lost_fail_runs_again(
     make_worker, tmp_path,
 ):
-    """A re-delivery after an unconfirmed *failure* is a genuine retry: the
-    backend re-queued the task to be attempted again. Running the handler is
-    the whole point, and the stale fail report must not survive to stamp
+    """The same rule with a failure in the ledger, where the cost of getting
+    it wrong is loudest: a stale fail report that survived would stamp
     ``failed`` over whatever this attempt produces."""
     client = _FailingTerminalClient(fail_times=1)
     task = _queue_stl_task(client, tmp_path)
@@ -501,13 +460,13 @@ async def test_re_claimed_task_after_a_lost_fail_runs_again(
 
 
 @pytest.mark.asyncio
-async def test_backend_refusal_stops_re_sends_but_keeps_the_outcome(
+async def test_backend_refusal_stops_re_sends_and_drops_the_outcome(
     make_worker, tmp_path,
 ):
     """A 4xx is the backend answering "not yours to report" (the ownership
-    check, after the sweeper reassigned the task). Re-sending on a timer
-    would just repeat the rejection every cycle — but the outcome is kept, so
-    a later re-claim can still replay it instead of recomputing."""
+    check, after the sweeper reassigned the task). Re-sending on a timer would
+    just repeat the rejection every cycle while holding a slot in the bounded
+    ledger, and whoever owns the task now reports its outcome."""
     client = _FailingTerminalClient(fail_times=1)
     _queue_stl_task(client, tmp_path)
 
@@ -535,12 +494,12 @@ async def test_backend_refusal_stops_re_sends_but_keeps_the_outcome(
     await worker._flush_unconfirmed_reports()
 
     assert len(client.complete_calls) == sends, "refused reports stop retrying"
-    assert len(worker._unconfirmed) == 1, "but the outcome is still held"
+    assert len(worker._unconfirmed) == 0, "and are not held for a re-delivery"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [408, 429])
-async def test_transient_4xx_keeps_the_report_sendable(
+async def test_transient_4xx_keeps_the_report_in_the_ledger(
     make_worker, tmp_path, status,
 ):
     """408 and 429 are 4xx but *transient*: the client already retried them
@@ -566,7 +525,7 @@ async def test_transient_4xx_keeps_the_report_sendable(
     await worker._flush_unconfirmed_reports()
 
     assert calls == [1, 1], "a throttled report keeps being re-sent"
-    assert worker._unconfirmed.sendable(), "and stays in the sendable set"
+    assert worker._unconfirmed.pending(), "and stays in the ledger"
 
     # ...and once the rate-limit window passes, it lands.
     client.complete = FakeBackendClient.complete.__get__(client)

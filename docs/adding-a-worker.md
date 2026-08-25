@@ -537,8 +537,9 @@ Adding `*, cancelled: Optional[asyncio.Event] = None` to your override
 terminal reports were sent under, in send order (`None` when a report
 carried none). It is the same key across every delivery of one outcome
 — the client's retries, and the SDK's re-send of a report the backend
-never confirmed — so `len(set(fake.keys_for(7))) == 1` asserts a replay
-reused it rather than filing a second report. `completed_tasks` /
+never confirmed — so `len(set(fake.keys_for(7))) == 1` asserts a re-send
+reused it rather than filing a second report, and two different keys
+say the worker ran a second *attempt*. `completed_tasks` /
 `failed_tasks` records keep the exact shape documented above, so
 existing assertions against them are unaffected. Here too there is
 nothing to migrate: a `complete`/`fail` override written before the key
