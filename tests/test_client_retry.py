@@ -1640,6 +1640,49 @@ def test_init_defaults_backoff_max_and_jitter():
     assert client.retry_jitter is True
 
 
+def test_init_rejects_negative_backoff_base():
+    """A negative base doesn't slow retries down — it removes the backoff.
+
+    The cap only clamps from above and ``_backoff_delay`` skips jitter on a
+    non-positive delay, so every attempt sleeps a negative delay, which
+    ``asyncio.sleep`` returns from immediately: the full attempt budget fires
+    back-to-back at a backend that is already failing, un-spaced and (across
+    the fleet) un-decorrelated. That is the retry storm the schedule exists to
+    prevent, produced by the knob that configures it — and invisible until a
+    transient failure lands in production.
+    """
+    with pytest.raises(ValueError, match="retry_backoff_s must be"):
+        BackendClient("http://fake", "x", retry_backoff_s=-2.0)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_init_rejects_non_finite_backoff_base(value):
+    """NaN and inf reach ``asyncio.sleep`` as delays it refuses.
+
+    NaN fails every comparison, so the cap never clamps it; uncapped, ``inf``
+    makes the jitter band ``uniform(inf - inf, inf)`` — also NaN. Either way
+    ``asyncio.sleep`` raises ``ValueError: Invalid delay: NaN`` from inside
+    ``_retry``, which is neither a retryable exception nor an
+    ``HTTPStatusError``: it escapes mid-loop and replaces the transient error
+    the caller was meant to see. (``inf`` with the default cap merely pins
+    every delay at the cap, but the uncapped config is supported, so the base
+    is rejected outright rather than only in the combination that breaks.)
+    """
+    with pytest.raises(ValueError, match="retry_backoff_s must be"):
+        BackendClient("http://fake", "x", retry_backoff_s=value)
+
+
+def test_init_accepts_zero_backoff_base():
+    """0 stays legal: retries with no inter-attempt sleep, as requested.
+
+    It is what this suite passes to keep the retry tests instant, and the
+    only degenerate-looking value a caller can mean literally — so the guard
+    rejects negatives and non-finites without narrowing the contract.
+    """
+    client = BackendClient("http://fake", "x", retry_backoff_s=0)
+    assert client.retry_backoff_s == 0
+
+
 # -----------------------------------------------------------------------
 # file_timeout_s — file transfers (download_file / upload_file) get a
 # separate, longer timeout than the 30s general request budget that

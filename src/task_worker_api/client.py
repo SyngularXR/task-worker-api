@@ -400,6 +400,38 @@ class BackendClient:
                 "it is the total number of attempts, not retries on top of one."
             )
         self.max_retries = max_retries
+        # Base of the exponential schedule (``retry_backoff_s * 2**n``) — the
+        # one backoff knob that was unguarded, while every degenerate value
+        # disables or breaks the very backoff it configures, silently at
+        # construction and only visibly once a transient failure lands in
+        # production:
+        #
+        # - **Negative** makes every delay negative. ``retry_backoff_max_s``
+        #   only clamps from above and ``_backoff_delay`` skips jitter on a
+        #   non-positive delay, so ``asyncio.sleep`` returns immediately on
+        #   every attempt: the whole attempt budget is spent re-hammering a
+        #   struggling backend with no spacing and no decorrelation — the
+        #   retry storm the schedule exists to prevent, from the knob that
+        #   configures it.
+        # - **NaN** fails every comparison, so it passes the cap untouched and
+        #   reaches ``asyncio.sleep``, which rejects it with ``ValueError:
+        #   Invalid delay: NaN``. That is neither a retryable exception nor an
+        #   ``HTTPStatusError``, so it escapes ``_retry`` mid-loop and replaces
+        #   the transient error the caller was meant to see and handle.
+        # - **inf** clamps to the cap when there is one, but
+        #   ``retry_backoff_max_s=None`` is supported, and uncapped the jitter
+        #   band is ``uniform(inf - inf, inf)`` → NaN → the ValueError above.
+        #
+        # ``0`` stays legal: it is how a caller (and this repo's own suite)
+        # asks for retries with no inter-attempt sleep, degenerate only in the
+        # way that was requested. Same finite-and-sane rule the poll loop's
+        # knobs get in ``worker._positive_finite_s``, minus its zero rejection.
+        if not (math.isfinite(retry_backoff_s) and retry_backoff_s >= 0):
+            raise ValueError(
+                f"retry_backoff_s must be a finite number >= 0 "
+                f"(got {retry_backoff_s!r}); it is the base of the "
+                "exponential schedule, and 0 means retry without sleeping."
+            )
         self.retry_backoff_s = retry_backoff_s
         # Cap on a single inter-attempt delay. Exponential backoff without a
         # cap grows without bound (2**n); a degenerate but supported config
