@@ -364,7 +364,7 @@ class BackendClient:
     """Async HTTP client bound to one SynPusher backend URL + one worker key.
 
     Usage:
-        async with BackendClient(url, api_key) as client:
+        async with BackendClient(url, api_key, worker_id="worker-1") as client:
             task = await client.claim_next(types, worker_id="...")
     """
 
@@ -373,6 +373,7 @@ class BackendClient:
         base_url: str,
         api_key: str,
         *,
+        worker_id: Optional[str] = None,
         timeout_s: float = 30.0,
         file_timeout_s: Optional[float] = None,
         cancel_timeout_s: Optional[float] = 5.0,
@@ -387,6 +388,7 @@ class BackendClient:
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self._worker_params = {"worker_id": worker_id} if worker_id else {}
         # max_retries is the total number of *attempts* (not retries-on-top-of-
         # one). A value < 1 means the retry loop in _retry never executes, so
         # last_exc stays None and the post-loop assert fires — an opaque
@@ -834,6 +836,7 @@ class BackendClient:
         resp = await self._request(
             "PUT", f"/tasks/{task_id}/progress",
             json=_progress_body(stage, current, total, kill_handle),
+            params=self._worker_params,
             timeout=self._lifecycle_timeout,
         )
         return resp.json() or {}
@@ -877,6 +880,7 @@ class BackendClient:
         resp = await self._client.request(
             "PUT", f"/tasks/{task_id}/progress",
             json=_progress_body(stage, current, total, kill_handle),
+            params=self._worker_params,
             timeout=self._lifecycle_timeout,
         )
         resp.raise_for_status()
@@ -951,6 +955,7 @@ class BackendClient:
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
+            params=self._worker_params,
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
@@ -968,6 +973,7 @@ class BackendClient:
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/fail", json={"error": error},
+            params=self._worker_params,
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
@@ -1045,7 +1051,8 @@ class BackendClient:
         async def _stream_once() -> None:
             _raise_if_cancelled()
             async with self._client.stream(
-                "GET", path, timeout=self._file_timeout,
+                "GET", path, params=self._worker_params,
+                timeout=self._file_timeout,
             ) as resp:
                 resp.raise_for_status()
                 f = await _to_thread_complete(
@@ -1142,7 +1149,8 @@ class BackendClient:
             with open(src, "rb") as f:
                 files = {"file": (filename, f)}
                 resp = await self._client.request(
-                    "PUT", path, files=files, timeout=self._file_timeout,
+                    "PUT", path, files=files, params=self._worker_params,
+                    timeout=self._file_timeout,
                 )
                 resp.raise_for_status()
 

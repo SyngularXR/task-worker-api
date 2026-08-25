@@ -1,13 +1,13 @@
 {
   "$schema_version": "1.0.0",
   "fleet_version": "1.0.0",
-  "generated_at": "2026-07-17",
+  "generated_at": "2026-08-25",
   "description": "Machine-readable manifest of every task-worker-api consumer in the SyngularXR fleet. Source of truth for backend handler routing, deployment health checks, and SDK-upgrade automation. Fetch via the GitHub raw URL — see docs/fleet/README.md for the canonical link.",
   "sdk": {
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
-    "current_release": "v0.12.0",
-    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.12.0",
+    "current_release": "v0.14.0",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.14.0",
     "release_workflow": ".github/workflows/release.yml — publishes wheel + tag on every merge to main"
   },
   "workers": [
@@ -19,12 +19,12 @@
       "compose_service": "neural-canvas",
       "mode": "hybrid",
       "mode_description": "Runs FastAPI app + task worker on one event loop via run_hybrid(). Falls back to FastAPI-only if SYNPUSHER_URL or WORKER_API_KEY are missing — safe for API-only deployments.",
-      "task_types": ["segmentation"],
+      "task_types": ["segmentation", "spatial_recon"],
       "sdk_pin": {
-        "style": "git_ref",
-        "version": "v0.5.0",
+        "style": "wheel_url",
+        "version": "v0.14.0",
         "file": "requirements.txt",
-        "line_pattern": "task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v{version}"
+        "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },
       "env": {
         "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID"],
@@ -33,6 +33,9 @@
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
           "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S",
+          "SPATIAL_CAPTURE_DEPTH_BACKEND",
+          "SPATIAL_CAPTURE_ALLOW_FAKE_DEPTH",
+          "SPATIAL_CAPTURE_DA3_CONFIG",
           "FASTAPI_HOST",
           "FASTAPI_PORT",
           "SYNCAST_URL",
@@ -44,7 +47,7 @@
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility",
-      "notes": "Hybrid mode runs --workers 1 (down from 2) because run_hybrid is one process; GPU-bound so single model-cache process is more efficient than 2 competing copies."
+      "notes": "Hybrid mode runs --workers 1 because one process owns the GPU model cache. Spatial reconstruction stays fail-closed until the v0.14.0 wheel is published and the BM03 Gate 0B profile passes."
     },
     {
       "id": "blender-worker",

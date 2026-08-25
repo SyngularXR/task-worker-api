@@ -426,7 +426,9 @@ def test_sync_fail_retries_then_succeeds(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
 
-    sync_fail = worker_mod._make_sync_fail("http://fake/api/v1", "key", 691)
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 691, "worker-1"
+    )
     sync_fail("timeout: exceeded 1800s")
 
     assert calls["n"] == 3
@@ -446,7 +448,9 @@ def test_sync_fail_raises_after_exhausting_attempts(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     monkeypatch.setattr(worker_mod.time, "sleep", lambda s: None)
 
-    sync_fail = worker_mod._make_sync_fail("http://fake/api/v1", "key", 691)
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 691, "worker-1"
+    )
     with pytest.raises(OSError, match="still down"):
         sync_fail("timeout")
 
@@ -466,7 +470,9 @@ def test_sync_fail_no_sleep_on_first_success(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
 
-    sync_fail = worker_mod._make_sync_fail("http://fake/api/v1", "key", 5)
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 5, "worker-1"
+    )
     sync_fail("err")
 
     assert calls["n"] == 1

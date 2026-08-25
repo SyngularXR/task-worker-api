@@ -16,6 +16,7 @@ from .generate_synthetic import GenerateSyntheticParams
 from .gs_build import GsBuildParams, Gs4dBuildParams
 from .model_initializing import ModelInitializingParams
 from .segmentation import SegmentationParams
+from .spatial_reconstruction import SpatialReconstructionParams
 
 # render + apple_ml_gs land in a future release once the handler shapes
 # are audited (see design spec Appendix A).
@@ -28,6 +29,7 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
     TaskType.SEGMENTATION: SegmentationParams,
     TaskType.DEPLOY_CASE: DeployCaseParams,
     TaskType.GENERATE_SYNTHETIC: GenerateSyntheticParams,
+    TaskType.SPATIAL_RECONSTRUCTION: SpatialReconstructionParams,
     # FINALIZE_SYNTHETIC is backend-local only — no worker-side params schema,
     # and deliberately absent so the public create endpoint can't accept it.
 }
@@ -44,4 +46,5 @@ __all__ = [
     "GsBuildParams",
     "Gs4dBuildParams",
     "SegmentationParams",
+    "SpatialReconstructionParams",
 ]

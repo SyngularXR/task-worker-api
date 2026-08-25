@@ -34,6 +34,7 @@ class TaskType(str, Enum):
     # TASK_PARAMS_SCHEMAS), mirroring FINALIZE_SYNTHETIC. Value kept <=20 chars to
     # fit the backend's task_type column (CharEnumField max_length=20).
     FINALIZE_SEGMENTATION = "finalize_segment"
+    SPATIAL_RECONSTRUCTION = "spatial_recon"
 
 
 class TaskStatus(IntEnum):

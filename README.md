@@ -15,10 +15,10 @@ One Python package consumed by three kinds of callers:
 ## Install
 
 ```
-pip install task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v0.6.0
+pip install "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v0.14.0/task_worker_api-0.14.0-py3-none-any.whl"
 ```
 
-Latest release: [v0.6.0](https://github.com/SyngularXR/task-worker-api/releases/tag/v0.6.0). See [CHANGELOG.md](CHANGELOG.md).
+Latest release: [v0.14.0](https://github.com/SyngularXR/task-worker-api/releases/tag/v0.14.0). See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick look at what a worker looks like
 
@@ -76,7 +76,7 @@ That's the whole public surface. The SDK handles the HTTP protocol, heartbeat, c
 |---|---|---|
 | [Blender-CLI](https://github.com/SyngularXR/Blender-CLI) | `detect_cut_planes`, `model_initializing` | Subprocess via `blender-pipe` |
 | [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `gs_build` | Subprocess wrapping `run.sh` |
-| [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `segmentation` (hybrid — FastAPI + worker) | Threadpool GPU |
+| [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `segmentation`, `spatial_recon` (hybrid — FastAPI + worker) | Serialized threadpool GPU |
 
 Each worker's entry point is ~30-50 lines of glue. All protocol code lives here.
 

@@ -154,6 +154,7 @@ async def test_worker_init_threads_file_timeout_to_client():
     try:
         assert worker._client._file_timeout is not None
         assert worker._client._file_timeout.read == 600.0
+        assert worker._client._worker_params == {"worker_id": "w"}
     finally:
         await worker._client.close()
 

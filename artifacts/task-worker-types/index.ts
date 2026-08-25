@@ -17,6 +17,7 @@ export type TaskType =
   | 'generate_synthetic'
   | 'finalize_synthetic'
   | 'finalize_segment'
+  | 'spatial_recon'
 ;
 
 export const TaskType = {
@@ -32,6 +33,7 @@ export const TaskType = {
   GENERATE_SYNTHETIC: 'generate_synthetic' as const,
   FINALIZE_SYNTHETIC: 'finalize_synthetic' as const,
   FINALIZE_SEGMENTATION: 'finalize_segment' as const,
+  SPATIAL_RECONSTRUCTION: 'spatial_recon' as const,
 } as const;
 
 export enum TaskStatus {
@@ -228,6 +230,16 @@ export interface GenerateSyntheticParams {
   niftymic?: Record<string, unknown>;
 }
 
+/**
+ * Locate one immutable capture under the worker's shared-data root.
+ */
+export interface SpatialReconstructionParams {
+  case_guid: string;
+  capture_hash: string;
+  capture_root_rel: string;
+  coordinate_frame: string;
+}
+
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
@@ -239,4 +251,5 @@ export interface TaskParamsByType {
   'segmentation': SegmentationParams;
   'deploy_case': DeployCaseParams;
   'generate_synthetic': GenerateSyntheticParams;
+  'spatial_recon': SpatialReconstructionParams;
 }

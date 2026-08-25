@@ -10,8 +10,8 @@ Every worker pins to a specific `task-worker-api` release tag. Two pinning style
 
 | Style | Where used | Example |
 |---|---|---|
-| **Git ref** (`requirements.txt`) | Neural-Canvas, colmap-splat | `task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v0.5.0` |
-| **Wheel URL** (`pyproject.toml`) | Blender-CLI | `task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v0.5.0/task_worker_api-0.5.0-py3-none-any.whl` |
+| **Git ref** (`requirements.txt`) | colmap-splat | `task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v0.5.0` |
+| **Wheel URL** (`requirements.txt` or `pyproject.toml`) | Neural-Canvas, Blender-CLI | `task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v0.14.0/task_worker_api-0.14.0-py3-none-any.whl` |
 
 **Recommended:** wheel URL when possible. Faster install (one HTTPS GET vs full git clone), no source-build step at install time, no transitive build-tooling dependency on the host. The git-ref style requires `hatchling` to be present on the host pip if `--no-build-isolation` is in play (see colmap-splat's Dockerfile fix in v0.5.0 rollout).
 

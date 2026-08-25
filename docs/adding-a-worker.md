@@ -624,7 +624,7 @@ Look at these for reference when building yours:
 |---|---|---|---|
 | [Blender-CLI](https://github.com/SyngularXR/Blender-CLI) | `detect_cut_planes`, `model_initializing` | Subprocess (Pattern 2) | Shells out to `blender-pipe` because bpy segfaults on threadpools. Minimal main.py. |
 | [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `gs_build` | Subprocess (Pattern 2) | Wraps run.sh + tails status.json + stall detection. Custom cancel_then_terminate watcher. |
-| [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `segmentation` | Threadpool (Pattern 3) | Hybrid mode: FastAPI app + Worker on one loop via `run_hybrid`. |
+| [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `segmentation`, `spatial_recon` | Threadpool (Pattern 3) | Hybrid mode: FastAPI app + Worker on one loop via `run_hybrid`; one shared admission guard serializes GPU work. |
 
 ---
 
@@ -689,7 +689,9 @@ REPLAY_KEEP_FIELDS = {"task_type", "case_id", "item_key", "params"}
 
 
 async def replay(jsonl_path: Path, backend_url: str, api_key: str) -> None:
-    async with BackendClient(backend_url, api_key) as client:
+    async with BackendClient(
+        backend_url, api_key, worker_id=worker_id
+    ) as client:
         for line in jsonl_path.read_text(encoding="utf-8").splitlines():
             envelope = json.loads(line)
             if envelope.get("stream") != "typed":
