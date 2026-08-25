@@ -533,6 +533,15 @@ had, and the SDK logs one WARNING per direction naming the override.
 Adding `*, cancelled: Optional[asyncio.Event] = None` to your override
 (and forwarding it) is what buys the mid-file abort.
 
+`completed_tasks` / `failed_tasks` entries also carry the
+`idempotency_key` the terminal report was sent under (`None` when the
+report carried none). It is the same key across every delivery of one
+outcome — the client's retries, and the SDK's re-send of a report the
+backend never confirmed — so a test can assert a replay reused it. Here
+too there is nothing to migrate: a `complete`/`fail` override written
+before the key keeps working (the SDK only passes it to overrides that
+declare it, or take `**kwargs`, and logs one WARNING otherwise).
+
 For integration testing against a real backend, `task-worker-api`'s
 own repo has a docker-compose fixture at `tests/integration/` you
 can adapt.

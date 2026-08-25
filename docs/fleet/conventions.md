@@ -98,3 +98,22 @@ Three modes:
 The SDK never raises out of payload-logging code paths (including `__init__`). Disk full, fs flap, permission errors, and serialization failures all produce one WARNING log per process lifetime; subsequent failures are silent. **Worker keeps polling and running tasks regardless** — payload logging is a debug aid, not a correctness feature.
 
 If you implement a custom `BackendClient` subclass or override `Worker._run_one`, preserve this property: don't let logging machinery propagate exceptions out to break the polling loop.
+
+## 9. Terminal report idempotency (v0.15.0+)
+
+A worker's last act on a task is one terminal report — `PUT /tasks/{id}/complete` or `PUT /tasks/{id}/fail`. Two things about that report are now contractual:
+
+**Every terminal report carries an `Idempotency-Key` header.** The value is `task-<id>-<complete|fail>-<uuid4 hex>`, minted once per attempt. All deliveries of one outcome share it: the client's own retry loop, the watchdog thread's last-resort sync `fail`, and any re-send from the ledger below. A *different* attempt on the same task (the backend re-queued it) mints a fresh key, so a retry is never mistaken for a replay.
+
+The header is additive and one-directional. Nexus Core is free to ignore it — its terminal transitions are already guarded server-side, so a duplicate `/complete` on a terminal row is dropped and behaviour is unchanged. When the backend does want to dedupe (post-complete hooks, cascade side effects), the key is the name to dedupe on; no fleet-wide SDK upgrade is needed first.
+
+**A report the backend never confirmed is kept and re-sent.** When `complete`/`fail` outlives the client's retry budget (backend down longer than ~60s), the worker holds the outcome in a bounded in-memory ledger (`task_worker_api.reports`) and:
+
+- re-sends it on the next idle poll cycle **whose claim reached the backend** — never while claims are failing, so this can't fight the claim backoff during an outage;
+- stops re-sending on a 4xx (the ownership check, once the sweeper hands the task elsewhere) but keeps the outcome;
+- **replays** it if this worker claims the same task again — the completed work's outputs were already published before the report, so re-running the handler would redo GPU-hours for artifacts that already exist;
+- treats a re-claim after an unconfirmed *failure* as a genuine retry: the handler runs, and the stale failure report is discarded rather than left to stamp `failed` over the new attempt.
+
+The ledger is per-process and in-memory. Reports still unconfirmed when the worker stops are logged at ERROR with their task ids — those outcomes are lost and their tasks will be swept as stale.
+
+**Nothing to migrate.** The SDK checks whether the client's `complete`/`fail` declares `idempotency_key` (or takes `**kwargs`) and only passes it if so, so a `BackendClient` subclass or test double written against `complete(task_id, result)` / `fail(task_id, error)` keeps working — it just reports without the dedupe name, and the SDK logs one WARNING naming the override. Adding `*, idempotency_key: Optional[str] = None` and forwarding it is what buys the header. The SDK's own `FakeBackendClient` records the key on `completed_tasks` / `failed_tasks` so tests can assert a re-send reused the original.

@@ -233,6 +233,29 @@ def _backoff_delay(
     return delay
 
 
+def _idempotency_headers(key: Optional[str]) -> dict:
+    """``{"Idempotency-Key": key}``, or ``{}`` when there is no key.
+
+    Terminal reports (``complete``/``fail``) are the one place this client
+    re-sends the *same* logical write: ``_retry`` re-PUTs on a transport error
+    or a 5xx, and the Worker re-sends an unconfirmed report on a later poll
+    cycle (see :mod:`task_worker_api.reports`). Neither path can tell a lost
+    write from a lost *response*, so both can deliver a report the backend
+    already applied.
+
+    The header names the report so the backend can collapse those duplicates
+    into one. It is deliberately additive and one-directional: SynPusher
+    already guards its terminal transitions server-side (a second
+    ``/complete`` on a terminal row is ignored), so an older backend that
+    drops the header keeps exactly today's behaviour, and a newer one can
+    dedupe on it without the fleet having to upgrade in lockstep.
+
+    The value is ASCII by construction (``task-<id>-<kind>-<uuid4 hex>``),
+    which keeps it a legal header value on every hop.
+    """
+    return {"Idempotency-Key": key} if key else {}
+
+
 def _progress_body(
     stage: str, current: int, total: int, kill_handle: Optional[dict],
 ) -> dict[str, Any]:
@@ -940,7 +963,11 @@ class BackendClient:
         resp.raise_for_status()
         return resp.json() or {}
 
-    async def complete(self, task_id: int, result: dict) -> None:
+    async def complete(
+        self, task_id: int, result: dict,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> None:
         """PUT /tasks/{id}/complete — final success payload.
 
         Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s) so
@@ -952,28 +979,37 @@ class BackendClient:
         and dropping the report orphans the computed outcome) and the attempt
         budget is raised to at least ``_TERMINAL_MIN_ATTEMPTS`` so the retry
         window (~60s jittered) rides out a backend restart.
+
+        ``idempotency_key`` rides along as an ``Idempotency-Key`` header —
+        see :func:`_idempotency_headers`.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
             params=self._worker_params,
+            headers=_idempotency_headers(idempotency_key),
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
         )
 
-    async def fail(self, task_id: int, error: str) -> None:
+    async def fail(
+        self, task_id: int, error: str,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> None:
         """PUT /tasks/{id}/fail — final failure payload.
 
         Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s) so
         a stalled fail call fails fast instead of blocking the polling loop
         for up to 120s (30s × 4 retries) under backend load.
 
-        Retries 500 with a raised attempt budget, same as :meth:`complete` —
-        see there for the rationale.
+        Retries 500 with a raised attempt budget, and carries the same
+        ``Idempotency-Key`` header, as :meth:`complete` — see there.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/fail", json={"error": error},
             params=self._worker_params,
+            headers=_idempotency_headers(idempotency_key),
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),

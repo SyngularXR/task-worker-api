@@ -17,6 +17,7 @@ src/task_worker_api/        SDK package
 ├── client.py               BackendClient — async HTTP wrapper for the worker protocol
 ├── context.py              ClaimedTask, FileContext, TaskContext (typed envelopes)
 ├── payload_log.py          PayloadLogger (v0.5.0+) — JSONL capture of claimed tasks
+├── reports.py              UnconfirmedReports (v0.15.0+) — idempotent terminal-report ledger
 ├── progress.py             ProgressReporter (heartbeat + progress)
 ├── cancel.py               CancelGuard (cooperative cancel)
 ├── files.py                prepare_inputs / upload_outputs (local + remote modes)

@@ -135,11 +135,35 @@ class FakeBackendClient:
         """
         return await self.get_cancel_status(task_id)
 
-    async def complete(self, task_id: int, result: dict) -> None:
-        self.completed_tasks.append({"task_id": task_id, "result": result})
+    async def complete(
+        self, task_id: int, result: dict,
+        *,
+        idempotency_key: "Optional[str]" = None,
+    ) -> None:
+        """Record a completion, including the key it was reported under.
 
-    async def fail(self, task_id: int, error: str) -> None:
-        self.failed_tasks.append({"task_id": task_id, "error": error})
+        ``idempotency_key`` is captured (not enforced) so tests can assert
+        that a re-sent report reuses the *same* key as the attempt that first
+        failed to land — the property that lets a backend collapse the two
+        into one terminal write.
+        """
+        self.completed_tasks.append({
+            "task_id": task_id,
+            "result": result,
+            "idempotency_key": idempotency_key,
+        })
+
+    async def fail(
+        self, task_id: int, error: str,
+        *,
+        idempotency_key: "Optional[str]" = None,
+    ) -> None:
+        """Record a failure + its idempotency key. See :meth:`complete`."""
+        self.failed_tasks.append({
+            "task_id": task_id,
+            "error": error,
+            "idempotency_key": idempotency_key,
+        })
 
     async def download_file(
         self, task_id: int, filename: str, dest: Path,

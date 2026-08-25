@@ -64,7 +64,9 @@ async def test_claim_next_accepts_string_task_types():
 async def test_complete_captures_result():
     fake = FakeBackendClient()
     await fake.complete(42, {"planes": []})
-    assert fake.completed_tasks == [{"task_id": 42, "result": {"planes": []}}]
+    assert fake.completed_tasks == [
+        {"task_id": 42, "result": {"planes": []}, "idempotency_key": None}
+    ]
     assert fake.failed_tasks == []
 
 
@@ -72,8 +74,21 @@ async def test_complete_captures_result():
 async def test_fail_captures_error():
     fake = FakeBackendClient()
     await fake.fail(42, "boom")
-    assert fake.failed_tasks == [{"task_id": 42, "error": "boom"}]
+    assert fake.failed_tasks == [
+        {"task_id": 42, "error": "boom", "idempotency_key": None}
+    ]
     assert fake.completed_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_reports_capture_their_idempotency_key():
+    """The key is what makes a re-sent report the *same* report; tests that
+    assert on replay behaviour read it back from here."""
+    fake = FakeBackendClient()
+    await fake.complete(42, {"planes": []}, idempotency_key="task-42-complete-x")
+    await fake.fail(43, "boom", idempotency_key="task-43-fail-y")
+    assert fake.completed_tasks[0]["idempotency_key"] == "task-42-complete-x"
+    assert fake.failed_tasks[0]["idempotency_key"] == "task-43-fail-y"
 
 
 @pytest.mark.asyncio

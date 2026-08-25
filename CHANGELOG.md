@@ -5,6 +5,49 @@
 **Features:**
 - Add the strict `spatial_recon` task params contract and packaged
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
+- Terminal reports are now **idempotent and re-sent until the backend confirms
+  them**. `BackendClient.complete` / `.fail` accept an `idempotency_key` and
+  put it on the wire as an `Idempotency-Key` header
+  (`task-<id>-<complete|fail>-<uuid4 hex>`); `Worker` mints one identity per
+  attempt, so every delivery of a single outcome — the client's own retry
+  loop, the watchdog thread's last-resort sync `fail`, and the re-sends below
+  — travels under the same name, and a backend that dedupes on the key applies
+  it exactly once. The header is additive and one-directional: SynPusher
+  already guards its terminal transitions server-side, so a backend that
+  ignores it behaves exactly as before and no fleet-wide upgrade is needed.
+- A terminal report that outlives the client's retry budget (a backend down
+  longer than the ~60s terminal window) is no longer **dropped**. It used to be
+  logged at ERROR and forgotten, which is what turned one degraded minute into
+  duplicated work: the row stayed `in_progress` until the stale-task sweeper
+  reclaimed it, and the next worker recomputed hours of GPU work whose result
+  already existed — and whose outputs had *already been published*, since
+  uploads happen before the report. The outcome is now held in a bounded
+  per-worker ledger (`task_worker_api.reports`) and re-sent on the next idle
+  poll cycle **whose claim reached the backend**, so a flush can never fight
+  the claim backoff during an outage. A 4xx (the ownership check, once the
+  sweeper hands the task to someone else) stops the re-sends but keeps the
+  outcome.
+- A re-claim of a task this worker already completed but could not report now
+  **replays the stored result instead of re-running the handler** — the work is
+  done and its artifacts are already delivered, so the only thing missing was
+  the report. A re-claim after an unconfirmed *failure* is treated as what it
+  is — the backend re-queuing the task for another attempt — so the handler
+  runs normally and the stale failure report is discarded rather than left to
+  stamp `failed` over the new attempt's outcome.
+- Reports still unconfirmed when a worker stops are logged at ERROR with their
+  task ids: the ledger dies with the process, so those outcomes are lost and
+  their tasks will be swept as stale.
+
+**Compatibility:**
+- Nothing to migrate. `Worker` checks whether the client's `complete`/`fail`
+  declares `idempotency_key` (or takes `**kwargs`) before passing it — the same
+  probe `prepare_inputs` / `upload_outputs` already use for `cancelled` — so a
+  `BackendClient` subclass or test double written against
+  `complete(task_id, result)` / `fail(task_id, error)` keeps reporting exactly
+  as before, minus the dedupe name, with one WARNING per process naming the
+  override. `FakeBackendClient.complete` / `.fail` accept the keyword and record
+  it on `completed_tasks` / `failed_tasks`, so those dicts carry a new
+  `idempotency_key` entry.
 
 **Fixes:**
 - `BackendClient`'s per-call deadlines no longer disable timeouts entirely when

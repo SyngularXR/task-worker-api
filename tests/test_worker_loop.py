@@ -345,7 +345,7 @@ class _FlakyCompleteClient(FakeBackendClient):
         super().__init__()
         self._exc = exc
 
-    async def complete(self, task_id: int, result: dict) -> None:
+    async def complete(self, task_id: int, result: dict, **_kwargs) -> None:
         raise self._exc
 
 
@@ -357,7 +357,7 @@ class _FlakyFailClient(FakeBackendClient):
         super().__init__()
         self._exc = exc
 
-    async def fail(self, task_id: int, error: str) -> None:
+    async def fail(self, task_id: int, error: str, **_kwargs) -> None:
         raise self._exc
 
 
@@ -492,7 +492,10 @@ async def test_worker_continues_polling_after_terminal_report_failure(
         params={"input_path": str(tmp_path / "fake.stl")},
     )
 
+    handler_runs = []
+
     async def handler(ctx, params):
+        handler_runs.append(ctx.task.id)
         return {"planes": []}
 
     worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: handler})
@@ -505,6 +508,12 @@ async def test_worker_continues_polling_after_terminal_report_failure(
     # if the first failure had escaped, run_one() would have raised and this
     # second cycle would never run.
     healthy = FakeBackendClient()
+    # A *different* task, not a re-delivery of the one whose report was lost:
+    # each FakeBackendClient numbers from 1, and a task id the worker still
+    # holds an unconfirmed report for is replayed rather than run (see
+    # test_reports.py). This test is about the loop surviving, so keep the
+    # ids distinct.
+    healthy._next_id = 2
     healthy.queue_task(
         task_type=TaskType.DETECT_CUT_PLANES,
         params={"input_path": str(tmp_path / "fake.stl")},
@@ -512,6 +521,8 @@ async def test_worker_continues_polling_after_terminal_report_failure(
     worker._client = healthy
     await worker.run_one()
     assert len(healthy.completed_tasks) == 1
+    # The handler really ran for the second task — the loop processed it.
+    assert handler_runs == [1, 2]
 
 
 # ----- heartbeat-before-prepare_inputs ordering ------------------------------
@@ -1165,7 +1176,11 @@ class _SlowCompleteClient(FakeBackendClient):
     """``complete`` that takes a while — modelling BackendClient._retry
     grinding through its schedule against a degraded backend — and snapshots
     heartbeat activity on entry and exit so a test can assert ticks landed
-    *during* the report."""
+    *during* the report.
+
+    Deliberately keeps the pre-``idempotency_key`` signature: like
+    ``_HeartbeatObservingClient`` above, it doubles as end-to-end coverage
+    that a consumer's un-updated override still reports its task."""
 
     def __init__(self, *, report_delay_s: float = 0.1) -> None:
         super().__init__()

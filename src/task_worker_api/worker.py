@@ -14,6 +14,7 @@ Two modes of use:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -25,6 +26,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -38,6 +40,7 @@ from .errors import ProtocolError, TaskCancelled, TaskParamsError
 from .files import prepare_inputs, upload_outputs
 from .payload_log import PayloadLogger, sanitize_worker_id
 from .progress import ProgressReporter
+from .reports import TerminalReport, UnconfirmedReports
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
 from .timeouts import DEFAULT_TASK_TIMEOUT_S, parse_timeouts_env, resolve_task_timeout
 from .watchdog import TaskWatchdog, TerminalGuard, list_descendants
@@ -81,6 +84,7 @@ def _positive_finite_s(name: str, value: float) -> float:
 def _make_sync_fail(
     base_url: str, api_key: str, task_id: int, worker_id: str, *, timeout_s: float = 3.0,
     attempts: int = 3, retry_sleep_s: float = 2.0,
+    idempotency_key: Optional[str] = None,
 ):
     """Build a synchronous ``fail(error)`` callable for the watchdog thread.
 
@@ -93,6 +97,12 @@ def _make_sync_fail(
     defaults): this is the only report path for a watchdog-fired timeout, and
     a single attempt against a momentarily unavailable backend (restart, DB
     blip) would silently orphan the task as RUNNING until the sweeper.
+
+    Those retries re-PUT a report that may already have been applied (a lost
+    response looks exactly like a lost write from here), so the attempt's
+    ``idempotency_key`` rides along on the same ``Idempotency-Key`` header
+    ``BackendClient.fail`` sends — the async and watchdog paths report the
+    same logical failure under the same name.
     """
     url = (
         f"{base_url.rstrip('/')}/tasks/{task_id}/fail"
@@ -103,13 +113,13 @@ def _make_sync_fail(
         data = json.dumps({"error": error}).encode("utf-8")
         last_exc: Exception | None = None
         for attempt in range(attempts):
-            req = urllib.request.Request(
-                url, data=data, method="PUT",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            if idempotency_key:
+                headers["Idempotency-Key"] = idempotency_key
+            req = urllib.request.Request(url, data=data, method="PUT", headers=headers)
             try:
                 urllib.request.urlopen(req, timeout=timeout_s).close()
                 return
@@ -152,6 +162,50 @@ def _clear_workdir(task_dir: Path) -> None:
             "attempt in a dead attempt's directory (its outputs would be "
             "published as this attempt's results)"
         )
+
+
+#: Client overrides already warned about (one WARNING per process, per name).
+_warned_legacy_terminal: set = set()
+
+
+def _idempotency_kwarg(report_fn, key: str) -> dict:
+    """``{"idempotency_key": key}`` if ``report_fn`` accepts it, else ``{}``.
+
+    Mirrors ``files._cancel_kwarg``, for the same reason and against the same
+    kind of consumer: someone who subclassed ``BackendClient`` (or wrote a test
+    double) against the older ``complete(task_id, result)`` /
+    ``fail(task_id, error)`` signature must keep working across this upgrade.
+    A ``TypeError`` raised here would break the one call whose entire job is to
+    make sure a finished task's outcome gets recorded — the worst possible
+    place to demand a lockstep migration.
+
+    Such an override only loses the dedupe *name*: the report itself is
+    unchanged, and SynPusher's guarded terminal transitions already collapse a
+    duplicate terminal write. One WARNING per process names the override so it
+    can be updated.
+    """
+    try:
+        params = inspect.signature(report_fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover — unintrospectable
+        # Can't tell; assume the current signature rather than silently
+        # dropping the key for a client that does support it.
+        return {"idempotency_key": key}
+    if "idempotency_key" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
+        return {"idempotency_key": key}
+    name = getattr(report_fn, "__qualname__", str(report_fn))
+    if name not in _warned_legacy_terminal:
+        _warned_legacy_terminal.add(name)
+        log.warning(
+            "%s has no 'idempotency_key' parameter; terminal reports from this "
+            "worker will not carry an Idempotency-Key header, so a re-sent "
+            "report cannot be deduped by key at the backend. Add "
+            "'idempotency_key: Optional[str] = None' as a keyword-only "
+            "parameter and forward it.",
+            name,
+        )
+    return {}
 
 
 def _result_encode_error(result: object) -> Optional[str]:
@@ -272,6 +326,11 @@ class Worker:
         # Consecutive failed claim round-trips; drives the escalating idle
         # wait in run_forever. Reset by any claim that reaches the backend.
         self._claim_failures = 0
+        # Terminal outcomes the backend never confirmed. The poll loop
+        # re-sends them once the backend is answering again, and a re-claim
+        # of the same task replays the stored outcome instead of recomputing
+        # it. See task_worker_api.reports.
+        self._unconfirmed = UnconfirmedReports()
 
         # Fail fast on misconfiguration: an empty handlers dict makes
         # task_types=[] in run_forever's poll loop, so the worker silently
@@ -410,6 +469,10 @@ class Worker:
             while not self._stop.is_set():
                 claimed = await self._claim()
                 if claimed is None:
+                    # Idle cycle with the backend answering: the cheapest
+                    # moment to settle outcomes it never confirmed.
+                    if len(self._unconfirmed) and not self._claim_failures:
+                        await self._flush_unconfirmed_reports()
                     wait_s = self._claim_wait_s()
                     if self._claim_failures:
                         log.info(
@@ -436,6 +499,16 @@ class Worker:
             except asyncio.CancelledError:
                 pass
             self._payload_logger.close()
+            if len(self._unconfirmed):
+                # Last chance to say it out loud: the process is going away
+                # and the ledger with it, so these outcomes are lost for good
+                # and their tasks will be swept as stale and recomputed.
+                log.error(
+                    "worker stopping with %d terminal report(s) the backend "
+                    "never confirmed (task ids: %s); those outcomes are lost",
+                    len(self._unconfirmed),
+                    ", ".join(str(i) for i in self._unconfirmed.task_ids()),
+                )
             await self._client.close()
             log.info("task-worker-api Worker stopped: id=%s", self.worker_id)
 
@@ -534,6 +607,83 @@ class Worker:
         self._claim_failures = 0
         return claimed
 
+    async def _put_terminal(self, report: TerminalReport) -> None:
+        """Send one terminal report through the client. Raises on failure.
+
+        The single place the async paths call either terminal route, so every
+        send — first attempt, poll-loop re-send, re-claim replay — carries the
+        report's ``Idempotency-Key`` and nothing else has to remember which
+        client method goes with which outcome. A client override predating the
+        key still gets its report; see :func:`_idempotency_kwarg`.
+        """
+        report_fn = (
+            self._client.complete if report.kind == "complete"
+            else self._client.fail
+        )
+        await report_fn(
+            report.task_id, report.payload,
+            **_idempotency_kwarg(report_fn, report.idempotency_key),
+        )
+
+    async def _flush_unconfirmed_reports(self) -> None:
+        """Re-send terminal reports the backend never confirmed. Never raises.
+
+        Driven from the poll loop's idle branch, and only while the last claim
+        round-trip reached the backend: one re-send costs up to
+        ``_TERMINAL_MIN_ATTEMPTS`` × ``lifecycle_timeout_s`` plus backoff, so
+        firing it into a dead backend would stall the loop *and* undo what the
+        claim backoff exists for — thinning the fleet's request rate while the
+        backend is struggling.
+
+        Per entry:
+
+        * accepted → drop it; the task is terminal at last.
+        * refused with a 4xx → the backend answered and will not take this
+          report from this worker (almost always the ownership check, after
+          the sweeper handed the task to someone else). Stop re-sending it,
+          but keep the outcome: if this worker claims that task again,
+          :meth:`_run_one` replays it instead of recomputing the work.
+        * anything else (transport error, or a 5xx that outlived the client's
+          own retries) → the backend is degraded again. Keep the entry and
+          end the flush for this cycle rather than walking the rest of the
+          ledger into the same wall.
+        """
+        for report in self._unconfirmed.sendable():
+            try:
+                await self._put_terminal(report)
+            except httpx.HTTPStatusError as exc:
+                if 400 <= exc.response.status_code < 500:
+                    report.sendable = False
+                    log.warning(
+                        "task %s: backend refused the unconfirmed %s report "
+                        "with HTTP %d; it is no longer ours to report, "
+                        "keeping the outcome only in case the task is "
+                        "re-claimed here",
+                        report.task_id, report.kind,
+                        exc.response.status_code,
+                    )
+                    continue
+                log.warning(
+                    "task %s: re-sending the unconfirmed %s report failed "
+                    "(HTTP %d); will retry on a later poll cycle",
+                    report.task_id, report.kind, exc.response.status_code,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "task %s: re-sending the unconfirmed %s report failed "
+                    "(%s); will retry on a later poll cycle",
+                    report.task_id, report.kind, exc,
+                )
+                break
+            else:
+                self._unconfirmed.discard(report.task_id)
+                log.info(
+                    "task %s: unconfirmed %s report accepted on re-send; the "
+                    "backend has the outcome",
+                    report.task_id, report.kind,
+                )
+
     async def _run_one(self, task: ClaimedTask) -> None:
         """Heartbeat → stage inputs → run handler → publish.
 
@@ -574,7 +724,78 @@ class Worker:
         deadline off the event loop. Terminal reporting goes through a single
         TerminalGuard so a timeout and a near-simultaneous normal completion
         report exactly once (first resolver wins).
+
+        A terminal report the backend never confirmed is kept (see
+        :mod:`task_worker_api.reports`), and a re-delivery of that same task
+        is answered from it rather than by running the handler again — see
+        the replay below.
         """
+        replay = self._unconfirmed.take(task.id)
+        if replay is not None:
+            if replay.kind == "complete":
+                # The only way a task we already completed comes back is that
+                # our complete() never landed: the row stayed in_progress and
+                # the backend's stale-task sweeper re-queued it. The work is
+                # done and its outputs were published *before* the report, so
+                # re-running the handler would burn the same GPU-hours to
+                # produce the same artifacts. Re-send the stored outcome under
+                # its original Idempotency-Key instead — same logical report,
+                # now that we own the task again.
+                log.warning(
+                    "task %s: re-claimed a task this worker already completed "
+                    "but could not report; re-sending the stored result "
+                    "instead of re-running the handler",
+                    task.id,
+                )
+                # Heartbeat through the re-send, for the same reason the
+                # normal path keeps one up through its terminal report: this
+                # call goes through the client's retry schedule and can span
+                # minutes, and a task whose ``updated_at`` freezes for that
+                # window is exactly what the sweeper reclaims — which is how
+                # this task came back here in the first place.
+                progress = ProgressReporter(
+                    self._client, task.id,
+                    heartbeat_interval_s=self.heartbeat_interval_s,
+                    heartbeat_warn_threshold=self.heartbeat_warn_threshold,
+                )
+                await progress.start_heartbeat()
+                try:
+                    await self._put_terminal(replay)
+                except Exception as exc:  # noqa: BLE001
+                    self._unconfirmed.record(replay)
+                    log.error(
+                        "task %s: re-sending the stored complete report failed "
+                        "again: %s", task.id, exc,
+                    )
+                else:
+                    log.info(
+                        "task %s completed (%s) — stored result accepted on "
+                        "re-claim", task.id, task.task_type.value,
+                    )
+                finally:
+                    await progress.stop()
+                return
+            # An unconfirmed *failure* is superseded by this delivery: the
+            # backend re-queued the task for another attempt, so the run
+            # starting now owns its outcome. ``take`` already dropped it —
+            # keeping it would let a stale fail() stamp ``failed`` over the
+            # result this attempt is about to produce.
+            log.info(
+                "task %s: discarding the unconfirmed fail report from a "
+                "previous attempt; this delivery supersedes it", task.id,
+            )
+
+        # One identity per attempt, one key per terminal route. Every send of
+        # this attempt's report — the client's own retries, the watchdog's
+        # sync fail, a re-send from the ledger cycles later — carries the same
+        # key, so a backend that dedupes on it applies the report once. A
+        # later attempt on the same task (re-queued after a failure) mints a
+        # fresh identity, so its report is not mistaken for a replay of this
+        # one.
+        attempt_id = uuid.uuid4().hex
+        complete_key = f"task-{task.id}-complete-{attempt_id}"
+        fail_key = f"task-{task.id}-fail-{attempt_id}"
+
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
             self._client, task.id,
@@ -601,6 +822,7 @@ class Worker:
                 guard=guard,
                 sync_fail=_make_sync_fail(
                     self.backend_url, self.api_key, task.id, self.worker_id,
+                    idempotency_key=fail_key,
                 ),
                 on_hard_exit=self._on_hard_exit,
                 children_before=list_descendants(os.getpid()),
@@ -752,10 +974,12 @@ class Worker:
                     # the operator had zero visibility. Surface it at ERROR so
                     # it's not invisible, while keeping the non-raising contract
                     # (the polling loop must keep running other tasks).
-                    # ``terminal`` mirrors the branch the try-block will take, so
-                    # the except handler can name the call that failed even when
-                    # the exception fires before the method returns. ``fired`` wins
-                    # over outcome because a timeout overrides a late completion.
+                    # The report is built as a value *before* it is sent, so
+                    # the except handler can name the call that failed even
+                    # when the exception fires before the method returns — and
+                    # so a report that never lands can be kept and re-sent
+                    # verbatim, under the same key, later. ``fired`` wins over
+                    # outcome because a timeout overrides a late completion.
                     #
                     # A result the wire can't encode is a terminal report that
                     # can never land: complete() raises while *building* the
@@ -798,30 +1022,21 @@ class Worker:
                                 f"encoded for the complete report: {encode_error}",
                             )
                     if fired:
-                        terminal = "fail"
+                        report = TerminalReport(
+                            task.id, "fail",
+                            f"timeout: exceeded {timeout_s:.0f}s", fail_key,
+                        )
                     elif outcome[0] == "complete":
-                        terminal = "complete"
+                        report = TerminalReport(
+                            task.id, "complete", outcome[1], complete_key,
+                        )
                     else:
-                        terminal = "fail"
+                        report = TerminalReport(
+                            task.id, "fail", outcome[1], fail_key,
+                        )
+                    terminal = report.kind
                     try:
-                        if fired:
-                            await self._client.fail(
-                                task.id, f"timeout: exceeded {timeout_s:.0f}s",
-                            )
-                            log.warning(
-                                "task %s timed out (%s)",
-                                task.id, task.task_type.value,
-                            )
-                        elif outcome[0] == "complete":
-                            await self._client.complete(task.id, outcome[1])
-                            log.info(
-                                "task %s completed (%s)",
-                                task.id, task.task_type.value,
-                            )
-                        else:
-                            await self._client.fail(task.id, outcome[1])
-                            if outcome[1] == "cancelled by user":
-                                log.info("task %s cancelled by user", task.id)
+                        await self._put_terminal(report)
                     except Exception as report_exc:  # noqa: BLE001
                         # The terminal status call itself failed after exhausting
                         # the client's own retries. Log at ERROR (not WARNING) —
@@ -838,11 +1053,36 @@ class Worker:
                         # the wire, so this failure can't tell a lost write from
                         # a lost *response*, and a second terminal write would
                         # risk stamping ``failed`` over a completion that landed.
+                        #
+                        # What we *do* keep is this same report, under the key
+                        # it was already sent with. Re-sending it is not a
+                        # second terminal write: it is the same one, named, so
+                        # the ambiguous case collapses to "the backend already
+                        # has it". The poll loop retries it once the backend is
+                        # answering again (_flush_unconfirmed_reports), and a
+                        # re-claim of the task replays it (see _run_one's head)
+                        # — either beats leaving a finished task to be swept as
+                        # stale and recomputed from scratch.
+                        self._unconfirmed.record(report)
                         log.error(
                             "task %s: terminal %s report failed after retries; "
-                            "backend did not record outcome=%r: %s",
-                            task.id, terminal, outcome[1], report_exc,
+                            "backend did not record outcome=%r: %s — kept for "
+                            "re-send on a later poll cycle",
+                            task.id, terminal, report.payload, report_exc,
                         )
+                    else:
+                        if fired:
+                            log.warning(
+                                "task %s timed out (%s)",
+                                task.id, task.task_type.value,
+                            )
+                        elif report.kind == "complete":
+                            log.info(
+                                "task %s completed (%s)",
+                                task.id, task.task_type.value,
+                            )
+                        elif report.payload == "cancelled by user":
+                            log.info("task %s cancelled by user", task.id)
             finally:
                 # Always tear the heartbeat down, even if the report block
                 # raised something the except above doesn't catch (guard.claim

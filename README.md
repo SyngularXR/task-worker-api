@@ -68,6 +68,7 @@ That's the whole public surface. The SDK handles the HTTP protocol, heartbeat, c
 | `task_worker_api.cancel` | `CancelGuard` async context manager — three documented patterns |
 | `task_worker_api.progress` | `ProgressReporter` — handler-facing API + background heartbeat |
 | `task_worker_api.files` | `prepare_inputs` / `upload_outputs` — local vs remote auto-detect |
+| `task_worker_api.reports` | Bounded ledger of terminal reports the backend never confirmed — re-sent, or replayed on re-claim |
 | `task_worker_api.testing` | `FakeBackendClient` for handler unit tests |
 
 ## Three workers already using it
