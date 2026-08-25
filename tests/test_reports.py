@@ -120,6 +120,53 @@ def test_ledger_evicts_oldest_and_says_so(caplog):
     assert "task 1" in errors[0]
 
 
+def test_ledger_evicts_on_payload_bytes_not_just_entry_count(caplog):
+    """Entry count bounds nothing on its own: ``payload`` is whatever the
+    handler returned, so a handful of fat completions is unbounded memory in
+    a process that runs for weeks."""
+    ledger = UnconfirmedReports(max_entries=64, max_bytes=2048)
+    with caplog.at_level("ERROR"):
+        for task_id in (1, 2, 3):
+            ledger.record(
+                TerminalReport(task_id, "complete", {"blob": "x" * 900}, "k"),
+            )
+
+    # Nowhere near the 64-entry bound, and still evicted.
+    assert [r.task_id for r in ledger.pending()] == [2, 3]
+    assert ledger.nbytes <= 2048
+    assert any("task 1" in r.getMessage() for r in caplog.records)
+
+
+def test_ledger_drops_a_report_larger_than_its_whole_budget(caplog):
+    """A single payload over budget evicts itself rather than living on as an
+    unbounded exception — the outcome was headed for the sweeper anyway."""
+    ledger = UnconfirmedReports(max_bytes=512)
+    with caplog.at_level("ERROR"):
+        ledger.record(TerminalReport(9, "complete", {"blob": "x" * 5000}, "k"))
+
+    assert len(ledger) == 0
+    assert ledger.nbytes == 0
+    assert any("task 9" in r.getMessage() for r in caplog.records)
+
+
+def test_ledger_releases_bytes_when_a_report_leaves():
+    """Accounting has to survive every exit path, or the budget leaks shut."""
+    ledger = UnconfirmedReports(max_bytes=4096)
+    ledger.record(TerminalReport(1, "complete", {"blob": "x" * 1000}, "k"))
+    ledger.record(TerminalReport(2, "fail", "boom", "k"))
+    assert ledger.nbytes > 1000
+
+    ledger.take(1)
+    ledger.discard(2)
+    assert ledger.nbytes == 0
+
+    # A superseding report replaces the first one's bytes, not adds to them.
+    ledger.record(TerminalReport(3, "complete", {"blob": "x" * 1000}, "k"))
+    held = ledger.nbytes
+    ledger.record(TerminalReport(3, "complete", {"blob": "x" * 1000}, "k2"))
+    assert ledger.nbytes == held
+
+
 # ---------------------------------------------------------------------------
 # The wire: Idempotency-Key
 # ---------------------------------------------------------------------------
@@ -328,18 +375,16 @@ async def test_flush_is_skipped_while_claims_are_failing(make_worker, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_report_is_re_sent_while_the_queue_never_goes_idle(
+async def test_flush_waits_for_an_empty_queue_and_then_re_sends(
     make_worker, tmp_path,
 ):
-    """The flush must not be gated on the poll loop's idle branch.
+    """The flush is gated on a claim that came back *empty*.
 
-    A worker facing a continuously nonempty queue never gets an idle cycle, so
-    an idle-only flush would hold a lost outcome until the bounded ledger
-    evicted it — and an evicted outcome is the dropped report this whole
-    mechanism exists to prevent: the row stays ``in_progress``, the sweeper
-    re-queues it, and its GPU-hours are spent again for artifacts that were
-    already published. Here every claim hands back another task and the
-    re-send still has to happen.
+    While the queue keeps handing back work, the worker has no evidence that
+    the task it holds a report for isn't sitting in that queue waiting to be
+    re-run — a claim that returns some *other* task says nothing about ours.
+    So the report waits. The moment the queue drains, the same claim proves
+    nothing is pending and the report goes out, under its original key.
     """
     client = _FailingTerminalClient(fail_times=1)
 
@@ -352,28 +397,96 @@ async def test_unconfirmed_report_is_re_sent_while_the_queue_never_goes_idle(
     )
 
     # A queue that is never empty: top it up before every claim, so the poll
-    # loop never once takes the idle branch.
-    busy_claim = client.claim_next
+    # loop never once takes the idle branch — until ``busy`` is cleared.
+    busy = True
+    base_claim = client.claim_next
 
-    async def always_busy_claim(task_types, worker_id):
-        _queue_stl_task(client, tmp_path)
-        return await busy_claim(task_types, worker_id)
+    async def maybe_busy_claim(task_types, worker_id):
+        if busy:
+            _queue_stl_task(client, tmp_path)
+        return await base_claim(task_types, worker_id)
 
-    client.claim_next = always_busy_claim
+    client.claim_next = maybe_busy_claim
 
-    async def stop_after_a_few_tasks():
+    sends_while_busy = []
+
+    async def drain_then_stop():
+        nonlocal busy
+        # Three tasks after the lost one, all served without an idle cycle.
         while len(client.completed_tasks) < 3:
+            await asyncio.sleep(0)
+        sends_while_busy.extend(k for tid, k in client.complete_calls if tid == 1)
+        busy = False
+        while not any(r["task_id"] == 1 for r in client.completed_tasks):
             await asyncio.sleep(0)
         await worker.shutdown()
 
-    await asyncio.gather(worker.run_forever(), stop_after_a_few_tasks())
+    await asyncio.wait_for(
+        asyncio.gather(worker.run_forever(), drain_then_stop()), timeout=5,
+    )
 
-    # Task 1's complete() was lost; it was re-sent mid-stream, under the same
-    # Idempotency-Key, without the queue ever draining.
+    # Busy cycles: only the attempt's own lost send. No re-send raced a
+    # re-queue we could not have seen.
+    assert len(sends_while_busy) == 1
+    # Drained: the held outcome lands, same report, same identity.
     task_1_sends = [k for tid, k in client.complete_calls if tid == 1]
     assert len(task_1_sends) == 2
     assert len(set(task_1_sends)) == 1
-    assert 1 in [r["task_id"] for r in client.completed_tasks]
+    assert [r["result"] for r in client.completed_tasks if r["task_id"] == 1] == [
+        {"planes": []}
+    ]
+    assert len(worker._unconfirmed) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_re_queued_task_is_never_terminalized_from_the_ledger(
+    make_worker, tmp_path,
+):
+    """Regression: the flush must not beat the re-delivery to the row.
+
+    The sweeper has re-queued a task this worker still holds a report for, so
+    the row is ``pending`` and waiting for a genuine re-run. If the poll loop
+    re-sends the held report first, the backend takes it, the row goes
+    terminal on the *earlier* attempt's output, and the re-run the backend
+    asked for is silently skipped — the exact outcome ``_run_one``'s
+    new-attempt rule exists to prevent. The report has to wait for a claim
+    that says nothing is pending, which by construction cannot happen while
+    this task is queued.
+    """
+    client = _FailingTerminalClient(fail_times=1)
+    task = _queue_stl_task(client, tmp_path)
+
+    attempts = []
+
+    async def handler(ctx, params):
+        attempts.append(ctx.task.id)
+        return {"attempt": len(attempts)}
+
+    worker = make_worker(
+        client=client, handlers={TaskType.DETECT_CUT_PLANES: handler},
+        poll_interval_s=0.01,
+    )
+    await worker.run_one()
+    assert client.completed_tasks == []      # attempt 1's report was lost
+    stale_key = worker._unconfirmed.pending()[0].idempotency_key
+
+    # The sweeper reclaims the row and queues it for a re-run.
+    _queue_stl_task(client, tmp_path, task_id=task.id)
+
+    async def stop_after_the_rerun():
+        while len(attempts) < 2 or not client.completed_tasks:
+            await asyncio.sleep(0)
+        await worker.shutdown()
+
+    await asyncio.wait_for(
+        asyncio.gather(worker.run_forever(), stop_after_the_rerun()), timeout=5,
+    )
+
+    assert attempts == [task.id, task.id], "the re-run actually ran"
+    # One terminal write, and it is the re-run's — the stale result never
+    # reached the backend, in either order.
+    assert [r["result"] for r in client.completed_tasks] == [{"attempt": 2}]
+    assert stale_key not in client.keys_for(task.id)
     assert len(worker._unconfirmed) == 0
 
 

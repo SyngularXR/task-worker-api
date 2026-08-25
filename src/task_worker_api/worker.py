@@ -473,20 +473,41 @@ class Worker:
 
         try:
             while not self._stop.is_set():
-                # Settle outcomes the backend never confirmed, on *every*
-                # cycle rather than only idle ones. A worker whose queue never
-                # empties never sees an idle cycle, so an idle-only flush
-                # would hold those reports until the bounded ledger evicted
-                # them — re-creating the dropped-outcome bug the ledger exists
-                # to prevent, on exactly the busy fleet that can least afford
-                # to recompute a task. Here at the top of the cycle the worker
-                # holds no claim and no heartbeat: the previous task is
-                # terminal and the next is not claimed yet, so a slow re-send
-                # can't strand a task the sweeper would then reclaim.
-                if len(self._unconfirmed) and not self._claim_failures:
-                    await self._flush_unconfirmed_reports()
                 claimed = await self._claim()
                 if claimed is None:
+                    # Settle outcomes the backend never confirmed — here, and
+                    # only here: on a cycle whose claim round-trip reached the
+                    # backend and came back *empty*.
+                    #
+                    # A held report is only safe to re-send while the backend
+                    # still has the task in progress. Once the sweeper
+                    # re-queues it, that report is stale, and delivering it to
+                    # a row that is pending again terminalizes a task the
+                    # backend asked to have re-run: the rerun is silently
+                    # skipped and the earlier attempt's output stands. That is
+                    # the same wrong answer ``_run_one`` refuses to give from
+                    # the ledger, so the flush must not give it either — and
+                    # re-sending on a *busy* cycle does exactly that, because
+                    # a claim that hands back some other task says nothing
+                    # about whether ours is sitting behind it in the queue.
+                    #
+                    # An empty claim is the one piece of evidence the worker
+                    # has: no task of its types is pending, so the task it
+                    # holds a report for is not queued for a re-run and the
+                    # report is still the live outcome. (The claim envelope
+                    # carries no attempt or lease id to check instead — see
+                    # ``_run_one``. Closing the remaining sliver, a sweep
+                    # landing between this response and the re-send, needs
+                    # that protocol change.)
+                    #
+                    # A worker whose queue never drains therefore holds its
+                    # unconfirmed reports, possibly until the ledger evicts
+                    # them (logged at ERROR). That costs a recomputation of
+                    # work already done — the pre-ledger behaviour, and the
+                    # safe direction to be wrong in; re-sending regardless
+                    # would trade it for silently applying a stale result.
+                    if len(self._unconfirmed) and not self._claim_failures:
+                        await self._flush_unconfirmed_reports()
                     wait_s = self._claim_wait_s()
                     if self._claim_failures:
                         log.info(
@@ -644,12 +665,16 @@ class Worker:
     async def _flush_unconfirmed_reports(self) -> None:
         """Re-send terminal reports the backend never confirmed. Never raises.
 
-        Driven from the top of every poll cycle — busy or idle — but only
-        while the last claim round-trip reached the backend: one re-send costs
-        up to ``_TERMINAL_MIN_ATTEMPTS`` × ``lifecycle_timeout_s`` plus
-        backoff, so firing it into a dead backend would stall the loop *and*
-        undo what the claim backoff exists for — thinning the fleet's request
-        rate while the backend is struggling.
+        Driven from the poll loop's *empty-claim* branch only, and only while
+        that claim reached the backend. Both halves of that gate are
+        load-bearing. An empty queue is what says the held task has not been
+        re-queued for a fresh attempt, so re-sending cannot terminalize a
+        task the backend wants re-run (see ``run_forever``). And a claim that
+        failed says the backend is down: one re-send costs up to
+        ``_TERMINAL_MIN_ATTEMPTS`` × ``lifecycle_timeout_s`` plus backoff, so
+        firing it into a dead backend would stall the loop *and* undo what the
+        claim backoff exists for — thinning the fleet's request rate while the
+        backend is struggling.
 
         Per entry:
 
@@ -1058,12 +1083,13 @@ class Worker:
                         # it was already sent with. Re-sending it is not a
                         # second terminal write: it is the same one, named, so
                         # the ambiguous case collapses to "the backend already
-                        # has it". The poll loop retries it once the backend is
-                        # answering again (_flush_unconfirmed_reports) — which
-                        # beats leaving a finished task to be swept as stale
-                        # and recomputed from scratch. It is dropped, not
-                        # re-sent, if the task is delivered here again: that
-                        # delivery is a new attempt (see _run_one's head).
+                        # has it". The poll loop retries it on the next cycle
+                        # whose claim comes back empty
+                        # (_flush_unconfirmed_reports) — which beats leaving a
+                        # finished task to be swept as stale and recomputed
+                        # from scratch. It is dropped, not re-sent, if the task
+                        # is delivered here again: that delivery is a new
+                        # attempt (see _run_one's head).
                         self._unconfirmed.record(report)
                         log.error(
                             "task %s: terminal %s report failed after retries; "

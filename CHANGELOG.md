@@ -22,13 +22,20 @@
   reclaimed it, and the next worker recomputed hours of GPU work whose result
   already existed — and whose outputs had *already been published*, since
   uploads happen before the report. The outcome is now held in a bounded
-  per-worker ledger (`task_worker_api.reports`) and re-sent at the top of the
-  next poll cycle — busy or idle — **whose claim reached the backend**, so a
-  saturated queue still settles its lost reports while a flush can never fight
-  the claim backoff during an outage. A permanent 4xx (the ownership check,
-  once the sweeper hands the task to someone else) stops the re-sends and
-  drops the outcome — whoever owns the task now reports it; a *transient* 4xx
-  (408/429) is not a refusal and stays queued.
+  per-worker ledger (`task_worker_api.reports`, bounded by entry count *and*
+  by total payload bytes) and re-sent on the next poll cycle whose claim
+  **reached the backend and came back empty**. An empty queue is the only
+  evidence a worker has that the task is not already re-queued for a fresh
+  attempt — re-sending a held report onto a `pending` row would terminalize it
+  on the earlier attempt's output and silently skip the re-run the backend
+  asked for — and a failing claim means the backend is down, where a flush
+  would fight the claim backoff. A worker whose queue never drains therefore
+  holds its reports until it drains or the ledger evicts them (logged at
+  ERROR): a recomputation of work already done, which is the pre-ledger
+  behaviour and the safe direction to be wrong in. A permanent 4xx (the
+  ownership check, once the sweeper hands the task to someone else) stops the
+  re-sends and drops the outcome — whoever owns the task now reports it; a
+  *transient* 4xx (408/429) is not a refusal and stays queued.
 - A re-delivery of a task the worker still holds an unconfirmed report for is
   treated as **a new attempt**: the handler runs and the stale report is
   discarded, rather than left to stamp `failed` over the new attempt's outcome
