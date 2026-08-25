@@ -13,7 +13,9 @@ from scratch — GPU-hours redone for a result that already exists, and a
 This ledger keeps those reports so the worker can re-send them:
 
 * :meth:`UnconfirmedReports.sendable` drives the poll loop's flush — one more
-  attempt per idle cycle, and only while the backend is answering claims.
+  attempt per poll cycle (busy or idle; a saturated queue never goes idle,
+  and its reports must not sit here until they are evicted), and only while
+  the backend is answering claims.
 * :meth:`UnconfirmedReports.take` is the re-claim path: when the sweeper
   re-queues a task this worker already finished, the worker re-reports the
   stored outcome instead of running the handler over again.

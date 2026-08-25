@@ -467,12 +467,20 @@ class Worker:
 
         try:
             while not self._stop.is_set():
+                # Settle outcomes the backend never confirmed, on *every*
+                # cycle rather than only idle ones. A worker whose queue never
+                # empties never sees an idle cycle, so an idle-only flush
+                # would hold those reports until the bounded ledger evicted
+                # them — re-creating the dropped-outcome bug the ledger exists
+                # to prevent, on exactly the busy fleet that can least afford
+                # to recompute a task. Here at the top of the cycle the worker
+                # holds no claim and no heartbeat: the previous task is
+                # terminal and the next is not claimed yet, so a slow re-send
+                # can't strand a task the sweeper would then reclaim.
+                if len(self._unconfirmed) and not self._claim_failures:
+                    await self._flush_unconfirmed_reports()
                 claimed = await self._claim()
                 if claimed is None:
-                    # Idle cycle with the backend answering: the cheapest
-                    # moment to settle outcomes it never confirmed.
-                    if len(self._unconfirmed) and not self._claim_failures:
-                        await self._flush_unconfirmed_reports()
                     wait_s = self._claim_wait_s()
                     if self._claim_failures:
                         log.info(
@@ -628,12 +636,12 @@ class Worker:
     async def _flush_unconfirmed_reports(self) -> None:
         """Re-send terminal reports the backend never confirmed. Never raises.
 
-        Driven from the poll loop's idle branch, and only while the last claim
-        round-trip reached the backend: one re-send costs up to
-        ``_TERMINAL_MIN_ATTEMPTS`` × ``lifecycle_timeout_s`` plus backoff, so
-        firing it into a dead backend would stall the loop *and* undo what the
-        claim backoff exists for — thinning the fleet's request rate while the
-        backend is struggling.
+        Driven from the top of every poll cycle — busy or idle — but only
+        while the last claim round-trip reached the backend: one re-send costs
+        up to ``_TERMINAL_MIN_ATTEMPTS`` × ``lifecycle_timeout_s`` plus
+        backoff, so firing it into a dead backend would stall the loop *and*
+        undo what the claim backoff exists for — thinning the fleet's request
+        rate while the backend is struggling.
 
         Per entry:
 

@@ -27,6 +27,11 @@ class FakeBackendClient:
         self._next_id = 1
         self.completed_tasks: list[dict] = []
         self.failed_tasks: list[dict] = []
+        # One record per terminal report — {"task_id", "kind",
+        # "idempotency_key"} in send order. Kept beside completed_tasks /
+        # failed_tasks rather than inside them so those records stay the
+        # shape every worker suite already asserts on. See ``keys_for``.
+        self.idempotency_keys: list[dict] = []
         self.progress_events: list[dict] = []
         self.cancelled_task_ids: set[int] = set()
         # Virtual file store for remote-mode tests. Inputs staged via
@@ -140,18 +145,16 @@ class FakeBackendClient:
         *,
         idempotency_key: "Optional[str]" = None,
     ) -> None:
-        """Record a completion, including the key it was reported under.
+        """Record a completion, and the key it was reported under.
 
-        ``idempotency_key`` is captured (not enforced) so tests can assert
-        that a re-sent report reuses the *same* key as the attempt that first
-        failed to land — the property that lets a backend collapse the two
-        into one terminal write.
+        The ``completed_tasks`` record keeps its documented
+        ``{"task_id", "result"}`` shape — worker suites across the fleet
+        compare those dicts whole, so widening them would fail tests that
+        never asked about idempotency. The key lands in
+        :attr:`idempotency_keys` instead.
         """
-        self.completed_tasks.append({
-            "task_id": task_id,
-            "result": result,
-            "idempotency_key": idempotency_key,
-        })
+        self.completed_tasks.append({"task_id": task_id, "result": result})
+        self._record_key(task_id, "complete", idempotency_key)
 
     async def fail(
         self, task_id: int, error: str,
@@ -159,11 +162,29 @@ class FakeBackendClient:
         idempotency_key: "Optional[str]" = None,
     ) -> None:
         """Record a failure + its idempotency key. See :meth:`complete`."""
-        self.failed_tasks.append({
+        self.failed_tasks.append({"task_id": task_id, "error": error})
+        self._record_key(task_id, "fail", idempotency_key)
+
+    def _record_key(
+        self, task_id: int, kind: str, idempotency_key: "Optional[str]",
+    ) -> None:
+        self.idempotency_keys.append({
             "task_id": task_id,
-            "error": error,
+            "kind": kind,
             "idempotency_key": idempotency_key,
         })
+
+    def keys_for(self, task_id: int, kind: "Optional[str]" = None) -> list:
+        """Idempotency keys this task was reported under, in send order.
+
+        The assertion a replay test wants: every delivery of one outcome
+        carries the same key, so ``len(set(fake.keys_for(7))) == 1`` says the
+        re-send was the *same* logical report rather than a second one.
+        """
+        return [
+            r["idempotency_key"] for r in self.idempotency_keys
+            if r["task_id"] == task_id and (kind is None or r["kind"] == kind)
+        ]
 
     async def download_file(
         self, task_id: int, filename: str, dest: Path,

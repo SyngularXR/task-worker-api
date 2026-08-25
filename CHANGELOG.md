@@ -22,8 +22,9 @@
   reclaimed it, and the next worker recomputed hours of GPU work whose result
   already existed — and whose outputs had *already been published*, since
   uploads happen before the report. The outcome is now held in a bounded
-  per-worker ledger (`task_worker_api.reports`) and re-sent on the next idle
-  poll cycle **whose claim reached the backend**, so a flush can never fight
+  per-worker ledger (`task_worker_api.reports`) and re-sent at the top of the
+  next poll cycle — busy or idle — **whose claim reached the backend**, so a
+  saturated queue still settles its lost reports while a flush can never fight
   the claim backoff during an outage. A 4xx (the ownership check, once the
   sweeper hands the task to someone else) stops the re-sends but keeps the
   outcome.
@@ -46,8 +47,10 @@
   `complete(task_id, result)` / `fail(task_id, error)` keeps reporting exactly
   as before, minus the dedupe name, with one WARNING per process naming the
   override. `FakeBackendClient.complete` / `.fail` accept the keyword and record
-  it on `completed_tasks` / `failed_tasks`, so those dicts carry a new
-  `idempotency_key` entry.
+  it on a new `idempotency_keys` list (read it via `keys_for(task_id)`);
+  `completed_tasks` / `failed_tasks` keep their documented
+  `{"task_id", "result"}` / `{"task_id", "error"}` shape, so worker suites
+  that compare those records whole are untouched.
 
 **Fixes:**
 - `BackendClient`'s per-call deadlines no longer disable timeouts entirely when

@@ -223,7 +223,8 @@ async def test_client_override_without_the_key_still_reports(
         await worker.run_one()
 
     assert len(client.completed_tasks) == 1
-    assert client.completed_tasks[0]["idempotency_key"] is None
+    assert client.completed_tasks[0] == {"task_id": 1, "result": {"planes": []}}
+    assert client.keys_for(1) == [None]
     warnings = [
         r.getMessage() for r in caplog.records
         if "no 'idempotency_key' parameter" in r.getMessage()
@@ -296,7 +297,14 @@ async def test_lost_fail_is_re_sent_too(make_worker, tmp_path):
 async def test_flush_is_skipped_while_claims_are_failing(make_worker, tmp_path):
     """Re-sending into a backend that isn't answering costs a full terminal
     retry budget per entry and undoes the claim backoff. The poll loop only
-    flushes on a cycle whose claim reached the backend."""
+    flushes on a cycle whose claim reached the backend.
+
+    That health signal is the *last* claim's result, so it is always one cycle
+    stale — an outage starting mid-cycle can still cost a single transitional
+    re-send, and no gate can prevent that. What must not happen is a re-send
+    on every cycle for as long as the backend stays dark, so this pins the
+    sustained case: already inside the outage, the flush stops entirely.
+    """
     client = _FailingTerminalClient(fail_times=1)
     _queue_stl_task(client, tmp_path)
 
@@ -309,16 +317,18 @@ async def test_flush_is_skipped_while_claims_are_failing(make_worker, tmp_path):
     )
     await worker.run_one()
     assert len(worker._unconfirmed) == 1
-    sends_after_task = len(client.complete_calls)
 
     # Backend goes dark: every claim raises, so no cycle is "healthy".
     async def dead_claim(task_types, worker_id):
         raise RuntimeError("backend unreachable")
 
     client.claim_next = dead_claim
+    # The state every cycle after the first one of an outage is in.
+    worker._claim_failures = 1
+    sends_after_task = len(client.complete_calls)
 
     async def stop_soon():
-        while worker._claim_failures < 3:
+        while worker._claim_failures < 5:
             await asyncio.sleep(0)
         await worker.shutdown()
 
@@ -326,6 +336,56 @@ async def test_flush_is_skipped_while_claims_are_failing(make_worker, tmp_path):
 
     assert len(client.complete_calls) == sends_after_task
     assert len(worker._unconfirmed) == 1
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_report_is_re_sent_while_the_queue_never_goes_idle(
+    make_worker, tmp_path,
+):
+    """The flush must not be gated on the poll loop's idle branch.
+
+    A worker facing a continuously nonempty queue never gets an idle cycle, so
+    an idle-only flush would hold a lost outcome until the bounded ledger
+    evicted it — and an evicted outcome is the dropped report this whole
+    mechanism exists to prevent: the row stays ``in_progress``, the sweeper
+    re-queues it, and its GPU-hours are spent again for artifacts that were
+    already published. Here every claim hands back another task and the
+    re-send still has to happen.
+    """
+    client = _FailingTerminalClient(fail_times=1)
+
+    async def handler(ctx, params):
+        return {"planes": []}
+
+    worker = make_worker(
+        client=client, handlers={TaskType.DETECT_CUT_PLANES: handler},
+        poll_interval_s=0.01,
+    )
+
+    # A queue that is never empty: top it up before every claim, so the poll
+    # loop never once takes the idle branch.
+    busy_claim = client.claim_next
+
+    async def always_busy_claim(task_types, worker_id):
+        _queue_stl_task(client, tmp_path)
+        return await busy_claim(task_types, worker_id)
+
+    client.claim_next = always_busy_claim
+
+    async def stop_after_a_few_tasks():
+        while len(client.completed_tasks) < 3:
+            await asyncio.sleep(0)
+        await worker.shutdown()
+
+    await asyncio.gather(worker.run_forever(), stop_after_a_few_tasks())
+
+    # Task 1's complete() was lost; it was re-sent mid-stream, under the same
+    # Idempotency-Key, without the queue ever draining.
+    task_1_sends = [k for tid, k in client.complete_calls if tid == 1]
+    assert len(task_1_sends) == 2
+    assert len(set(task_1_sends)) == 1
+    assert 1 in [r["task_id"] for r in client.completed_tasks]
+    assert len(worker._unconfirmed) == 0
 
 
 @pytest.mark.asyncio
