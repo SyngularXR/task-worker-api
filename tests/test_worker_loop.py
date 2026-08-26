@@ -1266,3 +1266,138 @@ async def test_heartbeat_stopped_when_worker_cancelled_mid_report(
     assert len(client.progress_events) == settled, (
         "heartbeat leaked past a cancelled terminal report"
     )
+
+
+# ---------------------------------------------------------------------------
+# Partial-failure cleanup: published, then failed
+# ---------------------------------------------------------------------------
+# upload_outputs cleans up after its *own* partial failure. These cover the
+# other half: publishing fully succeeded, and the attempt failed anyway. The
+# backend only sweeps a staging dir (or accepts an output manifest) for a task
+# it recorded as complete, so without this the artifacts are permanent orphans.
+
+
+class _CancelAfterLastUploadClient(FakeBackendClient):
+    """Sets the CancelGuard's own event once the final output has uploaded.
+
+    This is the race as it actually happens: the guard raises TaskCancelled
+    when the guarded block *exits*, so a cancel landing after the last upload
+    fails a task whose outputs are already fully published. Setting the event
+    the worker threaded in — rather than flipping a flag and sleeping — makes
+    the ordering exact instead of timing-dependent.
+    """
+
+    def __init__(self, total_outputs: int) -> None:
+        super().__init__()
+        self._total = total_outputs
+        self.upload_count = 0
+
+    async def upload_file(self, task_id, filename, src, *, cancelled=None):
+        await super().upload_file(task_id, filename, src, cancelled=cancelled)
+        self.upload_count += 1
+        if self.upload_count == self._total and cancelled is not None:
+            cancelled.set()
+
+
+@pytest.mark.asyncio
+async def test_late_cancel_after_full_publish_reports_the_remote_orphans(
+    make_worker, tmp_path, monkeypatch, caplog,
+):
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelAfterLastUploadClient(total_outputs=2)
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"mesh": "in.ply"}, "max_results": 1},
+    )
+    client.queue_file(task.id, "in.ply", b"pretend-PLY")
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "a.stl").write_bytes(b"out-a")
+        (ctx.files.output_dir / "b.stl").write_bytes(b"out-b")
+        return {"output_files": {"a": "a.stl", "b": "b.stl"}}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        heartbeat_interval_s=0.01,
+    )
+    with caplog.at_level("WARNING"):
+        await worker.run_one()
+
+    # Everything published, and the task still failed.
+    assert client.upload_count == 2
+    assert client.completed_tasks == []
+    assert "cancelled" in client.failed_tasks[0]["error"].lower()
+    # Remote mode has no delete route, so the reclaim is a log an operator can
+    # reconcile from — silence here is how these went unnoticed.
+    assert any(
+        "a.stl" in r.getMessage() and "b.stl" in r.getMessage()
+        and "reported failed" in r.getMessage()
+        for r in caplog.records if r.levelname == "WARNING"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unencodable_result_after_publish_discards_the_staging_dir(
+    make_worker, tmp_path,
+):
+    """The encode pre-check rewrites a completed outcome to a failure — and
+    the outputs it already staged onto the shared volume have to go with it."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    shared = tmp_path / "shared"
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        # A Path left in the dict — complete() can never encode this.
+        return {"output_files": {"planes": "planes.stl"}, "src": tmp_path}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        shared_volume_path=str(shared),
+    )
+    await worker.run_one()
+
+    assert client.completed_tasks == []
+    assert "could not be encoded" in client.failed_tasks[0]["error"]
+    # Staged during the run, reclaimed because the task ends failed.
+    assert not (shared / "temp" / "1").exists()
+
+
+@pytest.mark.asyncio
+async def test_handler_failure_before_publish_leaves_nothing_to_discard(
+    make_worker, tmp_path, caplog,
+):
+    """Nothing was published, so the cleanup must be a no-op — not a second
+    failure, and not a warning about orphans that don't exist."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    shared = tmp_path / "shared"
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        raise RuntimeError("handler blew up before producing anything")
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        shared_volume_path=str(shared),
+    )
+    with caplog.at_level("WARNING"):
+        await worker.run_one()
+
+    assert "handler blew up" in client.failed_tasks[0]["error"]
+    assert not any(
+        "remain published" in r.getMessage() for r in caplog.records
+    )

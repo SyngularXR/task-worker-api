@@ -33,11 +33,17 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from .cancel import CancelGuard
-from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
+from .client import (
+    BackendClient,
+    _DEFAULT_BACKOFF_MAX_S,
+    _IDEMPOTENCY_HEADER,
+    _JITTER_SPREAD,
+    _terminal_idempotency_key,
+)
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
-from .files import prepare_inputs, upload_outputs
+from .files import discard_published_outputs, prepare_inputs, upload_outputs
 from .payload_log import PayloadLogger, sanitize_worker_id
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
@@ -180,6 +186,13 @@ def _make_sync_fail(
     defaults): this is the only report path for a watchdog-fired timeout, and
     a single attempt against a momentarily unavailable backend (restart, DB
     blip) would silently orphan the task as RUNNING until the sweeper.
+
+    Those retries carry the same per-report ``Idempotency-Key`` the async
+    :meth:`BackendClient.fail` sends, built once per ``_sync_fail`` call so
+    every attempt shares it. This path needs it most: the 3s deadline is the
+    tightest in the SDK and it fires on a worker whose event loop is already
+    wedged, so "the write committed, the response didn't arrive in time" is
+    the *expected* way an attempt fails here, not an edge case.
     """
     url = (
         f"{base_url.rstrip('/')}/tasks/{task_id}/fail"
@@ -188,14 +201,15 @@ def _make_sync_fail(
 
     def _sync_fail(error: str) -> None:
         data = json.dumps({"error": error}).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            _IDEMPOTENCY_HEADER: _terminal_idempotency_key(task_id, "fail"),
+        }
         last_exc: Exception | None = None
         for attempt in range(attempts):
             req = urllib.request.Request(
-                url, data=data, method="PUT",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                url, data=data, method="PUT", headers=headers,
             )
             try:
                 urllib.request.urlopen(req, timeout=timeout_s).close()
@@ -871,6 +885,10 @@ class Worker:
         deadline off the event loop. Terminal reporting goes through a single
         TerminalGuard so a timeout and a near-simultaneous normal completion
         report exactly once (first resolver wins).
+
+        An attempt that publishes its outputs and *then* fails has its
+        published artifacts discarded before the failure is reported — see
+        the ``discard_published_outputs`` call below.
         """
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
@@ -905,6 +923,10 @@ class Worker:
             wd.start()
 
         outcome: tuple[str, object] = ("fail", "unknown")
+        # Set once upload_outputs has published this attempt's artifacts, so
+        # the terminal-report block below knows there is something to reclaim
+        # if the attempt still ends up failing. See the discard call there.
+        published: Optional[dict[str, str]] = None
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1009,6 +1031,7 @@ class Worker:
                         self.shared_volume_path, cancelled=cancelled,
                         foreign=not target.is_home,
                     )
+                    published = delivered
                     result = {**result, "output_files": delivered}
             outcome = ("complete", result or {})
 
@@ -1102,6 +1125,37 @@ class Worker:
                         terminal = "complete"
                     else:
                         terminal = "fail"
+                    # Partial-failure cleanup. Publishing succeeding does not
+                    # mean the task succeeded: upload_outputs can deliver every
+                    # file and the attempt still land here as a failure — the
+                    # CancelGuard raises TaskCancelled when the guarded block
+                    # *exits*, so a cancel arriving after the last upload fails
+                    # a fully-published task; the watchdog deadline can fire
+                    # between the last upload and this block; and an
+                    # unencodable result is rewritten to a failure just above.
+                    # upload_outputs only cleans up after its *own* partial
+                    # failure, so those artifacts survive — and the backend
+                    # only sweeps a staging dir for a task it recorded as
+                    # complete, leaving GB-scale colmap-splat PLYs and
+                    # Neural-Canvas splats orphaned on the shared volume for
+                    # good.
+                    #
+                    # Before the report, not after: reporting the failure is
+                    # what makes the task re-queueable, and a retry stages into
+                    # the *same* ``temp/<task_id>`` path — so a discard racing
+                    # a re-claim would delete the next attempt's fresh outputs
+                    # instead of this one's stale ones. Never raises (see
+                    # discard_published_outputs), so it cannot displace the
+                    # terminal report this worker still owes the task.
+                    if terminal == "fail" and published:
+                        await discard_published_outputs(
+                            task, self.shared_volume_path,
+                            list(published.values()),
+                            reason=(
+                                "the task is being reported failed, so the "
+                                "backend will never sweep them"
+                            ),
+                        )
                     try:
                         if fired:
                             await target.client.fail(

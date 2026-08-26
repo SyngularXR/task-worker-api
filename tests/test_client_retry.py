@@ -3570,3 +3570,95 @@ async def test_worker_mutations_send_claiming_worker_id(tmp_path):
 
     assert len(seen) == 6
     assert all(worker_id == "worker-7" for _, _, worker_id in seen)
+
+
+# ---------------------------------------------------------------------------
+# Terminal-report idempotency key
+# ---------------------------------------------------------------------------
+# Retrying a terminal report is the one retry in this client that can duplicate
+# a *state transition*: ReadTimeout / 500 / 502 are exactly the failures where
+# the write may have committed and only the response was lost. Each report
+# therefore carries an Idempotency-Key that is constant across its own retries
+# (so a backend can collapse them) and distinct per logical report (so a
+# genuinely new report is never collapsed into a stale one).
+
+
+@pytest.mark.asyncio
+async def test_complete_reuses_one_idempotency_key_across_retries():
+    keys: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get("Idempotency-Key"))
+        if len(keys) < 3:
+            return httpx.Response(500, json={"detail": "db down"})
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(handler)
+    await client.complete(4, {"ok": True})
+    await client.close()
+
+    # 500 is transient for terminal reports, so this took three attempts —
+    # all of them the same logical report, all carrying the same key.
+    assert len(keys) == 3
+    assert all(k and k == keys[0] for k in keys)
+
+
+@pytest.mark.asyncio
+async def test_fail_reuses_one_idempotency_key_across_retries():
+    keys: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get("Idempotency-Key"))
+        if len(keys) < 2:
+            raise httpx.ReadTimeout("response lost", request=request)
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(handler)
+    await client.fail(4, "boom")
+    await client.close()
+
+    # A lost response is the ambiguous case the key exists for: the retry must
+    # be recognisable as the same report, not a second one.
+    assert len(keys) == 2
+    assert all(k and k == keys[0] for k in keys)
+
+
+@pytest.mark.asyncio
+async def test_distinct_terminal_reports_get_distinct_idempotency_keys():
+    keys: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get("Idempotency-Key"))
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(handler)
+    await client.complete(4, {"ok": True})
+    await client.complete(4, {"ok": True})
+    await client.fail(4, "boom")
+    await client.fail(5, "boom")
+    await client.close()
+
+    # Four separate logical reports — including a re-claimed task's second
+    # attempt at the same (task_id, kind). Collapsing those would be worse
+    # than the duplicate the key prevents: a new outcome silently dropped.
+    assert len(set(keys)) == 4
+    assert keys[0].startswith("task-4-complete-")
+    assert keys[2].startswith("task-4-fail-")
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_calls_carry_no_idempotency_key():
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("Idempotency-Key")))
+        return httpx.Response(200, json={"cancelled": False})
+
+    client = _client_with_handler(handler)
+    await client.report_progress(4, stage="running")
+    await client.get_cancel_status(4)
+    await client.close()
+
+    # Heartbeats and cancel polls are safely repeatable reads/updates — no
+    # transition to deduplicate, so no key and no new wire surface.
+    assert [key for _, key in seen] == [None, None]

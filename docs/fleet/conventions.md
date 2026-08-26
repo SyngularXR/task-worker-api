@@ -98,3 +98,30 @@ Three modes:
 The SDK never raises out of payload-logging code paths (including `__init__`). Disk full, fs flap, permission errors, and serialization failures all produce one WARNING log per process lifetime; subsequent failures are silent. **Worker keeps polling and running tasks regardless** — payload logging is a debug aid, not a correctness feature.
 
 If you implement a custom `BackendClient` subclass or override `Worker._run_one`, preserve this property: don't let logging machinery propagate exceptions out to break the polling loop.
+
+## 9. Terminal report contract (`Idempotency-Key`)
+
+`PUT /tasks/{id}/complete` and `PUT /tasks/{id}/fail` are the only calls the SDK retries that mutate task *state*, and the failures they retry — `ReadTimeout`, 500, 502/504 — are exactly the ones where the write may have committed and only the response was lost. Both therefore carry an `Idempotency-Key` header:
+
+```
+Idempotency-Key: task-<task_id>-<complete|fail>-<32 hex chars>
+```
+
+The key is generated once per **logical report** and reused across every retry of that report, including the watchdog's last-resort synchronous `fail` (which retries 3× against a 3s deadline on an already-wedged worker — the likeliest duplicate in the fleet). A genuinely new report — a re-claimed task's second attempt, or a `fail` following a `complete` — gets a fresh key.
+
+**For backends:** if two terminal requests for the same task arrive with the *same* key, they are one report retried; return the first attempt's outcome rather than transitioning again. Different keys are different reports and must be handled on their own merits. Honouring the header is optional — SynPusher-Vue's guarded conditional `mark_completed`/`mark_failed` already absorbs most duplicates — but the routes that deliberately leave the row non-terminal and dispatch a finalize task (`segmentation`, `generate_synthetic`) have no status to guard on, and are where a retry currently re-runs that dispatch.
+
+No other call carries the header: heartbeats and cancel polls are safely repeatable and have no transition to collapse.
+
+## 10. Partial-failure cleanup
+
+Publishing succeeding is not the same as the task succeeding. `upload_outputs` can deliver every file and the attempt still end terminal-**failed** — a cancel landing after the last upload (the `CancelGuard` raises when the guarded block *exits*), a watchdog deadline firing between the last upload and the terminal report, or a handler result the wire can't encode.
+
+Since the backend only sweeps a staging dir (or accepts an output manifest) for a task it recorded as **complete**, those artifacts would be permanent orphans. `Worker._run_one` therefore discards them *before* reporting the failure:
+
+- **Local mode** — the whole `${SHARED_DATA_PATH}/temp/<task_id>/` staging dir is removed, so a retried task starts clean.
+- **Remote mode** — the worker protocol has no delete route, so the uploads stay until a retry overwrites them; the SDK logs one WARNING naming the files for operator reconciliation.
+
+Cleanup runs before the report because reporting the failure is what makes the task re-queueable, and a retry stages into the *same* `temp/<task_id>` path — a discard racing a re-claim would delete the next attempt's fresh outputs.
+
+`discard_published_outputs` is exported for consumers that override `Worker._run_one`. Like the payload logger (§8) it never raises: it runs while a failure is already being reported, so a cleanup error must not displace the real one.

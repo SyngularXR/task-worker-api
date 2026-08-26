@@ -162,3 +162,58 @@ async def test_per_type_env_override_resolved(
     await w.run_one()
     assert built["n"] == 0
     assert len(fake_client.completed_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_after_publish_discards_the_staging_dir(
+    make_worker, fake_client, tmp_path,
+):
+    """A watchdog deadline that lands after the handler published its outputs
+    fails the task — and the published artifacts must go with it. The backend
+    only sweeps a staging dir for a task it recorded as *complete*, so leaving
+    them behind orphans GB-scale artifacts on the shared volume for good."""
+    _queue(fake_client, tmp_path)
+    shared = tmp_path / "shared"
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    w = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        task_timeout_s=60.0,
+        shared_volume_path=str(shared),
+        _watchdog_factory=lambda **kw: _ImmediateWatchdog(fire=True),
+    )
+    await w.run_one()
+
+    assert fake_client.completed_tasks == []
+    assert "timeout: exceeded 60s" in fake_client.failed_tasks[0]["error"]
+    assert not (shared / "temp" / "1").exists()
+
+
+@pytest.mark.asyncio
+async def test_completed_task_keeps_its_staging_dir(
+    make_worker, fake_client, tmp_path,
+):
+    """The mirror image, and the regression this cleanup must never become:
+    a task that completes hands its staging dir to the backend to sweep."""
+    _queue(fake_client, tmp_path)
+    shared = tmp_path / "shared"
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    w = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        task_timeout_s=60.0,
+        shared_volume_path=str(shared),
+        _watchdog_factory=lambda **kw: _ImmediateWatchdog(fire=False),
+    )
+    await w.run_one()
+
+    assert len(fake_client.completed_tasks) == 1
+    assert (shared / "temp" / "1" / "planes.stl").read_bytes() == b"cut-planes"

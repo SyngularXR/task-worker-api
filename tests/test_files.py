@@ -17,7 +17,11 @@ import pytest
 
 from task_worker_api.context import ClaimedTask, FileContext
 from task_worker_api.enums import TaskStatus, TaskType
-from task_worker_api.files import prepare_inputs, upload_outputs
+from task_worker_api.files import (
+    discard_published_outputs,
+    prepare_inputs,
+    upload_outputs,
+)
 from task_worker_api.testing import FakeBackendClient
 
 
@@ -1450,3 +1454,109 @@ async def test_upload_outputs_no_shared_volume_rejects_escaping_name(tmp_path):
             output_files={"a": "../../etc/passwd"},
             shared_volume_path=None,
         )
+
+
+# ---------------------------------------------------------------------------#
+# discard_published_outputs — cleanup for a task that publishes, then fails
+# ---------------------------------------------------------------------------#
+# upload_outputs only cleans up after its *own* partial failure. A publish
+# that fully succeeds and is followed by a failing attempt (a cancel landing
+# after the last upload, a watchdog deadline, an unencodable result) leaves
+# artifacts the backend never sweeps — it only sweeps for tasks it recorded as
+# complete. This is the reclaim for that case.
+
+
+@pytest.mark.asyncio
+async def test_discard_removes_the_local_staging_dir(tmp_path):
+    shared = tmp_path / "shared"
+    staging = shared / "temp" / "31"
+    staging.mkdir(parents=True)
+    (staging / "a.stl").write_bytes(b"published-a")
+    (staging / "b.stl").write_bytes(b"published-b")
+
+    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+    await discard_published_outputs(
+        task, str(shared), [str(staging / "a.stl")], reason="the task failed",
+    )
+
+    assert not staging.exists()
+    # Only this task's dir goes — the shared volume itself is untouched.
+    assert shared.exists()
+
+
+@pytest.mark.asyncio
+async def test_discard_leaves_other_tasks_staging_dirs_alone(tmp_path):
+    shared = tmp_path / "shared"
+    (shared / "temp" / "31").mkdir(parents=True)
+    sibling = shared / "temp" / "32"
+    sibling.mkdir(parents=True)
+    (sibling / "keep.stl").write_bytes(b"other task's output")
+
+    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+    await discard_published_outputs(task, str(shared), [], reason="failed")
+
+    assert not (shared / "temp" / "31").exists()
+    assert (sibling / "keep.stl").read_bytes() == b"other task's output"
+
+
+@pytest.mark.asyncio
+async def test_discard_is_a_noop_when_no_staging_dir_exists(tmp_path):
+    """A task that failed before publishing anything has nothing to reclaim,
+    and must not turn that into a second failure."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+
+    await discard_published_outputs(task, str(shared), None, reason="failed")
+
+    assert shared.exists()
+
+
+@pytest.mark.asyncio
+async def test_discard_without_shared_volume_is_a_noop(tmp_path):
+    """No shared volume means outputs never left the per-task workdir, which
+    ``Worker._run_one`` removes after every attempt."""
+    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+    await discard_published_outputs(task, None, ["/tmp/whatever"], reason="x")
+
+
+@pytest.mark.asyncio
+async def test_discard_warns_for_remote_uploads_it_cannot_delete(tmp_path, caplog):
+    """Remote mode has no delete route, so the reclaim is a log an operator
+    can reconcile from — not silence."""
+    task = _claimed(31, params={"input_files": {"mesh": "in.ply"}})
+
+    with caplog.at_level("WARNING"):
+        await discard_published_outputs(
+            task, str(tmp_path / "shared"), ["a.stl", "b.stl"],
+            reason="the task is being reported failed",
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "a.stl" in m and "b.stl" in m and "reported failed" in m
+        for m in warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_discard_never_raises_when_cleanup_fails(tmp_path, caplog, monkeypatch):
+    """Contract: this runs while a failure is already being reported, on the
+    path that still owes the backend a terminal status. A cleanup error must
+    not displace the real failure."""
+    shared = tmp_path / "shared"
+    (shared / "temp" / "31").mkdir(parents=True)
+
+    def boom(*a, **kw):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr("task_worker_api.files.shutil.rmtree", boom)
+    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+
+    with caplog.at_level("WARNING"):
+        await discard_published_outputs(task, str(shared), [], reason="failed")
+
+    assert any(
+        "could not discard published outputs" in r.getMessage()
+        for r in caplog.records
+    )

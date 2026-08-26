@@ -18,6 +18,10 @@ from the failed attempt (a half-populated staging dir, or a subset of
 uploaded files on the backend) would otherwise linger as orphans that
 the backend's completed-task sweeper never reaches. Mirrors the
 ``BackendClient.download_file`` partial-file cleanup contract.
+:func:`discard_published_outputs` is that same cleanup as a callable, for
+the other half of the problem: a task whose publish *succeeded* but which
+still ends terminal-failed (a late cancel, a watchdog deadline, an
+unencodable result) — see ``Worker._run_one``.
 
 Every ``input_files`` / ``output_files`` name is checked by
 :func:`_require_safe_filename` before it is joined into a per-task
@@ -536,13 +540,10 @@ async def upload_outputs(
                 )
                 uploaded.append(filename)
         except Exception:
-            if uploaded:
-                log.warning(
-                    "upload_outputs for task %s failed after publishing %d "
-                    "output file(s) (%s); these partial uploads remain on "
-                    "the backend and will be overwritten on retry.",
-                    task.id, len(uploaded), ", ".join(uploaded),
-                )
+            await discard_published_outputs(
+                task, shared_volume_path, uploaded,
+                reason="publishing failed partway through",
+            )
             raise
         return dict(safe_output_files)
 
@@ -570,19 +571,13 @@ async def upload_outputs(
                 )
                 manifest[key] = str(dest)
         except Exception:
-            # A copy failed partway through — the staging dir holds a
-            # subset of the outputs. Remove the whole staging dir so a
-            # retried task starts clean and no orphaned partial artifacts
-            # confuse the backend's sweep. The backend only sweeps staging
-            # dirs for tasks it recorded as complete; a failed task's dir
-            # would otherwise linger indefinitely.
-            #
-            # Off-loop for the same reason the copies themselves are: the dir
-            # can hold GB-scale artifacts (colmap-splat PLYs, Neural-Canvas
-            # splats), and unlinking them synchronously would freeze the
-            # heartbeat and the CancelGuard poll while the failure is being
-            # reported. ``ignore_errors=True`` keeps this non-raising.
-            await asyncio.to_thread(shutil.rmtree, dest_dir, ignore_errors=True)
+            # A copy failed partway through — the staging dir holds a subset
+            # of the outputs. Same cleanup a task that fails *after* a fully
+            # successful publish needs, so both go through one helper.
+            await discard_published_outputs(
+                task, shared_volume_path, list(manifest.values()),
+                reason="publishing failed partway through",
+            )
             raise
         return manifest
 
@@ -590,3 +585,67 @@ async def upload_outputs(
         key: str(src)
         for key, (_, src) in output_sources.items()
     }
+
+
+async def discard_published_outputs(
+    task: ClaimedTask,
+    shared_volume_path: "str | None",
+    published: "list[str] | None" = None,
+    *,
+    reason: str,
+) -> None:
+    """Drop the artifacts published for a task that is ending in failure.
+
+    Publishing succeeding is not the same as the task succeeding. A cancel
+    that lands between the last upload and the ``CancelGuard`` exit, a
+    watchdog deadline that fires while the manifest is being assembled, or a
+    result the wire can't encode all leave a task fully published *and*
+    reported failed. The backend only sweeps a staging dir (or accepts an
+    output manifest) for a task it recorded as **complete**, so those
+    artifacts — GB-scale for colmap-splat PLYs and Neural-Canvas splats —
+    are orphans nothing ever reaches. This is the cleanup for that case, and
+    the one :func:`upload_outputs` uses when publishing itself fails partway.
+
+    Best-effort and non-raising by contract: it runs while a failure is
+    already being reported, on the path that owes the backend a terminal
+    status, so a cleanup error must never displace the real failure or kill
+    the polling loop. ``asyncio.CancelledError`` still propagates — a worker
+    shutting down mid-cleanup should unwind, not be swallowed here.
+
+    ``published`` names the artifacts (filenames in remote mode, staged paths
+    in local mode) and is used for the remote-mode log only. Modes differ in
+    what is actually reclaimable:
+
+    - **Remote** — the worker protocol has no "delete output file" route, so
+      the uploads stay on the backend until a retry overwrites them. Logged
+      at WARNING so an operator can reconcile; nothing else to do.
+    - **Local + ``shared_volume_path``** — the whole ``temp/<task_id>``
+      staging dir goes, so a retried task starts clean. Off the event loop
+      for the same reason the copies are (a synchronous multi-GB unlink
+      freezes the heartbeat and the cancel poll mid-failure-report), and
+      ``ignore_errors=True`` keeps it non-raising.
+    - **Local without a shared volume** — outputs never left the per-task
+      workdir, which ``Worker._run_one`` removes after every attempt.
+    """
+    try:
+        if (task.params or {}).get("input_files"):
+            if published:
+                log.warning(
+                    "task %s: %d output file(s) (%s) remain published on the "
+                    "backend — %s, and the worker protocol has no delete "
+                    "route; a retry of this task will overwrite them.",
+                    task.id, len(published), ", ".join(published), reason,
+                )
+            return
+        if not shared_volume_path:
+            return
+        dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
+        await asyncio.to_thread(shutil.rmtree, dest_dir, ignore_errors=True)
+        log.info(
+            "task %s: discarded the local output staging dir %s — %s",
+            task.id, dest_dir, reason,
+        )
+    except Exception as e:  # noqa: BLE001 — cleanup must not mask the failure
+        log.warning(
+            "task %s: could not discard published outputs: %s", task.id, e,
+        )

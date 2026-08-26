@@ -477,3 +477,52 @@ def test_sync_fail_no_sleep_on_first_success(monkeypatch):
 
     assert calls["n"] == 1
     assert sleeps == []
+
+
+def test_sync_fail_reuses_one_idempotency_key_across_retries(monkeypatch):
+    """The watchdog's urllib PUT carries the same per-report key on every
+    attempt — this path needs it most: a 3s deadline on a worker whose loop
+    is already wedged makes "committed, but the response didn't arrive in
+    time" the expected failure, not an edge case."""
+    from task_worker_api import worker as worker_mod
+
+    keys: list[str] = []
+
+    def fake_urlopen(req, timeout=None):
+        keys.append(req.get_header("Idempotency-key"))
+        if len(keys) < 3:
+            raise OSError("connection refused")
+        return _fake_response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: None)
+
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 691, "worker-1"
+    )
+    sync_fail("timeout: exceeded 1800s")
+
+    assert len(keys) == 3
+    assert all(k and k == keys[0] for k in keys)
+    assert keys[0].startswith("task-691-fail-")
+
+
+def test_sync_fail_key_differs_per_report(monkeypatch):
+    from task_worker_api import worker as worker_mod
+
+    keys: list[str] = []
+
+    def fake_urlopen(req, timeout=None):
+        keys.append(req.get_header("Idempotency-key"))
+        return _fake_response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: None)
+
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 691, "worker-1"
+    )
+    sync_fail("first")
+    sync_fail("second")
+
+    assert len(set(keys)) == 2

@@ -11,6 +11,7 @@ import logging
 import math
 import random
 import time
+import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -74,6 +75,41 @@ _TRANSIENT_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 # Extra transient set + attempt floor for terminal reports (see above).
 _TERMINAL_EXTRA_TRANSIENT = frozenset({500})
 _TERMINAL_MIN_ATTEMPTS = 6
+
+# Header carrying the per-report idempotency token on ``complete``/``fail``.
+#
+# Retrying a terminal report is the one retry in this client that can duplicate
+# a *state transition* rather than just a read. The failures it retries —
+# ReadTimeout, 500, 502/504 — are precisely the ones where the write may have
+# committed and only the response was lost, so the retry is indistinguishable,
+# at the backend, from a second and different terminal report for the same
+# task. Where the backend's transition is a guarded conditional UPDATE the
+# duplicate is absorbed; where ``/complete`` deliberately leaves the row
+# non-terminal and hands finalization to another task (SynPusher-Vue does this
+# for ``segmentation`` and ``generate_synthetic``) there is no status to guard
+# on, and the retry re-runs the finalize dispatch.
+#
+# So every terminal report carries a token that is *stable across its own
+# retries* and unique to the logical report, which is exactly what a backend
+# needs to collapse a retry into the first attempt's outcome. Additive and
+# advisory: a backend that ignores the header behaves as it always has, which
+# is what keeps this SDK independently shippable from the backends it talks to.
+_IDEMPOTENCY_HEADER = "Idempotency-Key"
+
+
+def _terminal_idempotency_key(task_id: int, kind: str) -> str:
+    """One token per logical terminal report — never per attempt.
+
+    Generated at the top of ``complete``/``fail`` and captured by the retry
+    closure, so all of a report's attempts carry the same value; a genuinely
+    new report (a re-claimed task's second attempt, or a ``fail`` after a
+    ``complete``) gets a fresh one. Random rather than derived from
+    ``(task_id, kind)``: those repeat across attempts of a re-queued task,
+    and a key that repeats would have the backend collapse a *new* report
+    into a stale one — the opposite failure, and a much worse one.
+    """
+    return f"task-{task_id}-{kind}-{uuid.uuid4().hex}"
+
 
 # Default ceiling for a single retry delay. Without a cap, backoff grows as
 # ``retry_backoff_s * 2**n`` — unbounded. A worker configured with the
@@ -1000,11 +1036,22 @@ class BackendClient:
         and dropping the report orphans the computed outcome) and the attempt
         budget is raised to at least ``_TERMINAL_MIN_ATTEMPTS`` so the retry
         window (~60s jittered) rides out a backend restart.
+
+        Retrying harder is also what makes a duplicate transition possible, so
+        the report carries an ``Idempotency-Key`` that every attempt of *this*
+        report shares — see :func:`_terminal_idempotency_key`. The key is built
+        here, before the retry closure, which is what makes it per-report
+        rather than per-attempt.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
+            headers={
+                _IDEMPOTENCY_HEADER: _terminal_idempotency_key(
+                    task_id, "complete",
+                ),
+            },
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
         )
@@ -1016,13 +1063,17 @@ class BackendClient:
         a stalled fail call fails fast instead of blocking the polling loop
         for up to 120s (30s × 4 retries) under backend load.
 
-        Retries 500 with a raised attempt budget, same as :meth:`complete` —
-        see there for the rationale.
+        Retries 500 with a raised attempt budget and carries a per-report
+        ``Idempotency-Key``, same as :meth:`complete` — see there for the
+        rationale.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/fail", json={"error": error},
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
+            headers={
+                _IDEMPOTENCY_HEADER: _terminal_idempotency_key(task_id, "fail"),
+            },
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
         )

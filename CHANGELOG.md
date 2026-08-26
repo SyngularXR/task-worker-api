@@ -5,8 +5,49 @@
 **Features:**
 - Add the strict `spatial_recon` task params contract and packaged
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
+- Terminal reports (`complete`/`fail`) now carry an `Idempotency-Key` header so
+  a backend can collapse a retried report into the first attempt's outcome.
+  Retrying a terminal report is the one retry in this client that can duplicate
+  a *state transition* rather than a read, and the failures it retries —
+  `ReadTimeout`, 500, 502/504 — are precisely the ones where the write may have
+  committed with only the response lost, making the retry indistinguishable at
+  the backend from a second, different report. The key is generated once per
+  **logical report** and reused across all of that report's attempts (including
+  the watchdog's synchronous last-resort `fail`, which retries 3× against a 3s
+  deadline on a worker whose loop is already wedged — the likeliest duplicate in
+  the fleet); a genuinely new report, such as a re-claimed task's second attempt
+  or a `fail` after a `complete`, gets a fresh one. Random rather than derived
+  from `(task_id, kind)` deliberately: those repeat across attempts of a
+  re-queued task, and a key that repeats would have a backend collapse a *new*
+  report into a stale one — the opposite failure, and a much worse one.
+  Additive and advisory: a backend that ignores the header behaves exactly as
+  before, which is what keeps this SDK independently shippable from the backends
+  it talks to. Heartbeats and cancel polls are unchanged — safely repeatable,
+  no transition to collapse, so no new wire surface. See
+  `docs/fleet/conventions.md` § 9 for the contract backends implement.
 
 **Fixes:**
+- A task that published its outputs and *then* failed no longer orphans them.
+  `upload_outputs` cleaned up after its own partial failure, but a publish that
+  fully succeeded and was followed by a failing attempt left everything behind:
+  the `CancelGuard` raises `TaskCancelled` when the guarded block *exits*, so a
+  cancel arriving after the last upload fails a fully-published task; a watchdog
+  deadline can fire between the last upload and the terminal report; and an
+  unencodable handler result is rewritten to a failure just before reporting.
+  The backend only sweeps a staging dir (or accepts an output manifest) for a
+  task it recorded as **complete**, so in every one of those cases the artifacts
+  — GB-scale colmap-splat PLYs and Neural-Canvas splats — were orphans nothing
+  ever reached, accumulating on the shared volume for good. `Worker._run_one`
+  now discards them: local mode removes the whole `temp/<task_id>` staging dir,
+  remote mode logs one WARNING naming the files (the worker protocol has no
+  delete route). The discard runs *before* the failure is reported, because
+  reporting it is what makes the task re-queueable and a retry stages into the
+  same `temp/<task_id>` path — a discard racing a re-claim would delete the next
+  attempt's fresh outputs instead of this one's stale ones. Non-raising by
+  contract, so it can never displace the terminal report the worker still owes
+  the task. The cleanup is exported as `discard_published_outputs` for consumers
+  that override `_run_one`; a task that completes still hands its staging dir to
+  the backend untouched.
 - `BackendClient` now validates `retry_backoff_s`, the base of its
   exponential-backoff schedule (`retry_backoff_s * 2**n`) and the last retry
   knob with no guard on it — `max_retries`, `retry_backoff_max_s` and
