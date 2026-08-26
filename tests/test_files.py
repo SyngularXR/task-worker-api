@@ -11,6 +11,7 @@ tmp dirs for the local-mode staging-dir path — no live HTTP needed.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -1582,6 +1583,55 @@ async def test_discard_leaves_a_requeued_attempts_outputs_alone(tmp_path, caplog
 
     assert mine.read_bytes() == b"attempt-2 (regenerated, different bytes)"
     # And the directory the new attempt is staging into survives with it.
+    assert staging.exists()
+    assert any(
+        "no longer the files this attempt published" in r.getMessage()
+        for r in caplog.records if r.levelname == "WARNING"
+    )
+
+
+@pytest.mark.asyncio
+async def test_discard_spares_a_requeued_attempt_that_regenerated_identical_bytes(
+    tmp_path, caplog,
+):
+    """The same guard, in the case size alone cannot see.
+
+    The sibling test above lets a *shorter* record catch the successor: its
+    bytes differ in length. The fleet's normal re-run does not. A re-queued
+    task runs the same deterministic pipeline over the same inputs and
+    regenerates a byte-identical artifact, and the copy overwrites the path
+    in place (``copyfile`` truncates rather than replaces), so the successor's
+    file has this attempt's inode *and* its size. Only the timestamps moved —
+    ``copystat`` stamps the successor's source mtime, and ctime is the
+    kernel's on every write — which is why the record carries them. Reduce
+    :func:`_staged_identity` to ``(st_ino, st_size)`` and this attempt
+    silently deletes a live successor's published output.
+    """
+    shared = tmp_path / "shared"
+    staging = shared / "temp" / "31"
+    staging.mkdir(parents=True)
+    mine = staging / "a.stl"
+    mine.write_bytes(b"deterministic-output")
+    published = _owned(mine)
+    before = mine.stat()
+
+    # The re-queued attempt republishes: same path, same deterministic bytes,
+    # overwritten in place. os.utime models copystat stamping *its* source's
+    # mtime, so the test does not lean on filesystem timestamp granularity.
+    mine.write_bytes(b"deterministic-output")
+    os.utime(mine, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+    after = mine.stat()
+    # The hard case really is the one under test: only timestamps separate them.
+    assert (after.st_ino, after.st_size) == (before.st_ino, before.st_size)
+
+    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+    with caplog.at_level("WARNING"):
+        await discard_published_outputs(
+            task, str(shared), published, reason="the task failed",
+        )
+
+    assert mine.read_bytes() == b"deterministic-output"
     assert staging.exists()
     assert any(
         "no longer the files this attempt published" in r.getMessage()
