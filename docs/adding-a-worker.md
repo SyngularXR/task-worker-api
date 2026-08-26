@@ -280,7 +280,7 @@ A dict for the `PUT /tasks/{id}/complete` payload. Shape is your
 choice, but two conventions:
 
 - **`output_files`**: `{logical_key: filename}`. The SDK publishes
-  these — local mode copies to `shared_volume_path/temp/<task_id>/`; remote
+  these — local mode copies to `shared_volume_path/temp/<task_id>/<attempt>/`; remote
   mode PUTs each via the file endpoints. Each value must be a **plain
   filename** relative to `ctx.files.output_dir` — no directory component, no
   absolute path (`os.path.basename(p)` if your pipeline hands you a full
@@ -417,7 +417,11 @@ The SDK auto-detects based on what's in `task.params`:
 
 The SDK copies the file into `ctx.files.input_dir` so your handler
 can write to it safely without mutating the shared source. Your
-`output_files` get copied back to `shared_volume_path/temp/<task_id>/`.
+`output_files` get copied back to a per-attempt staging directory,
+`shared_volume_path/temp/<task_id>/<attempt>/` — the manifest the SDK
+returns carries the absolute paths, so nothing downstream needs to spell
+them. The per-attempt leaf keeps two attempts of one task off each other's
+files; see [fleet conventions § 10](fleet/conventions.md).
 
 This is the common case for workers running in the same Docker Compose
 or Kubernetes namespace as SynPusher — everyone mounts the same

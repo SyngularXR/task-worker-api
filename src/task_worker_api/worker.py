@@ -43,7 +43,12 @@ from .client import (
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
-from .files import discard_published_outputs, prepare_inputs, upload_outputs
+from .files import (
+    _prune_staging_dirs,
+    discard_published_outputs,
+    prepare_inputs,
+    upload_outputs,
+)
 from .payload_log import PayloadLogger, sanitize_worker_id
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
@@ -926,13 +931,11 @@ class Worker:
 
         outcome: tuple[str, object] = ("fail", "unknown")
         # Filled in place by upload_outputs as each artifact leaves this
-        # attempt's workdir: what was published, and the identity each staged
-        # file had when *this* attempt wrote it. The terminal-report block
-        # below needs both — the first to know there is something to reclaim
-        # if the attempt still fails, the second to prove it is reclaiming its
-        # own outputs rather than a re-queued attempt's. See the discard call
-        # there.
-        published: dict[str, "tuple | None"] = {}
+        # attempt's workdir. The terminal-report block below needs it to know
+        # whether there is anything to reclaim if the attempt still fails, and
+        # in local mode it is also what names the per-attempt staging
+        # directory those outputs went to. See the discard call there.
+        published: dict[str, None] = {}
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1147,24 +1150,24 @@ class Worker:
                     # good.
                     #
                     # Before the report, not after: reporting the failure is
-                    # what makes the task re-queueable, and a retry stages into
-                    # the *same* ``temp/<task_id>`` path, so discarding first
+                    # what makes the task re-queueable, so discarding first
                     # keeps this attempt's cleanup out of the next attempt's
-                    # way. That ordering narrows the race but cannot close it —
-                    # this worker is not the only thing that can hand the task
-                    # to a successor. The watchdog reports a timeout ``fail``
-                    # from its own thread, and the backend's stale-task sweeper
+                    # way. But ordering alone can't be the guarantee — this
+                    # worker is not the only thing that can hand the task to a
+                    # successor. The watchdog reports a timeout ``fail`` from
+                    # its own thread, and the backend's stale-task sweeper
                     # re-queues a task whose heartbeat lapsed without any
                     # report at all; either can land while the event loop is
                     # still wedged here, and by the time it resumes a second
-                    # attempt may already have staged its outputs into that
-                    # shared path. So the discard proves ownership per file
-                    # instead of assuming it, and leaves anything that is no
-                    # longer this attempt's bytes alone (see _reclaim_staged) —
-                    # deleting a live attempt's outputs is a far worse outcome
-                    # than the orphan this cleanup exists to prevent. Never
-                    # raises (see discard_published_outputs), so it cannot
-                    # displace the terminal report this worker still owes.
+                    # attempt may already be staging its own outputs. What
+                    # makes the discard safe regardless is that it only ever
+                    # removes this attempt's own staging directory, a path
+                    # named for this attempt alone that no successor can write
+                    # to (see _attempt_dir) — deleting a live attempt's
+                    # outputs is a far worse outcome than the orphan this
+                    # cleanup exists to prevent. Never raises (see
+                    # discard_published_outputs), so it cannot displace the
+                    # terminal report this worker still owes.
                     if terminal == "fail" and published:
                         await discard_published_outputs(
                             task, self.shared_volume_path, published,
@@ -1227,6 +1230,17 @@ class Worker:
             # mode it delays the next claim. ``ignore_errors=True`` keeps this
             # non-raising, so the semantics are unchanged.
             await asyncio.to_thread(shutil.rmtree, task_dir, ignore_errors=True)
+            # And the shared volume's side of the same tidying. This attempt
+            # staged into its own ``temp/<task_id>/<attempt>/`` directory; the
+            # backend's post-complete mirror moves those artifacts out and
+            # rmdirs ``temp/<task_id>``, but that rmdir is not recursive, so
+            # the emptied attempt dir would keep the task dir alive. rmdir-only
+            # and so incapable of removing an output: a staging dir the mirror
+            # has not emptied (or a failed attempt's, already gone above)
+            # simply stays. Off the loop with the rmtree, for the same reason.
+            await asyncio.to_thread(
+                _prune_staging_dirs, published, self.shared_volume_path, task.id,
+            )
 
 
 async def run_hybrid(
