@@ -7,6 +7,27 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `BackendClient` now validates `retry_backoff_s`, the base of its
+  exponential-backoff schedule (`retry_backoff_s * 2**n`) and the last retry
+  knob with no guard on it — `max_retries`, `retry_backoff_max_s` and
+  `retry_sleep_budget_s` each already fail fast at construction. Every
+  degenerate value disabled or broke the backoff it configures, silently at
+  construction and visibly only once a transient failure landed in production.
+  A **negative** base made every delay negative: `retry_backoff_max_s` only
+  clamps from above and jitter is skipped on a non-positive delay, so
+  `asyncio.sleep` returned immediately on every attempt and the full attempt
+  budget fired back-to-back at an already-failing backend — un-spaced, and
+  across the fleet un-decorrelated, which is the retry storm the schedule
+  exists to prevent. **NaN** failed every comparison, passed the cap untouched
+  and reached `asyncio.sleep`, which rejects it with `ValueError: Invalid
+  delay: NaN`; that is neither a retryable exception nor an `HTTPStatusError`,
+  so it escaped `_retry` mid-loop and replaced the transient error the caller
+  was meant to handle. **inf** clamps to the cap when there is one, but
+  `retry_backoff_max_s=None` is supported, and uncapped the jitter band is
+  `uniform(inf - inf, inf)` — NaN again. A finite base `>= 0` is now required;
+  `0` remains legal (retries with no inter-attempt sleep) and the SDK default
+  of `2.0` is unaffected, so only a consumer already passing a broken value
+  sees the new `ValueError`.
 - `BackendClient`'s per-call deadlines no longer disable timeouts entirely when
   a consumer opts out of one. `file_timeout_s`, `cancel_timeout_s` and
   `lifecycle_timeout_s` each document `None` as "fall back to the client's own
