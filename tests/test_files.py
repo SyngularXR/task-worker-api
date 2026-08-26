@@ -1732,6 +1732,45 @@ async def test_two_attempts_of_one_task_publish_without_colliding(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_staging_survives_a_concurrent_prune_of_the_task_dir(
+    tmp_path, monkeypatch,
+):
+    """A successor's *half-made* staging dir is the last thing a prune reaches.
+
+    ``temp/<task_id>/<attempt>`` takes two ``mkdir`` calls to create, and
+    every attempt of the task rmdirs ``temp/<task_id>`` as soon as it comes
+    up empty — which is exactly the state it is in between those two calls.
+    The hook below rmdirs it right there, reproducing what a predecessor
+    finishing at that instant does on a real shared volume; this attempt must
+    still publish rather than fail on a directory pulled out from under it.
+    """
+    shared = tmp_path / "shared"
+    task = _claimed(81, params={"input_path": "/ignored"})
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"published")
+    file_ctx = _file_ctx(out_dir)  # built before the hook — it mkdirs too
+
+    task_dir = shared / "temp" / str(task.id)
+    real_mkdir, pruned = os.mkdir, []
+
+    def racing_mkdir(path, *args, **kwargs):
+        real_mkdir(path, *args, **kwargs)
+        if Path(path) == task_dir and not pruned:
+            pruned.append(path)
+            os.rmdir(task_dir)
+
+    monkeypatch.setattr(os, "mkdir", racing_mkdir)
+    manifest = await upload_outputs(
+        task, FakeBackendClient(), file_ctx,
+        output_files={"a": "a.stl"}, shared_volume_path=str(shared),
+    )
+
+    assert pruned, "the prune never landed in the window it targets"
+    assert Path(manifest["a"]).read_bytes() == b"published"
+
+
+@pytest.mark.asyncio
 async def test_discard_never_raises_when_cleanup_fails(tmp_path, caplog, monkeypatch):
     """Contract: this runs while a failure is already being reported, on the
     path that still owes the backend a terminal status. A cleanup error must

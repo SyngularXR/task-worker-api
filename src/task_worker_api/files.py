@@ -573,7 +573,7 @@ async def upload_outputs(
         # is what keeps concurrent attempts of one task off each other's
         # files — see :func:`_attempt_dir`.
         dest_dir = _attempt_dir(shared_volume_path, task.id)
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        _mkdir_attempt_dir(dest_dir)
         manifest: dict[str, str] = {}
         try:
             for key, (filename, src) in output_sources.items():
@@ -640,6 +640,30 @@ def _attempt_dir(shared_volume_path: str, task_id: object) -> Path:
     subtree they sweep.
     """
     return Path(shared_volume_path) / "temp" / str(task_id) / uuid.uuid4().hex
+
+
+def _mkdir_attempt_dir(dest_dir: Path) -> None:
+    """Create this attempt's staging dir, against a concurrent prune.
+
+    ``mkdir(parents=True)`` is two syscalls — ``temp/<task_id>``, then the
+    leaf — and every attempt of the task rmdirs ``temp/<task_id>`` the moment
+    it comes up empty (:func:`_prune_staging_dirs`, which
+    ``Worker._run_one`` runs after *every* attempt, success or not). A prune
+    landing in the gap between those two syscalls leaves the leaf's ``mkdir``
+    raising ``FileNotFoundError``, failing an attempt whose outputs were
+    fine. The parent being gone is the whole problem, and ``mkdir`` makes it
+    again, so retrying is the whole repair: one retry, because losing twice
+    means losing the same sub-millisecond window on both tries.
+
+    The other side of that race is already safe — a staging dir that exists
+    holds this attempt's outputs, and the prune is ``rmdir``-only, so it
+    cannot empty one or remove the task dir above it. See
+    :func:`_rmdir_if_empty`.
+    """
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except FileNotFoundError:
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _attempt_dirs(

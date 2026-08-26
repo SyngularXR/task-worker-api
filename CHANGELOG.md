@@ -71,7 +71,13 @@
   reclaim removes the directory whole, with no ownership check and no window to
   lose, and `temp/<task_id>` is only ever `rmdir`-ed — which cannot remove a
   file, or a live successor's staging dir, even during the moment between its
-  `mkdir` and its first copy. Two concurrent attempts of one task now also stop
+  `mkdir` and its first copy. The one window that `rmdir` can still reach is
+  inside the successor's own creation of that dir — `mkdir(parents=True)` makes
+  `temp/<task_id>` and the attempt leaf in two syscalls, and the task dir is
+  empty and prunable between them — so losing it is retried rather than
+  propagated: the pruned parent is simply made again. It could only fail an
+  attempt whose outputs were fine, never publish or delete the wrong bytes.
+  Two concurrent attempts of one task now also stop
   corrupting each other's *successful* publishes, which the shared path allowed
   in its own right. No interface change: `output_files` still carries absolute
   paths and `temp/<task_id>` is still the subtree a backend sweeps. A mirror
