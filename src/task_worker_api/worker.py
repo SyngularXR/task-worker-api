@@ -887,8 +887,10 @@ class Worker:
         report exactly once (first resolver wins).
 
         An attempt that publishes its outputs and *then* fails has its
-        published artifacts discarded before the failure is reported — see
-        the ``discard_published_outputs`` call below.
+        published artifacts discarded before the failure is reported — but
+        only the ones it can still prove are its own, since a re-queued
+        attempt of the same task stages into the same shared path. See the
+        ``discard_published_outputs`` call below.
         """
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
@@ -923,10 +925,14 @@ class Worker:
             wd.start()
 
         outcome: tuple[str, object] = ("fail", "unknown")
-        # Set once upload_outputs has published this attempt's artifacts, so
-        # the terminal-report block below knows there is something to reclaim
-        # if the attempt still ends up failing. See the discard call there.
-        published: Optional[dict[str, str]] = None
+        # Filled in place by upload_outputs as each artifact leaves this
+        # attempt's workdir: what was published, and the identity each staged
+        # file had when *this* attempt wrote it. The terminal-report block
+        # below needs both — the first to know there is something to reclaim
+        # if the attempt still fails, the second to prove it is reclaiming its
+        # own outputs rather than a re-queued attempt's. See the discard call
+        # there.
+        published: dict[str, "tuple | None"] = {}
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1030,8 +1036,8 @@ class Worker:
                         task, target.client, file_ctx, output_files,
                         self.shared_volume_path, cancelled=cancelled,
                         foreign=not target.is_home,
+                        staged=published,
                     )
-                    published = delivered
                     result = {**result, "output_files": delivered}
             outcome = ("complete", result or {})
 
@@ -1142,15 +1148,26 @@ class Worker:
                     #
                     # Before the report, not after: reporting the failure is
                     # what makes the task re-queueable, and a retry stages into
-                    # the *same* ``temp/<task_id>`` path — so a discard racing
-                    # a re-claim would delete the next attempt's fresh outputs
-                    # instead of this one's stale ones. Never raises (see
-                    # discard_published_outputs), so it cannot displace the
-                    # terminal report this worker still owes the task.
+                    # the *same* ``temp/<task_id>`` path, so discarding first
+                    # keeps this attempt's cleanup out of the next attempt's
+                    # way. That ordering narrows the race but cannot close it —
+                    # this worker is not the only thing that can hand the task
+                    # to a successor. The watchdog reports a timeout ``fail``
+                    # from its own thread, and the backend's stale-task sweeper
+                    # re-queues a task whose heartbeat lapsed without any
+                    # report at all; either can land while the event loop is
+                    # still wedged here, and by the time it resumes a second
+                    # attempt may already have staged its outputs into that
+                    # shared path. So the discard proves ownership per file
+                    # instead of assuming it, and leaves anything that is no
+                    # longer this attempt's bytes alone (see _reclaim_staged) —
+                    # deleting a live attempt's outputs is a far worse outcome
+                    # than the orphan this cleanup exists to prevent. Never
+                    # raises (see discard_published_outputs), so it cannot
+                    # displace the terminal report this worker still owes.
                     if terminal == "fail" and published:
                         await discard_published_outputs(
-                            task, self.shared_volume_path,
-                            list(published.values()),
+                            task, self.shared_volume_path, published,
                             reason=(
                                 "the task is being reported failed, so the "
                                 "backend will never sweep them"

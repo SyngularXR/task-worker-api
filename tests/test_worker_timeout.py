@@ -194,6 +194,55 @@ async def test_timeout_after_publish_discards_the_staging_dir(
 
 
 @pytest.mark.asyncio
+async def test_timeout_reclaim_spares_a_requeued_attempts_outputs(
+    make_worker, fake_client, tmp_path, monkeypatch,
+):
+    """The watchdog's report can hand the task to a successor before this
+    attempt's cleanup runs.
+
+    ``_make_sync_fail`` reports the timeout from the watchdog thread while
+    the event loop is still wedged, so the backend can re-queue the task and
+    a second attempt can stage fresh outputs into the same
+    ``temp/<task_id>`` — the shared staging path — before this attempt
+    resumes and reclaims. It must reclaim only what it can still prove is
+    its own.
+    """
+    _queue(fake_client, tmp_path)
+    shared = tmp_path / "shared"
+    staged_path = shared / "temp" / "1" / "planes.stl"
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    import task_worker_api.worker as worker_mod
+    real_discard = worker_mod.discard_published_outputs
+
+    async def discard_after_a_requeued_attempt_republished(*args, **kwargs):
+        # Between this attempt's publish and its cleanup, the re-queued
+        # attempt lands its own outputs at the same path.
+        staged_path.write_bytes(b"second attempt's cut-planes")
+        return await real_discard(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker_mod, "discard_published_outputs",
+        discard_after_a_requeued_attempt_republished,
+    )
+
+    w = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        task_timeout_s=60.0,
+        shared_volume_path=str(shared),
+        _watchdog_factory=lambda **kw: _ImmediateWatchdog(fire=True),
+    )
+    await w.run_one()
+
+    assert "timeout: exceeded 60s" in fake_client.failed_tasks[0]["error"]
+    assert staged_path.read_bytes() == b"second attempt's cut-planes"
+
+
+@pytest.mark.asyncio
 async def test_completed_task_keeps_its_staging_dir(
     make_worker, fake_client, tmp_path,
 ):

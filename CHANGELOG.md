@@ -38,16 +38,29 @@
   task it recorded as **complete**, so in every one of those cases the artifacts
   — GB-scale colmap-splat PLYs and Neural-Canvas splats — were orphans nothing
   ever reached, accumulating on the shared volume for good. `Worker._run_one`
-  now discards them: local mode removes the whole `temp/<task_id>` staging dir,
-  remote mode logs one WARNING naming the files (the worker protocol has no
-  delete route). The discard runs *before* the failure is reported, because
-  reporting it is what makes the task re-queueable and a retry stages into the
-  same `temp/<task_id>` path — a discard racing a re-claim would delete the next
-  attempt's fresh outputs instead of this one's stale ones. Non-raising by
-  contract, so it can never displace the terminal report the worker still owes
-  the task. The cleanup is exported as `discard_published_outputs` for consumers
-  that override `_run_one`; a task that completes still hands its staging dir to
-  the backend untouched.
+  now discards them: local mode unlinks the files this attempt staged under
+  `temp/<task_id>` (and removes the directory if that empties it), remote mode
+  logs one WARNING naming the files (the worker protocol has no delete route).
+  The discard runs *before* the failure is reported, because reporting it is
+  what makes the task re-queueable and a retry stages into the same
+  `temp/<task_id>` path — discarding first keeps this attempt's cleanup out of
+  the next attempt's way. That ordering narrows the race but cannot close it:
+  the worker is not the only thing that can hand the task to a successor — the
+  watchdog reports a timeout `fail` from its own thread while the event loop is
+  still wedged, and the backend's stale-task sweeper re-queues a task whose
+  heartbeat lapsed with no report at all, so by the time the loop resumes a
+  second attempt may already have staged its outputs into that shared path. So
+  the reclaim proves ownership per file rather than assuming it: `upload_outputs`
+  records each staged file's identity (`st_ino`, `st_size`, `st_mtime_ns`,
+  `st_ctime_ns`) as the copy lands, and the discard unlinks only the paths that
+  still match, leaving a newer attempt's outputs — and the directory it is
+  staging into — alone. Deleting a live attempt's outputs is a far worse outcome
+  than the orphan this cleanup exists to prevent. Non-raising by contract, so it
+  can never displace the terminal report the worker still owes the task. The
+  cleanup is exported as `discard_published_outputs` for consumers that override
+  `_run_one` (pass `upload_outputs(..., staged=...)` the dict you hand it — a
+  reclaim with no ownership record removes nothing); a task that completes still
+  hands its staging dir to the backend untouched.
 - `BackendClient` now validates `retry_backoff_s`, the base of its
   exponential-backoff schedule (`retry_backoff_s * 2**n`) and the last retry
   knob with no guard on it — `max_retries`, `retry_backoff_max_s` and

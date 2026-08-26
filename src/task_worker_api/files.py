@@ -21,7 +21,10 @@ the backend's completed-task sweeper never reaches. Mirrors the
 :func:`discard_published_outputs` is that same cleanup as a callable, for
 the other half of the problem: a task whose publish *succeeded* but which
 still ends terminal-failed (a late cancel, a watchdog deadline, an
-unencodable result) — see ``Worker._run_one``.
+unencodable result) — see ``Worker._run_one``. Because every attempt of a
+task stages into the same ``temp/<task_id>``, that cleanup only removes
+files whose identity still matches what the attempt recorded when it
+staged them; see :func:`_reclaim_staged`.
 
 Every ``input_files`` / ``output_files`` name is checked by
 :func:`_require_safe_filename` before it is joined into a per-task
@@ -461,6 +464,7 @@ async def upload_outputs(
     *,
     cancelled: Optional[asyncio.Event] = None,
     foreign: bool = False,
+    staged: "dict[str, tuple | None] | None" = None,
 ) -> dict[str, str]:
     """Publish output_files and return the manifest for task.result.
 
@@ -493,6 +497,15 @@ async def upload_outputs(
     dirs / accepts output manifests for tasks it recorded as complete).
     Mirrors the ``BackendClient.download_file`` partial-file cleanup.
 
+    ``staged``, when supplied, is filled in place as each artifact leaves
+    this attempt's workdir: ``{staged_path: identity}`` in local mode,
+    ``{filename: None}`` in remote mode (nothing local to identify). The
+    identity is recorded *as the copy lands*, not afterwards, because that
+    is what makes it this attempt's — every attempt of a task stages into
+    the same ``temp/<task_id>``, so a re-queued attempt publishing while
+    this one is still uploading would otherwise be recorded as ours and
+    then deleted by our cleanup. See :func:`discard_published_outputs`.
+
     Every filename in ``output_files`` must be a plain basename; one that
     isn't fails the task with a :class:`ProtocolError` naming its key. The
     whole manifest is checked before the first upload or copy, so a bad
@@ -516,6 +529,9 @@ async def upload_outputs(
     remote_mode = foreign or (
         bool(params.get("input_files")) and not params.get("input_path")
     )
+    # Caller-visible when supplied, a throwaway otherwise, so the publish
+    # loops below have one place to record what they published either way.
+    staged = {} if staged is None else staged
 
     if remote_mode:
         # Track filenames as they upload so a failure partway through can
@@ -524,7 +540,6 @@ async def upload_outputs(
         # re-uploading on retry — but we at least surface the partial state
         # in the logs so an operator can reconcile. The exception still
         # propagates so the task is marked failed and retried cleanly.
-        uploaded: list[str] = []
         try:
             for _, (filename, src) in output_sources.items():
                 if cancelled is not None and cancelled.is_set():
@@ -538,10 +553,10 @@ async def upload_outputs(
                         phase="remote output upload",
                     ),
                 )
-                uploaded.append(filename)
+                staged[filename] = None
         except Exception:
             await discard_published_outputs(
-                task, shared_volume_path, uploaded,
+                task, shared_volume_path, staged,
                 reason="publishing failed partway through",
             )
             raise
@@ -570,12 +585,15 @@ async def upload_outputs(
                     ),
                 )
                 manifest[key] = str(dest)
+                staged[str(dest)] = _staged_identity(dest)
         except Exception:
             # A copy failed partway through — the staging dir holds a subset
             # of the outputs. Same cleanup a task that fails *after* a fully
-            # successful publish needs, so both go through one helper.
+            # successful publish needs, so both go through one helper. The
+            # file the failing copy was writing is already gone:
+            # ``_copyfile_async`` removes its own partial destination.
             await discard_published_outputs(
-                task, shared_volume_path, list(manifest.values()),
+                task, shared_volume_path, staged,
                 reason="publishing failed partway through",
             )
             raise
@@ -587,10 +605,84 @@ async def upload_outputs(
     }
 
 
+def _staged_identity(path: "str | Path") -> "tuple | None":
+    """Identity of a staged output file, or ``None`` if it isn't there.
+
+    ``(st_ino, st_size, st_mtime_ns, st_ctime_ns)`` — enough to tell the file
+    *this* attempt staged from one a *different* attempt of the same task
+    wrote at the same path. ``st_ctime`` is what carries it on the fleet's
+    Linux workers: it is the kernel's, and ``copystat`` cannot forge it (the
+    ``utime`` that stamps the source's mtime onto the copy bumps ctime to
+    now), so it moves on every rewrite. ``st_mtime_ns`` and ``st_size`` are
+    in it for the platforms where ctime is creation time rather than change
+    time (Windows) and for the ordinary case where a retry regenerated the
+    artifact from a freshly written source.
+
+    Non-raising: a missing or unreadable path is simply not identifiable,
+    and an unidentifiable path is never removed.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _reclaim_staged(
+    published: "dict[str, tuple | None]", dest_dir: Path,
+) -> "tuple[int, int]":
+    """Unlink the staged files that are still the ones this attempt wrote.
+
+    Returns ``(removed, foreign)``. The staging path is ``temp/<task_id>``,
+    shared by *every* attempt of the task, and a failed attempt has no way
+    to know it is still the current one: the backend may already have
+    re-queued the task (the watchdog's synchronous ``fail`` lands from its
+    own thread while the event loop is wedged; the stale-task sweeper needs
+    no report at all) and a second attempt may already have staged fresh
+    outputs into this very directory. So ownership is proved per file rather
+    than assumed: a path whose identity no longer matches the one recorded
+    when this attempt staged it belongs to that newer attempt and is left
+    strictly alone, and the directory itself only goes when it ends up
+    empty. Deleting a live attempt's outputs is far worse than leaving an
+    orphan behind, which is the failure this cleanup exists to log.
+
+    Runs in a worker thread: unlinking GB-scale artifacts (colmap-splat
+    PLYs, Neural-Canvas splats) is exactly the blocking filesystem work that
+    would otherwise freeze the heartbeat and the cancel poll in the middle
+    of reporting a failure.
+    """
+    removed = foreign = 0
+    for path, identity in published.items():
+        if Path(path).parent != dest_dir:
+            # Defensive: this function unlinks, and the only paths it may
+            # unlink are the ones this task staged into its own staging dir.
+            continue
+        current = _staged_identity(path)
+        if current is None:
+            continue  # already gone — nothing to reclaim
+        if identity is None or current != identity:
+            foreign += 1
+            continue
+        try:
+            os.unlink(path)
+        except OSError as e:
+            log.warning("could not discard staged output %s: %s", path, e)
+        else:
+            removed += 1
+    try:
+        os.rmdir(dest_dir)
+    except OSError:
+        # Missing already, or still holding files this attempt did not
+        # publish — a concurrent attempt's outputs, or a dead attempt's
+        # leftovers. Both are someone else's to remove.
+        pass
+    return removed, foreign
+
+
 async def discard_published_outputs(
     task: ClaimedTask,
     shared_volume_path: "str | None",
-    published: "list[str] | None" = None,
+    published: "dict[str, tuple | None] | None" = None,
     *,
     reason: str,
 ) -> None:
@@ -612,18 +704,22 @@ async def discard_published_outputs(
     the polling loop. ``asyncio.CancelledError`` still propagates — a worker
     shutting down mid-cleanup should unwind, not be swallowed here.
 
-    ``published`` names the artifacts (filenames in remote mode, staged paths
-    in local mode) and is used for the remote-mode log only. Modes differ in
-    what is actually reclaimable:
+    ``published`` is the ownership record ``upload_outputs`` filled as this
+    attempt published: ``{artifact: identity}``, keyed by filename in remote
+    mode and by staged path in local mode. Modes differ in what is actually
+    reclaimable:
 
     - **Remote** — the worker protocol has no "delete output file" route, so
       the uploads stay on the backend until a retry overwrites them. Logged
       at WARNING so an operator can reconcile; nothing else to do.
-    - **Local + ``shared_volume_path``** — the whole ``temp/<task_id>``
-      staging dir goes, so a retried task starts clean. Off the event loop
-      for the same reason the copies are (a synchronous multi-GB unlink
-      freezes the heartbeat and the cancel poll mid-failure-report), and
-      ``ignore_errors=True`` keeps it non-raising.
+    - **Local + ``shared_volume_path``** — the staged files whose identity
+      still matches the record are unlinked, and ``temp/<task_id>`` goes if
+      that empties it, so a retried task starts clean. Only those: the
+      staging path is shared by every attempt of the task, and this cleanup
+      can run after the backend has already re-queued it (see
+      :func:`_reclaim_staged`). Off the event loop for the same reason the
+      copies are — a synchronous multi-GB unlink freezes the heartbeat and
+      the cancel poll mid-failure-report.
     - **Local without a shared volume** — outputs never left the per-task
       workdir, which ``Worker._run_one`` removes after every attempt.
     """
@@ -640,11 +736,21 @@ async def discard_published_outputs(
         if not shared_volume_path:
             return
         dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
-        await asyncio.to_thread(shutil.rmtree, dest_dir, ignore_errors=True)
-        log.info(
-            "task %s: discarded the local output staging dir %s — %s",
-            task.id, dest_dir, reason,
+        removed, foreign = await asyncio.to_thread(
+            _reclaim_staged, dict(published or {}), dest_dir,
         )
+        if foreign:
+            log.warning(
+                "task %s: left %d staged output file(s) under %s in place — "
+                "they are no longer the files this attempt published, so a "
+                "later attempt of this task owns them now.",
+                task.id, foreign, dest_dir,
+            )
+        if removed:
+            log.info(
+                "task %s: discarded %d staged output file(s) from %s — %s",
+                task.id, removed, dest_dir, reason,
+            )
     except Exception as e:  # noqa: BLE001 — cleanup must not mask the failure
         log.warning(
             "task %s: could not discard published outputs: %s", task.id, e,

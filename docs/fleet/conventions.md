@@ -119,9 +119,13 @@ Publishing succeeding is not the same as the task succeeding. `upload_outputs` c
 
 Since the backend only sweeps a staging dir (or accepts an output manifest) for a task it recorded as **complete**, those artifacts would be permanent orphans. `Worker._run_one` therefore discards them *before* reporting the failure:
 
-- **Local mode** — the whole `${SHARED_DATA_PATH}/temp/<task_id>/` staging dir is removed, so a retried task starts clean.
+- **Local mode** — the files this attempt staged into `${SHARED_DATA_PATH}/temp/<task_id>/` are unlinked, and the directory goes if that empties it, so a retried task starts clean.
 - **Remote mode** — the worker protocol has no delete route, so the uploads stay until a retry overwrites them; the SDK logs one WARNING naming the files for operator reconciliation.
 
-Cleanup runs before the report because reporting the failure is what makes the task re-queueable, and a retry stages into the *same* `temp/<task_id>` path — a discard racing a re-claim would delete the next attempt's fresh outputs.
+Cleanup runs before the report because reporting the failure is what makes the task re-queueable, and a retry stages into the *same* `temp/<task_id>` path — so discarding first keeps this attempt's cleanup out of the next attempt's way.
+
+**Ordering alone is not enough, so the local-mode reclaim proves ownership per file.** This worker is not the only thing that can hand the task to a successor: the watchdog reports a timeout `fail` from its own thread while the event loop is wedged, and the backend's stale-task sweeper re-queues a task whose heartbeat lapsed with no report at all. Either way a second attempt can already have staged its outputs into that shared directory. `upload_outputs` therefore records each staged file's identity (`st_ino`, `st_size`, `st_mtime_ns`, `st_ctime_ns`) *as the copy lands*, and the reclaim unlinks only the paths that still match, leaving anything a newer attempt owns in place (one WARNING per reclaim naming the count). Deleting a live attempt's outputs is a far worse outcome than the orphan this cleanup exists to prevent.
+
+**If you override `Worker._run_one`,** pass a dict as `upload_outputs(..., staged=...)` and hand that same dict to `discard_published_outputs` — a reclaim with no ownership record removes nothing.
 
 `discard_published_outputs` is exported for consumers that override `Worker._run_one`. Like the payload logger (§8) it never raises: it runs while a failure is already being reported, so a cleanup error must not displace the real one.
