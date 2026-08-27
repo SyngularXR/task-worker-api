@@ -632,7 +632,8 @@ async def _stage_output(
     artifact. The rename makes the published name change atomically from one
     complete file to another, so concurrent attempts can only be last-writer
     wins, never interleaved. It costs nothing: same directory, so it is a
-    metadata operation, not a second copy.
+    metadata operation, not a second copy — which is why it runs inline on
+    the event loop rather than in a thread that a cancel could not stop.
 
     The scratch name is this call's alone, which is what makes removing it on
     failure safe — it is the only name in the staging dir no other attempt
@@ -663,16 +664,32 @@ async def _stage_output(
             await _copyfile_async(
                 src, part, cancelled=cancelled, cancel_message=cancel_message,
             )
-        await asyncio.to_thread(os.replace, part, dest)
+        # Synchronous on purpose — the one filesystem call on this path that
+        # does not go through ``asyncio.to_thread``. ``to_thread`` is not
+        # cancellable: cancelling the await abandons the thread, which goes
+        # on to perform the rename anyway. So a task cancel landing there
+        # published the artifact *after* ``_stage_output`` raised —
+        # ``upload_outputs`` never recorded it in ``staged``, leaving a
+        # GB-scale file on the shared volume that the orphan warning could
+        # not name, while the cleanup below unlinked ``part`` out from under
+        # the rename still using it. Run inline there is no suspension point
+        # between the rename and the caller's ``staged.append``, so a
+        # publish is either not done or done and recorded. Affordable
+        # because ``part`` and ``dest`` share a directory: this is a
+        # metadata operation, not the copy, which stays off the loop above.
+        os.replace(part, dest)
     except BaseException:
         # ``_copyfile_async`` already removes a destination it opened; this is
         # for the paths it doesn't cover (a failed ``os.replace``, a cancel
         # between the two). Scratch files are the one thing in the staging
         # dir no consumer will ever pick up, so leaving one is worse than
         # useless — it keeps the dir non-empty and defeats the backend's
-        # rmdir. Non-raising: a real exception is already propagating.
+        # rmdir. Non-raising: a real exception is already propagating — and
+        # synchronous for the same reason as the rename, since an ``await``
+        # while unwinding a cancel is a second cancellation point, and one
+        # that fires here strands the scratch file for good.
         try:
-            await asyncio.to_thread(os.unlink, part)
+            os.unlink(part)
         except OSError:
             pass
         raise

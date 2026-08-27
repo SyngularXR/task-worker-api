@@ -71,6 +71,21 @@
   `temp/<task_id>/`, `output_files` still carries their absolute paths, and a
   consumer that moves the artifacts out and `rmdir`s `temp/<task_id>`
   non-recursively still finds it empty.
+- The rename that publishes a local-mode output no longer runs in
+  `asyncio.to_thread`. `to_thread` cannot be cancelled — cancelling the await
+  abandons the worker thread, which performs the rename anyway — so a task
+  cancel (worker shutdown, `run_hybrid` tearing the sibling down) landing on
+  that await published the artifact *after* `_stage_output` had already
+  raised. `upload_outputs` never reached its `staged.append`, so the very
+  orphan warning above could not name the GB-scale file the attempt had just
+  left on the shared volume, and the failure cleanup unlinked the `.part`
+  scratch file out from under the rename still using it. The rename is a
+  same-directory metadata operation, not a copy, so it now runs inline: it
+  either has not happened or has happened and been recorded, with no
+  suspension point in between. The failure path's `unlink` is inline for the
+  same reason — an `await` while unwinding a cancel is a second cancellation
+  point, and one that fires there strands the scratch file for good. The
+  multi-GB copy still runs off the event loop, unchanged.
 - A local-mode publish no longer fails when the staging dir is removed out from
   under it. `temp/<task_id>` is the backend consumer's to sweep and it `rmdir`s
   the directory the moment it comes up empty — which is exactly what it is

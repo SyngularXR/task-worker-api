@@ -140,6 +140,8 @@ The other half of the same problem: two attempts of one task publishing at once.
 
 The scratch name is generated per copy, so it is the one thing in that directory provably this attempt's: a failed or cancelled copy removes it and nothing else. Leaving it would keep the staging dir non-empty and defeat the consumer's `rmdir`.
 
+The rename itself runs **inline on the event loop**, unlike the copy that precedes it. `asyncio.to_thread` cannot be cancelled: cancelling the await abandons the thread, which completes the rename regardless — publishing an artifact the caller then never records in `staged`, which is precisely the orphan the warning above exists to name. A same-directory rename is a metadata operation, so running it inline costs nothing and makes the publish and its record atomic with respect to cancellation. If you write your own staging path, keep that property: the copy belongs in a thread, the commit does not.
+
 **Nothing about the on-volume layout has changed since v0.4.1.** Outputs sit directly under `temp/<task_id>/`, `output_files` carries their absolute paths, and a consumer that moves the artifacts out and then `rmdir`s `temp/<task_id>` non-recursively still finds it empty. Scratch files exist only for the duration of a copy.
 
 **If you override `Worker._run_one`,** pass a list as `upload_outputs(..., staged=...)`; it is appended to as each artifact is published, and it is what you need to log the orphans if the attempt ends failed. Do that whenever the attempt ends failed, not only when your loop wins the terminal report. Like the payload logger (§8) the SDK's warning helper never raises: it runs while a failure is already being reported, so it must not displace the real one. Don't replace it with a delete — see above.

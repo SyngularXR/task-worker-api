@@ -1711,6 +1711,66 @@ async def test_upload_outputs_records_what_it_staged(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_cancel_at_the_publish_rename_still_records_the_artifact(
+    tmp_path, monkeypatch,
+):
+    """Regression: task cancellation must not slip between the rename that
+    publishes an artifact and the record of it.
+
+    The rename ran in ``asyncio.to_thread``, and cancelling that await
+    abandons the thread instead of stopping it — so a cancel landing there
+    published the file anyway, ``upload_outputs`` raised before appending it
+    to ``staged``, and the caller's orphan warning could not name the
+    GB-scale artifact the attempt had just left on the shared volume. The
+    cleanup then unlinked the scratch file the abandoned rename was still
+    using. The rename is a same-directory metadata operation, so it runs
+    inline: once the copy is done, publishing commits and is recorded.
+    """
+    import asyncio
+    from task_worker_api import files as files_mod
+
+    real_copy = files_mod._copyfile_async
+
+    async def copy_then_cancel(*args, **kwargs):
+        # Cancel at the copy/rename boundary — the bytes are written under
+        # the scratch name, the artifact is not published yet. Delivered at
+        # the next suspension point, whichever one that turns out to be.
+        await real_copy(*args, **kwargs)
+        asyncio.current_task().cancel()
+
+    monkeypatch.setattr(files_mod, "_copyfile_async", copy_then_cancel)
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.ply").write_bytes(b"published")
+
+    task = _claimed(72, params={"input_path": "/ignored"})
+    staged: list[str] = []
+
+    publishing = asyncio.create_task(
+        upload_outputs(
+            task, FakeBackendClient(), _file_ctx(out_dir),
+            output_files={"a": "a.ply"}, shared_volume_path=str(shared),
+            staged=staged,
+        )
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await publishing
+
+    dest = shared / "temp" / "72" / "a.ply"
+    assert dest.read_bytes() == b"published"
+    assert staged == [str(dest)], (
+        "a rename that published the artifact must be recorded before the "
+        "cancel propagates, or the orphan warning cannot name it"
+    )
+    assert os.listdir(shared / "temp" / "72") == ["a.ply"], (
+        "the scratch file must be gone, not unlinked out from under a "
+        "rename that is still using it"
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_successor_publishing_mid_warning_keeps_its_output(tmp_path):
     """Regression: a stale attempt's failure handling must never remove a
     successor's published path.
