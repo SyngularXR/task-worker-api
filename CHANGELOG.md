@@ -44,13 +44,18 @@
   The discard runs *before* the failure is reported, because reporting it is
   what makes the task re-queueable and a retry stages into the same
   `temp/<task_id>` path — discarding first keeps this attempt's cleanup out of
-  the next attempt's way. That ordering narrows the race but cannot close it:
-  the worker is not the only thing that can hand the task to a successor — the
-  watchdog reports a timeout `fail` from its own thread while the event loop is
-  still wedged, and the backend's stale-task sweeper re-queues a task whose
-  heartbeat lapsed with no report at all, so by the time the loop resumes a
-  second attempt may already have staged its outputs into that shared path. So
-  the reclaim proves ownership per file rather than assuming it: `upload_outputs`
+  the next attempt's way. It is not gated on *winning* that report, though: the
+  watchdog can claim the terminal report and send the timeout itself, and the
+  resumed loop is still the only thing that knows what this attempt staged, so
+  hanging the cleanup off the exactly-once report gate would leave exactly
+  these orphans behind whenever the deadline beat the loop to the report. That
+  ordering narrows the race but cannot close it: the worker is not the only
+  thing that can hand the task to a successor — that same watchdog `fail` goes
+  out while the event loop is still wedged, and the backend's stale-task
+  sweeper re-queues a task whose heartbeat lapsed with no report at all, so by
+  the time the loop resumes a second attempt may already have staged its
+  outputs into that shared path. So the reclaim proves ownership per file
+  rather than assuming it: `upload_outputs`
   records each staged file's identity (`st_ino`, `st_size`, `st_mtime_ns`,
   `st_ctime_ns`) as the copy lands, and the discard unlinks only the paths that
   still match, leaving a newer attempt's outputs — and the directory it is

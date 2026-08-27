@@ -887,9 +887,11 @@ class Worker:
         report exactly once (first resolver wins).
 
         An attempt that publishes its outputs and *then* fails has its
-        published artifacts discarded before the failure is reported — but
-        only the ones it can still prove are its own, since a re-queued
-        attempt of the same task stages into the same shared path. See the
+        published artifacts discarded — but only the ones it can still prove
+        are its own, since a re-queued attempt of the same task stages into
+        the same shared path. That cleanup runs whether this loop or the
+        watchdog won the terminal report: losing the race decides who reports,
+        not whether this attempt's orphans get reclaimed. See the
         ``discard_published_outputs`` call below.
         """
         task_dir = self.work_dir / f"task_{task.id}"
@@ -1066,113 +1068,132 @@ class Worker:
                 # Single terminal report. If the watchdog fired, the deadline
                 # won; otherwise report the handler outcome. The guard makes
                 # this exactly-once even against the watchdog's hard-exit path.
-                if guard.claim():
-                    # Determine the terminal method + payload up front so the
-                    # except handler can log *which* report failed and on which
-                    # task — a bare ``except: pass`` here was silently swallowing
-                    # failures of the complete()/fail() call itself. BackendClient
-                    # already retries transient transport/5xx errors inside
-                    # _retry, so an exception reaching this block means retries
-                    # were exhausted (backend down longer than the retry window)
-                    # or a non-transient error surfaced. Either way the backend
-                    # never learns the task's terminal status: a completed task
-                    # stays "in_progress" until the sweeper marks it stale, and
-                    # the operator had zero visibility. Surface it at ERROR so
-                    # it's not invisible, while keeping the non-raising contract
-                    # (the polling loop must keep running other tasks).
-                    # ``terminal`` mirrors the branch the try-block will take, so
-                    # the except handler can name the call that failed even when
-                    # the exception fires before the method returns. ``fired`` wins
-                    # over outcome because a timeout overrides a late completion.
-                    #
-                    # A result the wire can't encode is a terminal report that
-                    # can never land: complete() raises while *building* the
-                    # request, so nothing is ever sent, and the task orphans in
-                    # in_progress until the backend's sweeper reclaims and
-                    # *recomputes* it — hours of GPU work redone over a stray
-                    # numpy scalar, Path or datetime left in a handler's dict.
-                    # Catch it here and report the failure instead, so the task
-                    # lands terminal carrying the real cause.
-                    #
-                    # Deciding this *before* the request is what makes it safe,
-                    # and is why there is no post-hoc "complete() raised, so
-                    # fail() it" fallback in the handler below. Once a complete
-                    # request has gone out, its failure is ambiguous — the write
-                    # may have committed with only the response lost — and no
-                    # amount of reading the task back closes that window: the
-                    # write can still commit (or a cancel/requeue land) between
-                    # the read and the fail(), which would overwrite a real
-                    # outcome with a bogus failure. Ruling that out needs an
-                    # atomic conditional transition (CAS) or a backend
-                    # idempotency contract this SDK ships independently of and
-                    # can't verify at runtime. Here there is nothing to race:
-                    # no complete request was ever transmitted, and the fail()
-                    # below is the same single terminal report this worker
-                    # already owed the task.
-                    if not fired and outcome[0] == "complete":
-                        encode_error = _result_encode_error(outcome[1])
-                        if encode_error is not None:
-                            log.error(
-                                "task %s: handler result is not JSON-"
-                                "serializable (%s); reporting the task failed "
-                                "instead — complete() could never have been "
-                                "sent, and leaving it unreported orphans the "
-                                "task in_progress",
-                                task.id, encode_error,
-                            )
-                            outcome = (
-                                "fail",
-                                "handler succeeded but its result could not be "
-                                f"encoded for the complete report: {encode_error}",
-                            )
-                    if fired:
-                        terminal = "fail"
-                    elif outcome[0] == "complete":
-                        terminal = "complete"
-                    else:
-                        terminal = "fail"
-                    # Partial-failure cleanup. Publishing succeeding does not
-                    # mean the task succeeded: upload_outputs can deliver every
-                    # file and the attempt still land here as a failure — the
-                    # CancelGuard raises TaskCancelled when the guarded block
-                    # *exits*, so a cancel arriving after the last upload fails
-                    # a fully-published task; the watchdog deadline can fire
-                    # between the last upload and this block; and an
-                    # unencodable result is rewritten to a failure just above.
-                    # upload_outputs only cleans up after its *own* partial
-                    # failure, so those artifacts survive — and the backend
-                    # only sweeps a staging dir for a task it recorded as
-                    # complete, leaving GB-scale colmap-splat PLYs and
-                    # Neural-Canvas splats orphaned on the shared volume for
-                    # good.
-                    #
-                    # Before the report, not after: reporting the failure is
-                    # what makes the task re-queueable, and a retry stages into
-                    # the *same* ``temp/<task_id>`` path, so discarding first
-                    # keeps this attempt's cleanup out of the next attempt's
-                    # way. That ordering narrows the race but cannot close it —
-                    # this worker is not the only thing that can hand the task
-                    # to a successor. The watchdog reports a timeout ``fail``
-                    # from its own thread, and the backend's stale-task sweeper
-                    # re-queues a task whose heartbeat lapsed without any
-                    # report at all; either can land while the event loop is
-                    # still wedged here, and by the time it resumes a second
-                    # attempt may already have staged its outputs into that
-                    # shared path. So the discard proves ownership per file
-                    # instead of assuming it, and leaves anything that is no
-                    # longer this attempt's bytes alone (see _reclaim_staged) —
-                    # deleting a live attempt's outputs is a far worse outcome
-                    # than the orphan this cleanup exists to prevent. Never
-                    # raises (see discard_published_outputs), so it cannot
-                    # displace the terminal report this worker still owes.
-                    if terminal == "fail" and published:
-                        await discard_published_outputs(
-                            task, self.shared_volume_path, published,
-                            reason=(
-                                "the task is being reported failed, so the "
-                                "backend will never sweep them"
-                            ),
+                # Claimed up front rather than used as the ``if`` of this
+                # whole block: losing the claim settles who *reports*, not what
+                # this attempt still owes the shared volume. The watchdog's
+                # phase-3 path claims the guard and reports the timeout from
+                # its own thread while this loop is wedged; when the loop
+                # resumes it must still discard the outputs it published, or
+                # the exact post-publish orphan this cleanup exists to prevent
+                # survives whenever the deadline beats the loop to the report.
+                # So only the report itself hangs off ``won``.
+                won = guard.claim()
+
+                # Determine the terminal method + payload up front so the
+                # except handler can log *which* report failed and on which
+                # task — a bare ``except: pass`` here was silently swallowing
+                # failures of the complete()/fail() call itself. BackendClient
+                # already retries transient transport/5xx errors inside
+                # _retry, so an exception reaching this block means retries
+                # were exhausted (backend down longer than the retry window)
+                # or a non-transient error surfaced. Either way the backend
+                # never learns the task's terminal status: a completed task
+                # stays "in_progress" until the sweeper marks it stale, and
+                # the operator had zero visibility. Surface it at ERROR so
+                # it's not invisible, while keeping the non-raising contract
+                # (the polling loop must keep running other tasks).
+                # ``terminal`` mirrors the branch the try-block will take, so
+                # the except handler can name the call that failed even when
+                # the exception fires before the method returns. ``fired`` wins
+                # over outcome because a timeout overrides a late completion.
+                #
+                # A result the wire can't encode is a terminal report that
+                # can never land: complete() raises while *building* the
+                # request, so nothing is ever sent, and the task orphans in
+                # in_progress until the backend's sweeper reclaims and
+                # *recomputes* it — hours of GPU work redone over a stray
+                # numpy scalar, Path or datetime left in a handler's dict.
+                # Catch it here and report the failure instead, so the task
+                # lands terminal carrying the real cause.
+                #
+                # Deciding this *before* the request is what makes it safe,
+                # and is why there is no post-hoc "complete() raised, so
+                # fail() it" fallback in the handler below. Once a complete
+                # request has gone out, its failure is ambiguous — the write
+                # may have committed with only the response lost — and no
+                # amount of reading the task back closes that window: the
+                # write can still commit (or a cancel/requeue land) between
+                # the read and the fail(), which would overwrite a real
+                # outcome with a bogus failure. Ruling that out needs an
+                # atomic conditional transition (CAS) or a backend
+                # idempotency contract this SDK ships independently of and
+                # can't verify at runtime. Here there is nothing to race:
+                # no complete request was ever transmitted, and the fail()
+                # below is the same single terminal report this worker
+                # already owed the task.
+                if won and not fired and outcome[0] == "complete":
+                    encode_error = _result_encode_error(outcome[1])
+                    if encode_error is not None:
+                        log.error(
+                            "task %s: handler result is not JSON-"
+                            "serializable (%s); reporting the task failed "
+                            "instead — complete() could never have been "
+                            "sent, and leaving it unreported orphans the "
+                            "task in_progress",
+                            task.id, encode_error,
                         )
+                        outcome = (
+                            "fail",
+                            "handler succeeded but its result could not be "
+                            f"encoded for the complete report: {encode_error}",
+                        )
+                # The status this task *ends* in, not merely the one this
+                # path reports: a lost claim means the watchdog already sent a
+                # timeout ``fail``, so the attempt is failed either way and the
+                # cleanup below has to run. Spelling out ``won`` here keeps
+                # that correct by construction instead of leaning on the
+                # watchdog having set ``fired`` before it claimed.
+                if won and not fired and outcome[0] == "complete":
+                    terminal = "complete"
+                else:
+                    terminal = "fail"
+                # Partial-failure cleanup. Publishing succeeding does not
+                # mean the task succeeded: upload_outputs can deliver every
+                # file and the attempt still land here as a failure — the
+                # CancelGuard raises TaskCancelled when the guarded block
+                # *exits*, so a cancel arriving after the last upload fails
+                # a fully-published task; the watchdog deadline can fire
+                # between the last upload and this block; and an
+                # unencodable result is rewritten to a failure just above.
+                # upload_outputs only cleans up after its *own* partial
+                # failure, so those artifacts survive — and the backend
+                # only sweeps a staging dir for a task it recorded as
+                # complete, leaving GB-scale colmap-splat PLYs and
+                # Neural-Canvas splats orphaned on the shared volume for
+                # good.
+                #
+                # Before the report, not after: reporting the failure is
+                # what makes the task re-queueable, and a retry stages into
+                # the *same* ``temp/<task_id>`` path, so discarding first
+                # keeps this attempt's cleanup out of the next attempt's
+                # way. That ordering narrows the race but cannot close it —
+                # this worker is not the only thing that can hand the task
+                # to a successor. The watchdog reports a timeout ``fail``
+                # from its own thread, and the backend's stale-task sweeper
+                # re-queues a task whose heartbeat lapsed without any
+                # report at all; either can land while the event loop is
+                # still wedged here, and by the time it resumes a second
+                # attempt may already have staged its outputs into that
+                # shared path. So the discard proves ownership per file
+                # instead of assuming it, and leaves anything that is no
+                # longer this attempt's bytes alone (see _reclaim_staged) —
+                # deleting a live attempt's outputs is a far worse outcome
+                # than the orphan this cleanup exists to prevent. When ``won``
+                # is false that hand-off has already happened — the watchdog
+                # sent the failure while this loop was wedged — so the cleanup
+                # runs strictly after it, and the same per-file ownership proof
+                # is what makes it safe there too. Never raises (see
+                # discard_published_outputs), so it cannot displace the
+                # terminal report this worker still owes.
+                if terminal == "fail" and published:
+                    await discard_published_outputs(
+                        task, self.shared_volume_path, published,
+                        reason=(
+                            "the task is being reported failed, so the "
+                            "backend will never sweep them"
+                        ),
+                    )
+                if won:
                     try:
                         if fired:
                             await target.client.fail(

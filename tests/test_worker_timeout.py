@@ -266,3 +266,73 @@ async def test_completed_task_keeps_its_staging_dir(
 
     assert len(fake_client.completed_tasks) == 1
     assert (shared / "temp" / "1" / "planes.stl").read_bytes() == b"cut-planes"
+
+
+class _WedgedLoopWatchdog:
+    """Test double for the watchdog's phase-3 in-process wedge.
+
+    Phases 1 and 2 kill the task's children; when neither frees the event
+    loop, the watchdog claims the terminal report and sends the timeout
+    ``fail`` itself from its own thread (``TaskWatchdog._run``). The loop can
+    unwedge afterwards — the hard exit is not instantaneous, and consumers can
+    inject a non-exiting ``on_hard_exit`` — and when it does it finds the
+    report already gone. Claiming in ``stop()`` puts the claim exactly where
+    the real one lands relative to the loop: before ``_run_one`` reaches its
+    terminal block.
+    """
+
+    def __init__(self, *, guard, **_kw):
+        self._guard = guard
+        self.fired = False
+        self.won_report = False
+
+    def start(self):
+        pass
+
+    def stop(self) -> bool:
+        self.fired = True
+        self.won_report = self._guard.claim()
+        return self.fired
+
+
+@pytest.mark.asyncio
+async def test_watchdog_winning_the_report_still_discards_published_outputs(
+    make_worker, fake_client, tmp_path,
+):
+    """Cleanup must not hang off winning the terminal report.
+
+    The watchdog reports the timeout while the loop is wedged, so the resumed
+    ``_run_one`` never sends a report of its own — but it is still the only
+    thing that knows what this attempt staged onto the shared volume, and the
+    backend only sweeps a staging dir for a task it recorded as *complete*.
+    Skipping the discard here leaves exactly the post-publish orphan the
+    cleanup exists to prevent.
+    """
+    _queue(fake_client, tmp_path)
+    shared = tmp_path / "shared"
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    built = []
+
+    def factory(**kw):
+        built.append(_WedgedLoopWatchdog(**kw))
+        return built[-1]
+
+    w = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        task_timeout_s=60.0,
+        shared_volume_path=str(shared),
+        _watchdog_factory=factory,
+    )
+    await w.run_one()
+
+    # The watchdog owned the report: the loop sent neither terminal status.
+    assert built[0].won_report is True
+    assert fake_client.completed_tasks == []
+    assert fake_client.failed_tasks == []
+    # ...and the outputs it published are still reclaimed.
+    assert not (shared / "temp" / "1").exists()
