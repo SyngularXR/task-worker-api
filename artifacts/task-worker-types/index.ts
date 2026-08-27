@@ -104,6 +104,8 @@ export interface ModelInitializingParams {
   input_path: string;
   /** Filename stem for outputs. */
   base_name: string;
+  /** Remote-worker inputs: {filename: filename}, served via GET /tasks/{id}/files/{filename}. Emitted alongside input_path when the producing box enables cross-box files; home workers keep the zero-copy input_path, foreign workers use only this. */
+  input_files?: Record<string, string>;
 }
 
 /**
@@ -116,6 +118,8 @@ export interface CinematicBakingParams {
   input_path: string;
   /** Filename stem for outputs; _finalized.glb appended. */
   base_name: string;
+  /** Remote-worker inputs: {filename: filename}, served via GET /tasks/{id}/files/{filename}. Emitted alongside input_path when the producing box enables cross-box files; home workers keep the zero-copy input_path, foreign workers use only this. */
+  input_files?: Record<string, string>;
   /** Optional worker material registry id. Omit for the deployment's Current/default material. */
   material_id?: string;
   /** Optional Bioform Pattern Scale override; requires material_id and must be supported by that material. */

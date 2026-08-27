@@ -19,12 +19,14 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 import tempfile
 import time
 import traceback
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -56,6 +58,91 @@ HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
 # ~an order of magnitude, short enough that a recovered backend is picked up
 # within a minute.
 _DEFAULT_CLAIM_BACKOFF_MAX_S = _DEFAULT_BACKOFF_MAX_S
+
+#: Cap on how many poll cycles a connect-failing foreign target is skipped.
+#: 32 cycles at the default 5s poll interval ≈ 2.7 min between attempts —
+#: enough to stop a dead target from consuming a retry burst every cycle,
+#: short enough that a recovered box is picked back up within minutes.
+_FOREIGN_BACKOFF_MAX_CYCLES = 32
+
+#: Bare fleet-default worker ids (``blender-worker-1``). Fine on a single
+#: box; ambiguous the moment two boxes' fleets poll the same target — the
+#: target's registry and ownership checks key on the worker_id string.
+_DEFAULT_WORKER_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*-worker-\d+$")
+
+
+@dataclass
+class ForeignTarget:
+    """One additional SynPusher box this worker helps when otherwise idle.
+
+    Parsed from ``SYNPUSHER_TARGETS`` (``url|api_key|task_types`` entries,
+    semicolon-separated) or built directly in tests with an injected
+    ``client``. Foreign targets are strictly additive: ``SYNPUSHER_URL`` /
+    ``WORKER_API_KEY`` keep their exact meaning as the *home* box — the only
+    target whose shared-volume paths this worker may trust.
+    """
+
+    url: str
+    api_key: str
+    task_types: list[TaskType]
+    client: Optional[BackendClient] = None  # tests inject a fake
+
+
+def parse_synpusher_targets(raw: Optional[str]) -> list[ForeignTarget]:
+    """Parse ``SYNPUSHER_TARGETS`` — fail fast on any malformed entry.
+
+    A silently skipped target is indistinguishable from "no work available",
+    so misconfiguration raises :class:`ProtocolError` (consumers exit
+    non-zero and container crash-loop detection fires) instead of degrading.
+    """
+    targets: list[ForeignTarget] = []
+    if not raw or not raw.strip():
+        return targets
+    for idx, entry in enumerate(raw.split(";")):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = [p.strip() for p in entry.split("|")]
+        if len(parts) != 3 or not all(parts):
+            raise ProtocolError(
+                f"SYNPUSHER_TARGETS entry {idx} is malformed: {entry!r}. "
+                "Expected 'url|api_key|task_types' with all three fields "
+                "non-empty (entries separated by ';')."
+            )
+        url, api_key, types_str = parts
+        types: list[TaskType] = []
+        for t in types_str.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            try:
+                types.append(TaskType(t))
+            except ValueError:
+                raise ProtocolError(
+                    f"SYNPUSHER_TARGETS entry {idx} names unknown task type "
+                    f"{t!r}. Known: "
+                    f"{', '.join(sorted(m.value for m in TaskType))}"
+                )
+        if not types:
+            raise ProtocolError(
+                f"SYNPUSHER_TARGETS entry {idx} has an empty task_types field."
+            )
+        targets.append(ForeignTarget(url=url, api_key=api_key, task_types=types))
+    return targets
+
+
+@dataclass
+class _Target:
+    """Runtime view of one pollable box (home or foreign)."""
+
+    client: "BackendClient"
+    task_types: list[TaskType]
+    is_home: bool
+    base_url: str
+    api_key: str
+    label: str
+    failures: int = field(default=0)
+    skip_cycles: int = field(default=0)
 
 
 def _positive_finite_s(name: str, value: float) -> float:
@@ -217,6 +304,7 @@ class Worker:
         timeout_grace_s: float = 15.0,
         on_hard_exit: Optional[Callable[[], None]] = None,
         client: Optional[BackendClient] = None,
+        foreign_targets: Optional[list[ForeignTarget]] = None,
         _watchdog_factory: Callable[..., object] = TaskWatchdog,
     ):
         self.backend_url = backend_url
@@ -326,6 +414,72 @@ class Worker:
                     f"Pass a client whose base_url matches backend_url."
                 )
 
+        # ----- cross-box targets (SYNPUSHER_TARGETS) ------------------
+        # SYNPUSHER_URL stays the home box with unchanged semantics — the only
+        # target trusted for shared-volume paths. Foreign targets are strictly
+        # additive and always remote-mode; parsed from env unless tests pass
+        # them explicitly.
+        specs = (
+            foreign_targets
+            if foreign_targets is not None
+            else parse_synpusher_targets(os.environ.get("SYNPUSHER_TARGETS"))
+        )
+        self._foreign_targets: list[_Target] = []
+        home_norm = self.backend_url.rstrip("/")
+        for spec in specs:
+            spec_url = (spec.url or "").rstrip("/")
+            if spec_url and spec_url == home_norm:
+                raise ProtocolError(
+                    f"SYNPUSHER_TARGETS lists the home box ({spec.url!r}); "
+                    "foreign targets are additive — remove the home URL from "
+                    "the list."
+                )
+            usable = [t for t in spec.task_types if t in self.handlers]
+            dropped = [t.value for t in spec.task_types if t not in self.handlers]
+            if dropped:
+                log.warning(
+                    "foreign target %s lists task types with no local handler "
+                    "(%s); they will not be claimed.",
+                    spec.url, ", ".join(dropped),
+                )
+            if not usable:
+                raise ProtocolError(
+                    f"foreign target {spec.url!r} has no task type this "
+                    "worker handles; remove the entry or fix its task_types."
+                )
+            tgt_client = spec.client
+            if tgt_client is None:
+                tgt_client = BackendClient(
+                    spec.url, spec.api_key, timeout_s=request_timeout_s,
+                    worker_id=worker_id,
+                    file_timeout_s=file_timeout_s,
+                    cancel_timeout_s=cancel_timeout_s,
+                    lifecycle_timeout_s=lifecycle_timeout_s,
+                    max_retries=max_retries,
+                    retry_backoff_s=retry_backoff_s,
+                    retry_backoff_max_s=retry_backoff_max_s,
+                    retry_sleep_budget_s=retry_sleep_budget_s,
+                    retry_jitter=retry_jitter,
+                    payload_logger=self._payload_logger,
+                )
+            self._foreign_targets.append(_Target(
+                client=tgt_client,
+                task_types=usable,
+                is_home=False,
+                base_url=spec.url or str(getattr(tgt_client, "base_url", "")),
+                api_key=spec.api_key,
+                label=spec.url or type(tgt_client).__name__,
+            ))
+        if self._foreign_targets and _DEFAULT_WORKER_ID_RE.match(self.worker_id):
+            log.warning(
+                "WORKER_ID %r looks like a bare fleet default. With "
+                "SYNPUSHER_TARGETS set, worker ids must be globally unique "
+                "across boxes (the target's registry and ownership checks "
+                "key on this string) — prefix it with the box name, e.g. "
+                "'3dpo-%s'.",
+                self.worker_id, self.worker_id,
+            )
+
     def _build_payload_logger(self) -> PayloadLogger:
         """Construct a PayloadLogger from env + shared_volume_path.
 
@@ -374,6 +528,24 @@ class Worker:
         """Types this worker can claim, derived from registered handlers."""
         return list(self.handlers.keys())
 
+    @property
+    def _home_target(self) -> _Target:
+        """Live home-target view over ``self._client``.
+
+        A property (not captured at construction) so test seams and hybrid
+        consumers that swap ``worker._client`` keep home binding coherent —
+        the home task's progress/complete/files must follow the current
+        client, exactly as they did before targets existed.
+        """
+        return _Target(
+            client=self._client,
+            task_types=[],  # home claims use self.task_types (live view)
+            is_home=True,
+            base_url=self.backend_url,
+            api_key=self.api_key,
+            label="home",
+        )
+
     async def shutdown(self) -> None:
         """Ask the polling loop to exit after the current task finishes."""
         self._stop.set()
@@ -406,6 +578,14 @@ class Worker:
             self._periodic_cleanup_loop(cleanup_interval_s)
         )
 
+        if self._foreign_targets:
+            log.info(
+                "cross-box mode: %d foreign target(s): %s",
+                len(self._foreign_targets),
+                ", ".join(t.label for t in self._foreign_targets),
+            )
+            await self._verify_home_affinity()
+
         try:
             while not self._stop.is_set():
                 claimed = await self._claim()
@@ -428,7 +608,8 @@ class Worker:
                     except asyncio.TimeoutError:
                         pass
                     continue
-                await self._run_one(claimed)
+                task, target = claimed
+                await self._run_one(task, target)
         finally:
             cleanup_task.cancel()
             try:
@@ -437,7 +618,72 @@ class Worker:
                 pass
             self._payload_logger.close()
             await self._client.close()
+            for tgt in self._foreign_targets:
+                try:
+                    await tgt.client.close()
+                except Exception:  # noqa: BLE001 — shutdown is best-effort
+                    log.warning("failed to close client for %s", tgt.label)
             log.info("task-worker-api Worker stopped: id=%s", self.worker_id)
+
+    async def _verify_home_affinity(self) -> None:
+        """Volume-affinity check: is SYNPUSHER_URL really the box whose volume
+        this worker mounts?
+
+        A typo'd home URL would designate a FOREIGN box as trusted-for-paths
+        and recreate the silent wrong-file hazard cross-box mode exists to
+        close. The home backend writes its identity to
+        ``{shared_volume}/.box-id`` and serves the same value at
+        ``GET /tasks/box-id``; a mismatch is fatal. Missing endpoint (old
+        backend) or missing sentinel only warns — the check must not break
+        rollout ordering — and without a shared volume there is nothing to
+        verify.
+        """
+        if not self.shared_volume_path:
+            return
+        sentinel = Path(self.shared_volume_path) / ".box-id"
+        try:
+            volume_id = sentinel.read_text(encoding="utf-8").strip()
+        except OSError:
+            log.warning(
+                "box-affinity: no readable %s on the shared volume; cannot "
+                "verify SYNPUSHER_URL points at the box this volume belongs "
+                "to. Update the home backend to one that writes .box-id.",
+                sentinel,
+            )
+            return
+        get_box_id = getattr(self._client, "get_box_id", None)
+        if get_box_id is None:
+            log.warning(
+                "box-affinity: client %s has no get_box_id; skipping check.",
+                type(self._client).__qualname__,
+            )
+            return
+        try:
+            home_id = await get_box_id()
+        except Exception as e:  # noqa: BLE001 — startup must tolerate a blip
+            log.warning(
+                "box-affinity: could not fetch home box id from %s (%s); "
+                "continuing without verification.",
+                self.backend_url, e,
+            )
+            return
+        if home_id is None:
+            log.warning(
+                "box-affinity: home backend %s predates GET /tasks/box-id; "
+                "continuing without verification.",
+                self.backend_url,
+            )
+            return
+        if home_id != volume_id:
+            raise ProtocolError(
+                f"box-affinity check failed: home backend {self.backend_url} "
+                f"reports box id {home_id!r} but the mounted shared volume "
+                f"belongs to box {volume_id!r}. SYNPUSHER_URL points at a "
+                "box whose volume this worker does NOT mount — fix "
+                "SYNPUSHER_URL (or the volume mount) before enabling "
+                "cross-box targets."
+            )
+        log.info("box-affinity: verified home %s == volume box id", home_id)
 
     async def _periodic_cleanup_loop(self, interval_s: float) -> None:
         """Background timer that re-runs cleanup so idle workers stay honest.
@@ -464,7 +710,8 @@ class Worker:
         claimed = await self._claim()
         if claimed is None:
             return False
-        await self._run_one(claimed)
+        task, target = claimed
+        await self._run_one(task, target)
         return True
 
     # ----- internals ----------------------------------------------
@@ -513,7 +760,51 @@ class Worker:
             min(delay + spread, cap),
         )
 
-    async def _claim(self) -> Optional[ClaimedTask]:
+    async def _claim(self) -> Optional[tuple[ClaimedTask, _Target]]:
+        """Home-first claim across all targets.
+
+        Home gets first refusal every cycle — "help only when idle" falls out
+        of the loop structure, since a worker only polls at all when it has no
+        task. Foreign targets are polled in listed order; one that fails to
+        connect is skipped for exponentially more cycles (capped) so a dead
+        target can't starve the ones after it or consume a retry burst every
+        cycle. Home failures keep driving the existing global idle-wait
+        escalation; foreign failures never touch it.
+        """
+        claimed = await self._claim_home()
+        if claimed is not None:
+            return claimed, self._home_target
+        for tgt in self._foreign_targets:
+            if self._stop.is_set():
+                return None
+            if tgt.skip_cycles > 0:
+                tgt.skip_cycles -= 1
+                continue
+            try:
+                foreign_claim = await tgt.client.claim_next(
+                    tgt.task_types, worker_id=self.worker_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                tgt.failures += 1
+                tgt.skip_cycles = min(
+                    2 ** tgt.failures, _FOREIGN_BACKOFF_MAX_CYCLES,
+                )
+                log.warning(
+                    "foreign claim failed against %s (%d consecutive; "
+                    "skipping %d cycles): %s",
+                    tgt.label, tgt.failures, tgt.skip_cycles, e,
+                )
+                continue
+            tgt.failures = 0
+            if foreign_claim is not None:
+                log.info(
+                    "claimed cross-box task %s (%s) from %s",
+                    foreign_claim.id, foreign_claim.task_type.value, tgt.label,
+                )
+                return foreign_claim, tgt
+        return None
+
+    async def _claim_home(self) -> Optional[ClaimedTask]:
         try:
             claimed = await self._client.claim_next(
                 self.task_types, worker_id=self.worker_id,
@@ -534,8 +825,14 @@ class Worker:
         self._claim_failures = 0
         return claimed
 
-    async def _run_one(self, task: ClaimedTask) -> None:
+    async def _run_one(self, task: ClaimedTask, target: _Target) -> None:
         """Heartbeat → stage inputs → run handler → publish.
+
+        Every backend interaction for this task — heartbeat, cancel poll,
+        file transfer, watchdog last-resort fail, and the terminal report —
+        goes through ``target`` (the box the task was claimed from), never
+        through worker-level home state: a foreign task's timeout or
+        completion must land on the foreign box.
 
         The heartbeat is started *before* ``prepare_inputs`` so the backend's
         ``updated_at`` keeps ticking during the (potentially multi-minute)
@@ -577,7 +874,7 @@ class Worker:
         """
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
-            self._client, task.id,
+            target.client, task.id,
             heartbeat_interval_s=self.heartbeat_interval_s,
             heartbeat_warn_threshold=self.heartbeat_warn_threshold,
         )
@@ -600,7 +897,7 @@ class Worker:
                 grace_s=self.timeout_grace_s,
                 guard=guard,
                 sync_fail=_make_sync_fail(
-                    self.backend_url, self.api_key, task.id, self.worker_id,
+                    target.base_url, target.api_key, task.id, self.worker_id,
                 ),
                 on_hard_exit=self._on_hard_exit,
                 children_before=list_descendants(os.getpid()),
@@ -670,7 +967,7 @@ class Worker:
             # between batch downloads and raises TaskCancelled. The same
             # guard then covers the handler and upload phases.
             async with CancelGuard(
-                self._client, task.id,
+                target.client, task.id,
                 poll_interval_s=self.cancel_poll_interval_s,
             ) as cancelled:
                 # Link the CancelGuard's ``cancelled`` event into the
@@ -687,7 +984,8 @@ class Worker:
                 # await point where the guard raises TaskCancelled.
                 progress.link_cancelled(cancelled)
                 file_ctx = await prepare_inputs(
-                    task, self._client, task_dir, cancelled=cancelled,
+                    task, target.client, task_dir, cancelled=cancelled,
+                    foreign=not target.is_home,
                 )
                 ctx = TaskContext(task=task, files=file_ctx, progress=progress)
 
@@ -707,8 +1005,9 @@ class Worker:
                 output_files = (result or {}).get("output_files") or {}
                 if output_files:
                     delivered = await upload_outputs(
-                        task, self._client, file_ctx, output_files,
+                        task, target.client, file_ctx, output_files,
                         self.shared_volume_path, cancelled=cancelled,
+                        foreign=not target.is_home,
                     )
                     result = {**result, "output_files": delivered}
             outcome = ("complete", result or {})
@@ -805,7 +1104,7 @@ class Worker:
                         terminal = "fail"
                     try:
                         if fired:
-                            await self._client.fail(
+                            await target.client.fail(
                                 task.id, f"timeout: exceeded {timeout_s:.0f}s",
                             )
                             log.warning(
@@ -813,13 +1112,13 @@ class Worker:
                                 task.id, task.task_type.value,
                             )
                         elif outcome[0] == "complete":
-                            await self._client.complete(task.id, outcome[1])
+                            await target.client.complete(task.id, outcome[1])
                             log.info(
                                 "task %s completed (%s)",
                                 task.id, task.task_type.value,
                             )
                         else:
-                            await self._client.fail(task.id, outcome[1])
+                            await target.client.fail(task.id, outcome[1])
                             if outcome[1] == "cancelled by user":
                                 log.info("task %s cancelled by user", task.id)
                     except Exception as report_exc:  # noqa: BLE001

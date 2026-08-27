@@ -918,6 +918,22 @@ class BackendClient:
         resp.raise_for_status()
         return resp.json() or {}
 
+    async def get_box_id(self) -> Optional[str]:
+        """GET /tasks/box-id — this backend's box identity.
+
+        Used by the worker's volume-affinity check when cross-box targets are
+        configured. Returns ``None`` on a backend that predates the endpoint
+        (404), so callers can warn-and-continue instead of failing rollout
+        ordering.
+        """
+        try:
+            resp = await self._request("GET", "/tasks/box-id")
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return None
+            raise
+        return (resp.json() or {}).get("box_id")
+
     async def get_cancel_status(self, task_id: int) -> dict:
         """GET /tasks/{id}/cancel-status — cheap read-only cancel check.
 

@@ -25,3 +25,14 @@ class ProtocolError(Exception):
     that the worker's pinned package version cannot decode; an HTTP
     response shape that doesn't match the expected envelope.
     """
+
+
+class CrossBoxLocalModeError(ProtocolError):
+    """A foreign-box claim landed on a shared-volume (local-mode) only task.
+
+    Every box uses the identical ``/app/shared`` layout and case ids collide
+    across independent databases, so resolving a foreign task's ``input_path``
+    against this worker's own volume could silently read the WRONG box's
+    patient file. The SDK therefore refuses such claims outright — before
+    touching the filesystem — and fails the task with an actionable message.
+    """
