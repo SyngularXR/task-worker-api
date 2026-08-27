@@ -637,9 +637,28 @@ async def _stage_output(
     # so building the scratch name out of it could overrun NAME_MAX.
     part = dest.with_name(f".{uuid.uuid4().hex}.part")
     try:
-        await _copyfile_async(
-            src, part, cancelled=cancelled, cancel_message=cancel_message,
-        )
+        try:
+            await _copyfile_async(
+                src, part, cancelled=cancelled, cancel_message=cancel_message,
+            )
+        except FileNotFoundError:
+            if dest.parent.exists():
+                raise  # the *source* is what's missing; not ours to repair
+            # The staging dir is shared by every attempt of the task, and a
+            # failing attempt's reclaim rmdirs it the moment it comes up
+            # empty (:func:`_reclaim_staged`) — which is exactly what it is
+            # between our caller's mkdir and the first copy creating a
+            # scratch file in it. Losing that race would fail an attempt
+            # whose outputs are fine. The dir being gone is the whole
+            # problem and mkdir makes it again, so remaking it is the whole
+            # repair: one retry, because losing twice means losing the same
+            # sub-millisecond window on both tries. Later files are already
+            # safe — by then the dir holds this attempt's published outputs,
+            # so no reclaim can rmdir it.
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            await _copyfile_async(
+                src, part, cancelled=cancelled, cancel_message=cancel_message,
+            )
         return await asyncio.to_thread(_publish_atomically, part, dest)
     except BaseException:
         # ``_copyfile_async`` already removes a destination it opened; this is

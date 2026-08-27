@@ -260,6 +260,55 @@ async def test_publish_leaves_a_concurrent_attempts_file_intact(
 
 
 @pytest.mark.asyncio
+async def test_publish_survives_a_concurrent_attempts_cleanup_rmdir(
+    tmp_path, monkeypatch,
+):
+    """A concurrent attempt's cleanup removing the staging dir must not fail
+    this publish.
+
+    ``temp/<task_id>`` is shared by every attempt of the task, and a failing
+    attempt's reclaim ``rmdir``s it the moment it comes up empty
+    (:func:`_reclaim_staged`) — which is exactly what it is in the window
+    between this attempt's ``mkdir`` and the moment its first copy creates a
+    scratch file in it. Losing that race used to fail an attempt whose
+    outputs were perfectly fine.
+    """
+    import os
+    from task_worker_api import files as files_mod
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    real_copy = files_mod._copyfile_async
+    copies = []
+
+    async def racing_copy(src, dest, **kwargs):
+        copies.append(dest)
+        if len(copies) == 1:
+            # The other attempt's reclaim found the dir empty and took it.
+            os.rmdir(dest.parent)
+        return await real_copy(src, dest, **kwargs)
+
+    monkeypatch.setattr(files_mod, "_copyfile_async", racing_copy)
+
+    manifest = await upload_outputs(
+        _claimed(64, params={"input_path": "/ignored"}),
+        FakeBackendClient(), _file_ctx(out_dir),
+        output_files={"a": "a.stl"},
+        shared_volume_path=str(shared),
+    )
+
+    staging = shared / "temp" / "64"
+    assert manifest == {"a": str(staging / "a.stl")}
+    assert (staging / "a.stl").read_bytes() == b"aaa"
+    assert os.listdir(staging) == ["a.stl"], (
+        "the retry must leave no scratch file from the losing copy behind"
+    )
+
+
+@pytest.mark.asyncio
 async def test_local_mode_no_staging_dir_when_shared_volume_unset(tmp_path):
     """Without shared_volume_path, upload_outputs returns output_dir paths
     and creates no staging dir — nothing to clean up."""

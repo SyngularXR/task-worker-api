@@ -85,6 +85,16 @@
   outputs still sit directly under `temp/<task_id>/`, `output_files` still
   carries their absolute paths, and a consumer that moves the artifacts out and
   `rmdir`s `temp/<task_id>` non-recursively still finds it empty.
+- A local-mode publish no longer fails when a concurrent attempt's cleanup
+  removes the staging dir out from under it. `temp/<task_id>` is shared by
+  every attempt of a task and the reclaim `rmdir`s it the moment it comes up
+  empty — which is exactly what it is between an attempt's `mkdir` and the
+  moment its first copy creates a scratch file in it. Losing that window raised
+  `FileNotFoundError` and failed an attempt whose outputs were perfectly fine.
+  The staging copy now remakes the directory and retries once; a missing
+  *source* file still raises as before, and later files in the same publish
+  were never at risk, since by then the directory holds this attempt's own
+  outputs and no reclaim can remove it.
 - `BackendClient` now validates `retry_backoff_s`, the base of its
   exponential-backoff schedule (`retry_backoff_s * 2**n`) and the last retry
   knob with no guard on it — `max_retries`, `retry_backoff_max_s` and
