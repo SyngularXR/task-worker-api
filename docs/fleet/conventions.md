@@ -34,7 +34,7 @@ worker = Worker(
 ```
 
 **This is load-bearing for several SDK features**, including:
-- Local-mode file staging under `shared/temp/{task_id}/{attempt}/` (since v0.4.1; the per-attempt leaf is newer — see § 10)
+- Local-mode file staging under `shared/temp/{task_id}/` (since v0.4.1)
 - Payload logging under `shared/_worker_payloads/{worker_id}/` (since v0.5.0)
 
 If `shared_volume_path` is `None`, those features silently disable. The SDK does not raise — it just no-ops. The [SDK upgrade runbook](runbooks/sdk-upgrade.md) includes an audit step to verify each worker's wiring.
@@ -119,19 +119,19 @@ Publishing succeeding is not the same as the task succeeding. `upload_outputs` c
 
 Since the backend only sweeps a staging dir (or accepts an output manifest) for a task it recorded as **complete**, those artifacts would be permanent orphans. `Worker._run_one` therefore discards them *before* reporting the failure:
 
-- **Local mode** — the directory this attempt staged into, `${SHARED_DATA_PATH}/temp/<task_id>/<attempt>/`, is removed whole, and `temp/<task_id>` with it if that empties it, so a retried task starts clean.
+- **Local mode** — the files this attempt staged into `${SHARED_DATA_PATH}/temp/<task_id>/` are unlinked, and the directory goes if that empties it, so a retried task starts clean.
 - **Remote mode** — the worker protocol has no delete route, so the uploads stay until a retry overwrites them; the SDK logs one WARNING naming the files for operator reconciliation.
 
-Cleanup runs before the report because reporting the failure is what makes the task re-queueable — so discarding first keeps this attempt's cleanup out of the next attempt's way.
+Cleanup runs before the report because reporting the failure is what makes the task re-queueable, and a retry stages into the *same* `temp/<task_id>` path — so discarding first keeps this attempt's cleanup out of the next attempt's way.
 
-**But ordering alone is not what makes it safe: each attempt stages into a directory of its own.** This worker is not the only thing that can hand the task to a successor. The watchdog reports a timeout `fail` from its own thread while the event loop is wedged, and the backend's stale-task sweeper re-queues a task whose heartbeat lapsed with no report at all — so by the time a failed attempt gets round to cleaning up, a second attempt of the same task may already be publishing.
+**Ordering alone is not enough, so the local-mode reclaim proves ownership per file.** This worker is not the only thing that can hand the task to a successor: the watchdog reports a timeout `fail` from its own thread while the event loop is wedged, and the backend's stale-task sweeper re-queues a task whose heartbeat lapsed with no report at all. Either way a second attempt can already have staged its outputs into that shared directory. `upload_outputs` therefore records each staged file's identity (`st_ino`, `st_size`, `st_mtime_ns`, `st_ctime_ns`) *as the copy lands*, and the reclaim unlinks only the paths that still match, leaving anything a newer attempt owns in place (one WARNING per reclaim naming the count). Deleting a live attempt's outputs is a far worse outcome than the orphan this cleanup exists to prevent.
 
-Through v0.14.0 every attempt staged into `temp/<task_id>` directly, and the reclaim tried to tell its own files from a successor's by comparing each one's recorded identity (`st_ino`, `st_size`, `st_mtime_ns`, `st_ctime_ns`) before unlinking it. That cannot be made correct — there is no compare-and-unlink on POSIX. A successor landing between the `stat` and the `unlink` lost its output to the delete, and because a staging copy truncates in place rather than replacing, it went on writing to an already-unlinked inode and published a manifest pointing at nothing; a successor landing between the copy and the record was adopted as this attempt's and deleted later.
+**A local publish is a rename, not a copy over the live file.** The other half of the same problem: two attempts of one task publishing at once. `upload_outputs` copies to a scratch name in the staging dir (`.<random>.part`) and then `os.replace`s it onto the published name, so that name only ever changes from one complete artifact to another. Copying straight into it truncated the destination on `open`, so a concurrent attempt's file — or the same file a consumer was mid-read on — was left spliced from two publishes while both attempts reported success. The rename also makes the identity record above meaningful: it is taken from a scratch path no other attempt can name, so what it describes is provably this attempt's.
 
-The staging path now carries a random per-attempt leaf, `temp/<task_id>/<attempt>/`, minted per `upload_outputs` call. No other attempt can name a path inside it, so the reclaim removes the directory whole with no ownership check and no window to lose. `temp/<task_id>` itself is only ever `rmdir`-ed, which cannot remove a file or a live successor's staging dir — only, briefly, the empty task dir a successor is still building its staging dir under (`mkdir(parents=True)` is two syscalls), which the successor retries rather than failing on.
+The remaining window is small and one-sided: POSIX has no compare-and-unlink, so a successor that publishes between the reclaim's `stat` and its `unlink` still loses that file. It loses a *complete* artifact and the backend reports the manifest path missing — where before, the successor would carry on writing into an inode the reclaim had already unlinked and complete with a manifest pointing at nothing. Closing it entirely means giving each attempt a staging directory of its own, which changes the on-volume layout every backend consumer reads and sweeps, so it needs those consumers to land first.
 
-**For backends:** nothing changes at the interface — `output_files` still carries absolute paths and `temp/<task_id>` is still the subtree to sweep. Note only that a mirror which rmdirs `temp/<task_id>` non-recursively after moving artifacts out now finds the emptied attempt dir inside it; the SDK removes its own once the mirror has emptied it.
+**Nothing about the on-volume layout has changed since v0.4.1.** Outputs sit directly under `temp/<task_id>/`, `output_files` carries their absolute paths, and a consumer that moves the artifacts out and then `rmdir`s `temp/<task_id>` non-recursively still finds it empty. The scratch files exist only for the duration of a copy and are removed when one fails.
 
-**If you override `Worker._run_one`,** pass a dict as `upload_outputs(..., staged=...)` and hand that same dict to `discard_published_outputs` — it is what names the directory to reclaim, so a reclaim with no record removes nothing.
+**If you override `Worker._run_one`,** pass a dict as `upload_outputs(..., staged=...)` and hand that same dict to `discard_published_outputs` — a reclaim with no ownership record removes nothing.
 
 `discard_published_outputs` is exported for consumers that override `Worker._run_one`. Like the payload logger (§8) it never raises: it runs while a failure is already being reported, so a cleanup error must not displace the real one.

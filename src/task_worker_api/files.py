@@ -8,9 +8,11 @@ Remote mode — ``task.params.input_files`` is a ``{key: filename}`` map;
 each is streamed via ``GET /tasks/{id}/files/{name}``.
 
 The same file supplies output publishing: local mode copies to
-``shared_volume_path/temp/<task_id>/<attempt>/`` (a short-lived staging
-dir the backend consumer is expected to sweep after it moves the
-artifacts to their final location); remote mode PUTs each via HTTP.
+``shared_volume_path/temp/<task_id>/`` (a short-lived staging dir the
+backend consumer is expected to sweep after it moves the artifacts to
+their final location); remote mode PUTs each via HTTP. Every attempt of a
+task stages into that one directory, so a local publish goes to a scratch
+name and is renamed onto the published one — see :func:`_stage_output`.
 
 Both modes clean up partial artifacts if publishing fails partway
 through: a failed task is retried, and the partially-published outputs
@@ -21,12 +23,10 @@ the backend's completed-task sweeper never reaches. Mirrors the
 :func:`discard_published_outputs` is that same cleanup as a callable, for
 the other half of the problem: a task whose publish *succeeded* but which
 still ends terminal-failed (a late cancel, a watchdog deadline, an
-unencodable result) — see ``Worker._run_one``. That cleanup can run after
-the backend has already handed the task to a successor, which is what the
-``<attempt>`` leaf is for: a random token minted per ``upload_outputs``
-call makes the staging dir private to one attempt, so removing it whole is
-safe at any time and against any successor. See
-:func:`_reclaim_attempt_dirs`.
+unencodable result) — see ``Worker._run_one``. Because every attempt of a
+task stages into the same ``temp/<task_id>``, that cleanup only removes
+files whose identity still matches what the attempt recorded when it
+staged them; see :func:`_reclaim_staged`.
 
 Every ``input_files`` / ``output_files`` name is checked by
 :func:`_require_safe_filename` before it is joined into a per-task
@@ -501,12 +501,13 @@ async def upload_outputs(
     Mirrors the ``BackendClient.download_file`` partial-file cleanup.
 
     ``staged``, when supplied, is filled in place as each artifact leaves
-    this attempt's workdir — ``{staged_path: None}`` in local mode,
-    ``{filename: None}`` in remote mode. It records what this attempt
-    published, and in local mode it is also what names the staging directory
-    to reclaim, that directory's leaf being a token chosen per call. The
-    values carry nothing; a dict is the type so a caller can pass a plain
-    ``{}`` and read it back filled. See :func:`discard_published_outputs`.
+    this attempt's workdir: ``{staged_path: identity}`` in local mode,
+    ``{filename: None}`` in remote mode (nothing local to identify). The
+    identity is recorded *as the copy lands*, not afterwards, because that
+    is what makes it this attempt's — every attempt of a task stages into
+    the same ``temp/<task_id>``, so a re-queued attempt publishing while
+    this one is still uploading would otherwise be recorded as ours and
+    then deleted by our cleanup. See :func:`discard_published_outputs`.
 
     Every filename in ``output_files`` must be a plain basename; one that
     isn't fails the task with a :class:`ProtocolError` naming its key. The
@@ -569,11 +570,9 @@ async def upload_outputs(
         # (a) workers don't pollute the shared volume root with one
         # ``{task_id}/`` folder per completed task, and (b) the backend
         # mirror has an obvious place to rmdir once it has moved the
-        # artifacts to their permanent home. The per-attempt leaf below that
-        # is what keeps concurrent attempts of one task off each other's
-        # files — see :func:`_attempt_dir`.
-        dest_dir = _attempt_dir(shared_volume_path, task.id)
-        _mkdir_attempt_dir(dest_dir)
+        # artifacts to their permanent home.
+        dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
+        dest_dir.mkdir(parents=True, exist_ok=True)
         manifest: dict[str, str] = {}
         try:
             for key, (filename, src) in output_sources.items():
@@ -582,34 +581,23 @@ async def upload_outputs(
                         f"task {task.id} cancelled by user during output upload"
                     )
                 dest = dest_dir / filename
-                await _copyfile_async(
+                staged[str(dest)] = await _stage_output(
                     src, dest, cancelled=cancelled,
                     cancel_message=(
                         f"task {task.id} cancelled by user during output copy"
                     ),
                 )
                 manifest[key] = str(dest)
-                staged[str(dest)] = None
         except Exception:
             # A copy failed partway through — the staging dir holds a subset
-            # of the outputs, so the whole directory goes. This branch doesn't
-            # consult ``staged`` the way ``discard_published_outputs`` has to:
-            # ``dest_dir`` was created by *this* call and named for it, so
-            # everything under it is this attempt's by construction. Which is
-            # also why the record isn't enough here — when the very first copy
-            # is the one that fails, ``_copyfile_async`` removes its own
-            # partial destination and the record stays empty, but the
-            # directory is still there to clean up.
-            #
-            # Non-raising, like every cleanup on this path: an exception is
-            # already propagating and a cleanup error must not replace it.
-            try:
-                await asyncio.to_thread(_reclaim_attempt_dirs, [dest_dir])
-            except Exception as cleanup_exc:  # noqa: BLE001
-                log.warning(
-                    "task %s: could not discard the staging dir %s: %s",
-                    task.id, dest_dir, cleanup_exc,
-                )
+            # of the outputs. Same cleanup a task that fails *after* a fully
+            # successful publish needs, so both go through one helper. The
+            # file the failing copy was writing is already gone:
+            # :func:`_stage_output` removes its own scratch file.
+            await discard_published_outputs(
+                task, shared_volume_path, staged,
+                reason="publishing failed partway through",
+            )
             raise
         return manifest
 
@@ -619,135 +607,162 @@ async def upload_outputs(
     }
 
 
-def _attempt_dir(shared_volume_path: str, task_id: object) -> Path:
-    """The local-mode staging dir for *one* ``upload_outputs`` call.
+async def _stage_output(
+    src: Path,
+    dest: Path,
+    *,
+    cancelled: Optional[asyncio.Event] = None,
+    cancel_message: str,
+) -> "tuple | None":
+    """Publish one output to its staged path. Returns the file's identity.
 
-    ``temp/<task_id>/<random>``, and the random leaf is the whole point.
-    Every attempt of a task used to stage into ``temp/<task_id>`` directly,
-    so a re-queued attempt overwrote its predecessor's files in place and the
-    failed attempt's cleanup had to decide, file by file, whether what sat at
-    a shared path was still its own. No ``stat``-then-``unlink`` check makes
-    that safe: the file can be replaced in the window between the two calls,
-    and because a staging copy truncates in place rather than replacing, the
-    successor would go on writing to an inode this cleanup had already
-    removed — publishing a manifest that points at nothing. Nor is recording
-    the identity any safer at the other end, where a successor can land
-    between the copy and the ``stat`` and be recorded as ours. A path no
-    other attempt can even name removes the race rather than narrowing it.
+    Copy to a scratch name in the same directory, then ``os.replace`` it onto
+    ``dest``. Never straight into ``dest``: every attempt of a task stages
+    into the same ``temp/<task_id>``, and a copy *truncates the destination
+    in place*, so an attempt landing on a path a concurrent attempt had
+    already published rewrote that attempt's file underneath it — both
+    completing, one of them pointing its manifest at a half-overwritten
+    artifact. The rename makes the published name change atomically from one
+    complete file to another, so concurrent attempts can only be last-writer
+    wins, never interleaved. It costs nothing: same directory, so it is a
+    metadata operation, not a second copy.
 
-    Backend consumers are unaffected: they read absolute paths out of the
-    task's ``output_files`` manifest, and ``temp/<task_id>`` is still the
-    subtree they sweep.
+    The scratch name is this call's alone, so what it holds is provably this
+    attempt's — which is what makes the identity recorded here trustworthy
+    (see :func:`_staged_identity`). ``None`` when a concurrent attempt won the
+    published name in the instant after the rename: that file is not ours,
+    and an attempt never unlinks what it cannot prove it wrote.
     """
-    return Path(shared_volume_path) / "temp" / str(task_id) / uuid.uuid4().hex
-
-
-def _mkdir_attempt_dir(dest_dir: Path) -> None:
-    """Create this attempt's staging dir, against a concurrent prune.
-
-    ``mkdir(parents=True)`` is two syscalls — ``temp/<task_id>``, then the
-    leaf — and every attempt of the task rmdirs ``temp/<task_id>`` the moment
-    it comes up empty (:func:`_prune_staging_dirs`, which
-    ``Worker._run_one`` runs after *every* attempt, success or not). A prune
-    landing in the gap between those two syscalls leaves the leaf's ``mkdir``
-    raising ``FileNotFoundError``, failing an attempt whose outputs were
-    fine. The parent being gone is the whole problem, and ``mkdir`` makes it
-    again, so retrying is the whole repair: one retry, because losing twice
-    means losing the same sub-millisecond window on both tries.
-
-    The other side of that race is already safe — a staging dir that exists
-    holds this attempt's outputs, and the prune is ``rmdir``-only, so it
-    cannot empty one or remove the task dir above it. See
-    :func:`_rmdir_if_empty`.
-    """
+    # Fixed-length name: an output filename has no length limit of its own,
+    # so building the scratch name out of it could overrun NAME_MAX.
+    part = dest.with_name(f".{uuid.uuid4().hex}.part")
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-    except FileNotFoundError:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-
-def _attempt_dirs(
-    published: "dict[str, Any] | None",
-    shared_volume_path: str,
-    task_id: object,
-) -> "list[Path]":
-    """The staging dirs a publish record names, deduplicated.
-
-    Derived from the record rather than recomputed, because the directory
-    name is the token :func:`_attempt_dir` chose for that call. Anything not
-    sitting *directly* under this task's ``temp/<task_id>`` is dropped: this
-    list drives a recursive delete, so it is a trust boundary — the only
-    directories it may ever name are ones this task staged into.
-    """
-    root = Path(shared_volume_path) / "temp" / str(task_id)
-    return sorted({
-        p.parent for p in map(Path, published or ()) if p.parent.parent == root
-    })
-
-
-def _rmdir_if_empty(paths: "list[Path]") -> None:
-    """``rmdir`` each path, tolerating missing and non-empty.
-
-    ``rmdir`` cannot remove a file, which is what makes it safe to aim at a
-    directory someone else may be using: a dir holding a live attempt's
-    outputs — or its own subdirectories — simply survives.
-    """
-    for path in paths:
+        await _copyfile_async(
+            src, part, cancelled=cancelled, cancel_message=cancel_message,
+        )
+        return await asyncio.to_thread(_publish_atomically, part, dest)
+    except BaseException:
+        # ``_copyfile_async`` already removes a destination it opened; this is
+        # for the paths it doesn't cover (a failed ``os.replace``, a cancel
+        # between the two). Scratch files are the one thing in the staging
+        # dir no consumer will ever pick up, so leaving one is worse than
+        # useless — it keeps the dir non-empty and defeats the backend's
+        # rmdir. Non-raising: a real exception is already propagating.
         try:
-            os.rmdir(path)
+            await asyncio.to_thread(os.unlink, part)
         except OSError:
             pass
+        raise
 
 
-def _reclaim_attempt_dirs(attempt_dirs: "list[Path]") -> int:
-    """Delete this attempt's staging dirs whole. Returns how many went.
+def _publish_atomically(part: Path, dest: Path) -> "tuple | None":
+    """``os.replace`` a finished scratch file onto its published name.
 
-    There is no ownership check because there is nothing left to check: a
-    staging dir is named for the ``upload_outputs`` call that created it (see
-    :func:`_attempt_dir`), so no other attempt of the task can create, read
-    or write any path inside it, and no successor can appear inside it
-    mid-delete. The task-level parent then goes only if it comes out empty,
-    which is exactly when no other attempt still has a staging dir under it.
-
-    Runs in a worker thread: deleting GB-scale artifacts (colmap-splat PLYs,
-    Neural-Canvas splats) is exactly the blocking filesystem work that would
-    otherwise freeze the heartbeat and the cancel poll mid-failure-report.
+    Identity is read back from ``dest`` *after* the rename rather than from
+    ``part`` before it, because the rename itself moves ``st_ctime``. The
+    read-back is then checked against the inode we renamed in: anything else
+    means a concurrent attempt replaced the published name in the instant
+    after our rename, so the file there is that attempt's, not ours, and this
+    one records nothing for it. Every other interleaving is caught later —
+    a successor replacing ``dest`` after the read-back leaves an identity
+    that no longer matches, and :func:`_reclaim_staged` leaves it alone.
     """
-    removed = 0
-    for path in attempt_dirs:
+    ino = os.stat(part).st_ino
+    os.replace(part, dest)
+    identity = _staged_identity(dest)
+    if identity is None or identity[0] != ino:  # [0] is st_ino
+        return None
+    return identity
+
+
+def _staged_identity(path: "str | Path") -> "tuple | None":
+    """Identity of a staged output file, or ``None`` if it isn't there.
+
+    ``(st_ino, st_size, st_mtime_ns, st_ctime_ns)`` — enough to tell the file
+    *this* attempt staged from one a *different* attempt of the same task
+    published at the same path. ``st_ino`` carries most of it now that every
+    publish is a rename (:func:`_stage_output`) rather than a copy over the
+    live file: a successor's artifact is a distinct inode, where an in-place
+    copy used to leave a rewritten file wearing the dead attempt's inode
+    *and*, for a deterministic re-run, its size. The rest is what covers
+    inode reuse — a later attempt's scratch file can be handed the number
+    this one's freed — since a re-run writes its source afresh, so
+    ``st_mtime_ns`` (which ``copystat`` carries over from that source) moves
+    even when the bytes are identical. ``st_ctime_ns`` is the kernel's and
+    cannot be forged at all on the fleet's Linux workers; it is not
+    load-bearing where ctime means creation time instead (Windows).
+
+    Non-raising: a missing or unreadable path is simply not identifiable,
+    and an unidentifiable path is never removed.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _reclaim_staged(
+    published: "dict[str, tuple | None]", dest_dir: Path,
+) -> "tuple[int, int]":
+    """Unlink the staged files that are still the ones this attempt wrote.
+
+    Returns ``(removed, foreign)``. The staging path is ``temp/<task_id>``,
+    shared by *every* attempt of the task, and a failed attempt has no way
+    to know it is still the current one: the backend may already have
+    re-queued the task (the watchdog's synchronous ``fail`` lands from its
+    own thread while the event loop is wedged; the stale-task sweeper needs
+    no report at all) and a second attempt may already have staged fresh
+    outputs into this very directory. So ownership is proved per file rather
+    than assumed: a path whose identity no longer matches the one recorded
+    when this attempt staged it belongs to that newer attempt and is left
+    strictly alone, and the directory itself only goes when it ends up
+    empty. Deleting a live attempt's outputs is far worse than leaving an
+    orphan behind, which is the failure this cleanup exists to log.
+
+    ponytail: POSIX has no compare-and-unlink, so a successor that publishes
+    in the gap between the ``stat`` here and the ``unlink`` below still loses
+    its file — a two-syscall window, and bounded: because a publish is now a
+    rename onto the name rather than a copy over the file
+    (:func:`_stage_output`), the successor is no longer *writing* when this
+    runs. It loses a complete artifact and the backend's mirror reports the
+    manifest path missing, where before it would carry on filling an inode
+    this had already unlinked and complete with a manifest pointing at
+    nothing. Closing the window entirely means giving each attempt a staging
+    directory of its own, which is a shared-volume layout change every
+    backend consumer has to land first.
+
+    Runs in a worker thread: unlinking GB-scale artifacts (colmap-splat
+    PLYs, Neural-Canvas splats) is exactly the blocking filesystem work that
+    would otherwise freeze the heartbeat and the cancel poll in the middle
+    of reporting a failure.
+    """
+    removed = foreign = 0
+    for path, identity in published.items():
+        if Path(path).parent != dest_dir:
+            # Defensive: this function unlinks, and the only paths it may
+            # unlink are the ones this task staged into its own staging dir.
+            continue
+        current = _staged_identity(path)
+        if current is None:
+            continue  # already gone — nothing to reclaim
+        if identity is None or current != identity:
+            foreign += 1
+            continue
         try:
-            shutil.rmtree(path)
-        except FileNotFoundError:
-            continue
+            os.unlink(path)
         except OSError as e:
-            log.warning("could not discard staging dir %s: %s", path, e)
-            continue
-        removed += 1
-    _rmdir_if_empty([d.parent for d in attempt_dirs])
-    return removed
-
-
-def _prune_staging_dirs(
-    published: "dict[str, Any] | None",
-    shared_volume_path: "str | None",
-    task_id: object,
-) -> None:
-    """Drop this attempt's staging dirs *if empty*. Runs in a worker thread.
-
-    ``rmdir`` only, so it can never remove an output — which is what lets
-    ``Worker._run_one`` run it after every attempt whatever the outcome, and
-    is how the SDK tidies up after itself on the success path. The backend
-    mirror moves a completed task's artifacts to their permanent home and
-    then rmdirs ``temp/<task_id>``; that rmdir is not recursive, so without
-    this the emptied attempt dir would keep the task dir alive and
-    reintroduce exactly the one-directory-per-completed-task litter
-    ``temp/`` exists to avoid. A staging dir the backend has *not* emptied is
-    non-empty and stays, outputs intact.
-    """
-    if not shared_volume_path:
-        return
-    dirs = _attempt_dirs(published, shared_volume_path, task_id)
-    _rmdir_if_empty(dirs + sorted({d.parent for d in dirs}))
+            log.warning("could not discard staged output %s: %s", path, e)
+        else:
+            removed += 1
+    try:
+        os.rmdir(dest_dir)
+    except OSError:
+        # Missing already, or still holding files this attempt did not
+        # publish — a concurrent attempt's outputs, or a dead attempt's
+        # leftovers. Both are someone else's to remove.
+        pass
+    return removed, foreign
 
 
 async def discard_published_outputs(
@@ -775,28 +790,24 @@ async def discard_published_outputs(
     the polling loop. ``asyncio.CancelledError`` still propagates — a worker
     shutting down mid-cleanup should unwind, not be swallowed here.
 
-    ``published`` is the record ``upload_outputs`` filled as this attempt
-    published, keyed by filename in remote mode and by staged path in local
-    mode. Modes differ in what is actually reclaimable:
+    ``published`` is the ownership record ``upload_outputs`` filled as this
+    attempt published: ``{artifact: identity}``, keyed by filename in remote
+    mode and by staged path in local mode. Modes differ in what is actually
+    reclaimable:
 
     - **Remote** — the worker protocol has no "delete output file" route, so
       the uploads stay on the backend until a retry overwrites them. Logged
       at WARNING so an operator can reconcile; nothing else to do.
-    - **Local + ``shared_volume_path``** — this attempt's staging dirs go
-      whole, and ``temp/<task_id>`` with them if that empties it, so a
-      retried task starts clean. This attempt's only: the cleanup can run
-      long after the backend has handed the task to a successor, and the
-      record is what names the per-attempt directories to remove (see
-      :func:`_reclaim_attempt_dirs`). Off the event loop for the same reason
-      the copies are — a synchronous multi-GB delete freezes the heartbeat
-      and the cancel poll mid-failure-report.
+    - **Local + ``shared_volume_path``** — the staged files whose identity
+      still matches the record are unlinked, and ``temp/<task_id>`` goes if
+      that empties it, so a retried task starts clean. Only those: the
+      staging path is shared by every attempt of the task, and this cleanup
+      can run after the backend has already re-queued it (see
+      :func:`_reclaim_staged`). Off the event loop for the same reason the
+      copies are — a synchronous multi-GB unlink freezes the heartbeat and
+      the cancel poll mid-failure-report.
     - **Local without a shared volume** — outputs never left the per-task
       workdir, which ``Worker._run_one`` removes after every attempt.
-
-    An empty record reclaims nothing. An attempt that published no local
-    outputs has no staging directory of its own to drop, and
-    ``temp/<task_id>`` is not its to touch — a successor may already have
-    created its own staging dir under there and be about to copy into it.
     """
     try:
         if (task.params or {}).get("input_files"):
@@ -810,14 +821,21 @@ async def discard_published_outputs(
             return
         if not shared_volume_path:
             return
-        dest_dirs = _attempt_dirs(published, shared_volume_path, task.id)
-        if not dest_dirs:
-            return
-        if await asyncio.to_thread(_reclaim_attempt_dirs, dest_dirs):
+        dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
+        removed, foreign = await asyncio.to_thread(
+            _reclaim_staged, dict(published or {}), dest_dir,
+        )
+        if foreign:
+            log.warning(
+                "task %s: left %d staged output file(s) under %s in place — "
+                "they are no longer the files this attempt published, so a "
+                "later attempt of this task owns them now.",
+                task.id, foreign, dest_dir,
+            )
+        if removed:
             log.info(
                 "task %s: discarded %d staged output file(s) from %s — %s",
-                task.id, len(published or {}),
-                ", ".join(str(d) for d in dest_dirs), reason,
+                task.id, removed, dest_dir, reason,
             )
     except Exception as e:  # noqa: BLE001 — cleanup must not mask the failure
         log.warning(
