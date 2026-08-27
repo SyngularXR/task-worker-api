@@ -23,6 +23,7 @@ def test_cinematic_baking_roundtrip():
         "job_id": "job1",
         "input_path": "/shared/preview.glb",
         "base_name": "skull",
+        "input_files": None,
         "material_id": None,
         "pattern_scale": None,
     }

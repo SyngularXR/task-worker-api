@@ -7,13 +7,18 @@ from .cancel import CancelGuard
 from .client import BackendClient
 from .context import ClaimedTask, FileContext, TaskContext
 from .enums import TaskStatus, TaskType
-from .errors import ProtocolError, TaskCancelled, TaskParamsError
+from .errors import (
+    CrossBoxLocalModeError,
+    ProtocolError,
+    TaskCancelled,
+    TaskParamsError,
+)
 from .files import prepare_inputs, upload_outputs
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
-from .worker import Worker, run_hybrid
+from .worker import ForeignTarget, Worker, parse_synpusher_targets, run_hybrid
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 __all__ = [
     "__version__",
@@ -36,6 +41,9 @@ __all__ = [
     "CancelGuard",
     "ProgressReporter",
     "Worker",
+    "ForeignTarget",
+    "parse_synpusher_targets",
+    "CrossBoxLocalModeError",
     "run_hybrid",
     "prepare_inputs",
     "upload_outputs",

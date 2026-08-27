@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from .context import ClaimedTask, FileContext
-from .errors import ProtocolError, TaskCancelled
+from .errors import CrossBoxLocalModeError, ProtocolError, TaskCancelled
 
 if TYPE_CHECKING:  # pragma: no cover
     from .client import BackendClient
@@ -306,10 +306,47 @@ def _cancel_kwarg(
     return {}
 
 
+#: Params keys that only make sense on the task's home box (absolute paths
+#: on ITS shared volume). A foreign claim must never resolve these locally:
+#: every box shares the same ``/app/shared`` layout and case ids collide
+#: across databases, so the path can exist AND be the wrong box's file.
+_LOCAL_ONLY_PARAM_KEYS = ("output_dir", "snapshot_path")
+
+
+def _require_foreign_capable(task: ClaimedTask) -> None:
+    """Raise :class:`CrossBoxLocalModeError` unless this task can run remotely.
+
+    Remote-capable means: inputs are declared via ``input_files`` (or the task
+    is pure-param) and no local-only path key is present. ``input_path`` on its
+    own is a shared-volume contract; resolving it against a foreign worker's
+    identically-laid-out volume would silently process the wrong box's patient
+    file, so refusal happens here — before any filesystem access.
+    """
+    params = task.params or {}
+    local_only = [k for k in _LOCAL_ONLY_PARAM_KEYS if params.get(k)]
+    if local_only:
+        raise CrossBoxLocalModeError(
+            f"cross-box claim refused: task {task.id} ({task.task_type.value}) "
+            f"carries shared-volume-only params {local_only}; this task type "
+            "is not remote-capable. Remove it from this worker's cross-box "
+            "key on the target box."
+        )
+    if params.get("input_path") and not params.get("input_files"):
+        raise CrossBoxLocalModeError(
+            f"cross-box claim refused: task {task.id} ({task.task_type.value}) "
+            "is shared-volume (local-mode) only — it has input_path but no "
+            "input_files. Either the target box has not enabled "
+            "ENABLE_CROSS_BOX_FILES (drain pre-flag tasks first), or this "
+            "task type was granted to a cross-box key without being "
+            "remote-capable."
+        )
+
+
 async def prepare_inputs(
     task: ClaimedTask, client: "BackendClient", work_dir: Path,
     *,
     cancelled: Optional[asyncio.Event] = None,
+    foreign: bool = False,
 ) -> FileContext:
     """Materialise task inputs under ``work_dir/in/``. Returns a FileContext.
 
@@ -343,6 +380,14 @@ async def prepare_inputs(
     params = task.params or {}
     input_path = params.get("input_path")
     input_files = params.get("input_files")
+
+    if foreign:
+        # A task claimed from a non-home target must never resolve
+        # shared-volume paths against THIS worker's volume (wrong-box
+        # hazard); refuse local-only tasks, and for dual-param tasks use
+        # only the HTTP input_files channel.
+        _require_foreign_capable(task)
+        input_path = None
 
     if input_path:
         src = Path(input_path)
@@ -411,6 +456,7 @@ async def upload_outputs(
     shared_volume_path: "str | None",
     *,
     cancelled: Optional[asyncio.Event] = None,
+    foreign: bool = False,
 ) -> dict[str, str]:
     """Publish output_files and return the manifest for task.result.
 
@@ -457,7 +503,15 @@ async def upload_outputs(
         file_ctx.output_dir, safe_output_files,
     )
 
-    remote_mode = bool((task.params or {}).get("input_files"))
+    # Publish over HTTP when the task was claimed from a foreign box, or when
+    # the task is input_files-only (a genuinely volume-less worker). A
+    # dual-param task (input_path + input_files, the cross-box enqueue shape)
+    # claimed by a HOME worker stays on the shared-volume path — presence of
+    # input_files alone must not flip a co-located fleet to HTTP uploads.
+    params = task.params or {}
+    remote_mode = foreign or (
+        bool(params.get("input_files")) and not params.get("input_path")
+    )
 
     if remote_mode:
         # Track filenames as they upload so a failure partway through can
