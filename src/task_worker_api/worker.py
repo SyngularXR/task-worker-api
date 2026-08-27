@@ -43,7 +43,7 @@ from .client import (
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
-from .files import discard_published_outputs, prepare_inputs, upload_outputs
+from .files import _warn_published_orphans, prepare_inputs, upload_outputs
 from .payload_log import PayloadLogger, sanitize_worker_id
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
@@ -886,13 +886,13 @@ class Worker:
         TerminalGuard so a timeout and a near-simultaneous normal completion
         report exactly once (first resolver wins).
 
-        An attempt that publishes its outputs and *then* fails has its
-        published artifacts discarded — but only the ones it can still prove
-        are its own, since a re-queued attempt of the same task stages into
-        the same shared path. That cleanup runs whether this loop or the
-        watchdog won the terminal report: losing the race decides who reports,
-        not whether this attempt's orphans get reclaimed. See the
-        ``discard_published_outputs`` call below.
+        An attempt that publishes its outputs and *then* fails leaves them on
+        the shared volume and logs them as orphans — it does not delete them,
+        because a re-queued attempt of the same task stages into that same
+        shared path. That warning runs whether this loop or the watchdog won
+        the terminal report: losing the race decides who reports, not what
+        this attempt owes the operator. See the ``_warn_published_orphans``
+        call below.
         """
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
@@ -927,14 +927,11 @@ class Worker:
             wd.start()
 
         outcome: tuple[str, object] = ("fail", "unknown")
-        # Filled in place by upload_outputs as each artifact leaves this
-        # attempt's workdir: what was published, and the identity each staged
-        # file had when *this* attempt wrote it. The terminal-report block
-        # below needs both — the first to know there is something to reclaim
-        # if the attempt still fails, the second to prove it is reclaiming its
-        # own outputs rather than a re-queued attempt's. See the discard call
-        # there.
-        published: dict[str, "tuple | None"] = {}
+        # Appended to in place by upload_outputs as each artifact leaves this
+        # attempt's workdir. The terminal-report block below needs it to name
+        # the orphans this attempt leaves on the shared volume if it still
+        # fails. Not a delete list — see the warning call there.
+        published: list[str] = []
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1069,14 +1066,14 @@ class Worker:
                 # won; otherwise report the handler outcome. The guard makes
                 # this exactly-once even against the watchdog's hard-exit path.
                 # Claimed up front rather than used as the ``if`` of this
-                # whole block: losing the claim settles who *reports*, not what
-                # this attempt still owes the shared volume. The watchdog's
+                # whole block: losing the claim settles who *reports*, not
+                # what this attempt still owes the operator. The watchdog's
                 # phase-3 path claims the guard and reports the timeout from
                 # its own thread while this loop is wedged; when the loop
-                # resumes it must still discard the outputs it published, or
-                # the exact post-publish orphan this cleanup exists to prevent
-                # survives whenever the deadline beats the loop to the report.
-                # So only the report itself hangs off ``won``.
+                # resumes it is still the only thing that knows what this
+                # attempt staged, so the orphan warning below has to run
+                # whenever the deadline beats the loop to the report. So only
+                # the report itself hangs off ``won``.
                 won = guard.claim()
 
                 # Determine the terminal method + payload up front so the
@@ -1147,51 +1144,42 @@ class Worker:
                     terminal = "complete"
                 else:
                     terminal = "fail"
-                # Partial-failure cleanup. Publishing succeeding does not
-                # mean the task succeeded: upload_outputs can deliver every
-                # file and the attempt still land here as a failure — the
+                # Post-publish orphans. Publishing succeeding does not mean
+                # the task succeeded: upload_outputs can deliver every file
+                # and the attempt still land here as a failure — the
                 # CancelGuard raises TaskCancelled when the guarded block
                 # *exits*, so a cancel arriving after the last upload fails
                 # a fully-published task; the watchdog deadline can fire
                 # between the last upload and this block; and an
                 # unencodable result is rewritten to a failure just above.
-                # upload_outputs only cleans up after its *own* partial
-                # failure, so those artifacts survive — and the backend
-                # only sweeps a staging dir for a task it recorded as
-                # complete, leaving GB-scale colmap-splat PLYs and
-                # Neural-Canvas splats orphaned on the shared volume for
-                # good.
+                # The backend only sweeps a staging dir for a task it
+                # recorded as complete, so those artifacts — GB-scale
+                # colmap-splat PLYs and Neural-Canvas splats — are orphans
+                # nothing ever reaches.
                 #
-                # Before the report, not after: reporting the failure is
-                # what makes the task re-queueable, and a retry stages into
-                # the *same* ``temp/<task_id>`` path, so discarding first
-                # keeps this attempt's cleanup out of the next attempt's
-                # way. That ordering narrows the race but cannot close it —
-                # this worker is not the only thing that can hand the task
-                # to a successor. The watchdog reports a timeout ``fail``
-                # from its own thread, and the backend's stale-task sweeper
-                # re-queues a task whose heartbeat lapsed without any
-                # report at all; either can land while the event loop is
-                # still wedged here, and by the time it resumes a second
-                # attempt may already have staged its outputs into that
-                # shared path. So the discard proves ownership per file
-                # instead of assuming it, and leaves anything that is no
-                # longer this attempt's bytes alone (see _reclaim_staged) —
-                # deleting a live attempt's outputs is a far worse outcome
-                # than the orphan this cleanup exists to prevent. When ``won``
-                # is false that hand-off has already happened — the watchdog
-                # sent the failure while this loop was wedged — so the cleanup
-                # runs strictly after it, and the same per-file ownership proof
-                # is what makes it safe there too. Never raises (see
-                # discard_published_outputs), so it cannot displace the
-                # terminal report this worker still owes.
-                if terminal == "fail" and published:
-                    await discard_published_outputs(
+                # They are logged, not deleted. This worker is not the only
+                # thing that can hand the task to a successor: the watchdog
+                # reports a timeout ``fail`` from its own thread, and the
+                # backend's stale-task sweeper re-queues a task whose
+                # heartbeat lapsed without any report at all. Either can
+                # land while the event loop is still wedged here, and by the
+                # time it resumes a second attempt may already have staged
+                # its outputs into that same ``temp/<task_id>`` path — which
+                # this attempt has no way to tell apart from its own, since
+                # a stat-then-unlink check still lets the successor land in
+                # the gap. Reclaiming safely needs an attempt-unique staging
+                # path the backend consumers understand, or a lease on the
+                # shared one; until then the orphan is an operator's to
+                # sweep, because deleting a live attempt's outputs is far
+                # worse. Not gated on ``won``: losing the report decides who
+                # tells the backend, not who knows what this attempt staged —
+                # the watchdog's ``fail`` carries no such record. Never
+                # raises (see _warn_published_orphans), so it cannot displace
+                # the terminal report this worker still owes.
+                if terminal == "fail":
+                    _warn_published_orphans(
                         task, self.shared_volume_path, published,
-                        reason=(
-                            "the task is being reported failed, so the "
-                            "backend will never sweep them"
-                        ),
+                        reason="the task is being reported failed",
                     )
                 if won:
                     try:

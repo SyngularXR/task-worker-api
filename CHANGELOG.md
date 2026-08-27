@@ -27,45 +27,35 @@
   `docs/fleet/conventions.md` § 9 for the contract backends implement.
 
 **Fixes:**
-- A task that published its outputs and *then* failed no longer orphans them.
-  `upload_outputs` cleaned up after its own partial failure, but a publish that
-  fully succeeded and was followed by a failing attempt left everything behind:
-  the `CancelGuard` raises `TaskCancelled` when the guarded block *exits*, so a
-  cancel arriving after the last upload fails a fully-published task; a watchdog
-  deadline can fire between the last upload and the terminal report; and an
-  unencodable handler result is rewritten to a failure just before reporting.
-  The backend only sweeps a staging dir (or accepts an output manifest) for a
-  task it recorded as **complete**, so in every one of those cases the artifacts
-  — GB-scale colmap-splat PLYs and Neural-Canvas splats — were orphans nothing
-  ever reached, accumulating on the shared volume for good. `Worker._run_one`
-  now discards them: local mode unlinks the files this attempt staged under
-  `temp/<task_id>` (and removes the directory if that empties it), remote mode
-  logs one WARNING naming the files (the worker protocol has no delete route).
-  The discard runs *before* the failure is reported, because reporting it is
-  what makes the task re-queueable and a retry stages into the same
-  `temp/<task_id>` path — discarding first keeps this attempt's cleanup out of
-  the next attempt's way. It is not gated on *winning* that report, though: the
-  watchdog can claim the terminal report and send the timeout itself, and the
-  resumed loop is still the only thing that knows what this attempt staged, so
-  hanging the cleanup off the exactly-once report gate would leave exactly
-  these orphans behind whenever the deadline beat the loop to the report. That
-  ordering narrows the race but cannot close it: the worker is not the only
-  thing that can hand the task to a successor — that same watchdog `fail` goes
-  out while the event loop is still wedged, and the backend's stale-task
-  sweeper re-queues a task whose heartbeat lapsed with no report at all, so by
-  the time the loop resumes a second attempt may already have staged its
-  outputs into that shared path. So the reclaim proves ownership per file
-  rather than assuming it: `upload_outputs`
-  records each staged file's identity (`st_ino`, `st_size`, `st_mtime_ns`,
-  `st_ctime_ns`) as the copy lands, and the discard unlinks only the paths that
-  still match, leaving a newer attempt's outputs — and the directory it is
-  staging into — alone. Deleting a live attempt's outputs is a far worse outcome
-  than the orphan this cleanup exists to prevent. Non-raising by contract, so it
-  can never displace the terminal report the worker still owes the task. The
-  cleanup is exported as `discard_published_outputs` for consumers that override
-  `_run_one` (pass `upload_outputs(..., staged=...)` the dict you hand it — a
-  reclaim with no ownership record removes nothing); a task that completes still
-  hands its staging dir to the backend untouched.
+- A task that published its outputs and *then* failed used to leave them on the
+  shared volume silently. `upload_outputs` logged after its own partial
+  failure, but a publish that fully succeeded and was followed by a failing
+  attempt said nothing at all: the `CancelGuard` raises `TaskCancelled` when
+  the guarded block *exits*, so a cancel arriving after the last upload fails a
+  fully-published task; a watchdog deadline can fire between the last upload
+  and the terminal report; and an unencodable handler result is rewritten to a
+  failure just before reporting. The backend only sweeps a staging dir (or
+  accepts an output manifest) for a task it recorded as **complete**, so in
+  every one of those cases the artifacts — GB-scale colmap-splat PLYs and
+  Neural-Canvas splats — accumulate on the shared volume unnoticed.
+  `Worker._run_one` now emits one WARNING naming them, in both modes, whether
+  or not this loop won the terminal report (the watchdog can send the timeout
+  `fail` from its own thread while the loop is wedged, and the resumed loop is
+  still the only thing that knows what this attempt staged).
+
+  **The SDK does not delete them, by design.** `temp/<task_id>` is shared by
+  every attempt of a task, and a failing attempt cannot prove the file at a
+  published name is still the one it wrote: that same watchdog `fail` goes out
+  while the loop is wedged, and the backend's stale-task sweeper re-queues a
+  task whose heartbeat lapsed with no report at all, so by the time the loop
+  resumes a successor may already have published there. A stat-then-unlink
+  ownership check does not close that — POSIX has no compare-and-unlink, so the
+  successor can still land in the gap and lose a complete artifact. Attempt-safe
+  reclamation is therefore **deferred** until the fleet has either a staging
+  path unique per attempt that every backend consumer understands, or a lease on
+  the shared one. Until one of those lands the orphan is a logged, operator-swept
+  file, which beats deleting a live attempt's outputs. Remote mode has no delete
+  route in the worker protocol regardless.
 - Local-mode output publishing is now atomic. Every attempt of a task stages
   into the same `temp/<task_id>/`, and the copy went straight into the
   published name — which truncates it on `open`. Two attempts of one task
@@ -75,31 +65,22 @@
   to a scratch name in the staging dir (`.<random>.part`) and `os.replace`s it
   onto the published name, so that name only ever changes from one whole
   artifact to another; a publish that dies before the rename touches nothing,
-  and its scratch file is removed. The rename is also what makes the ownership
-  record above trustworthy: the identity is read from a scratch path no other
-  attempt can name, then checked against the published name after the rename,
-  so an attempt that lost that name in the interval records nothing for it and
-  will never unlink it. What remains is a two-syscall window — POSIX has no
-  compare-and-unlink, so a successor publishing between the reclaim's `stat`
-  and its `unlink` still loses that file, but it loses a *complete* artifact
-  and the backend reports the manifest path missing, where before it would
-  carry on writing into an already-unlinked inode and complete with a manifest
-  pointing at nothing. Closing that window entirely means a staging directory
-  per attempt, which changes the on-volume layout every backend consumer reads
-  and sweeps, so it needs those consumers to land first. Nothing here does:
-  outputs still sit directly under `temp/<task_id>/`, `output_files` still
-  carries their absolute paths, and a consumer that moves the artifacts out and
-  `rmdir`s `temp/<task_id>` non-recursively still finds it empty.
-- A local-mode publish no longer fails when a concurrent attempt's cleanup
-  removes the staging dir out from under it. `temp/<task_id>` is shared by
-  every attempt of a task and the reclaim `rmdir`s it the moment it comes up
-  empty — which is exactly what it is between an attempt's `mkdir` and the
-  moment its first copy creates a scratch file in it. Losing that window raised
-  `FileNotFoundError` and failed an attempt whose outputs were perfectly fine.
-  The staging copy now remakes the directory and retries once; a missing
-  *source* file still raises as before, and later files in the same publish
-  were never at risk, since by then the directory holds this attempt's own
-  outputs and no reclaim can remove it.
+  and its scratch file — the one name in that directory no other attempt can
+  hold, and so the only thing a failing attempt removes — is cleaned up.
+  Nothing about the on-volume layout changes: outputs still sit directly under
+  `temp/<task_id>/`, `output_files` still carries their absolute paths, and a
+  consumer that moves the artifacts out and `rmdir`s `temp/<task_id>`
+  non-recursively still finds it empty.
+- A local-mode publish no longer fails when the staging dir is removed out from
+  under it. `temp/<task_id>` is the backend consumer's to sweep and it `rmdir`s
+  the directory the moment it comes up empty — which is exactly what it is
+  between an attempt's `mkdir` and the moment its first copy creates a scratch
+  file in it. Losing that window raised `FileNotFoundError` and failed an
+  attempt whose outputs were perfectly fine. The staging copy now remakes the
+  directory and retries once; a missing *source* file still raises as before,
+  and later files in the same publish were never at risk, since by then the
+  directory holds this attempt's own outputs and is not empty for anyone to
+  remove.
 - `BackendClient` now validates `retry_backoff_s`, the base of its
   exponential-backoff schedule (`retry_backoff_s * 2**n`) and the last retry
   knob with no guard on it — `max_retries`, `retry_backoff_max_s` and

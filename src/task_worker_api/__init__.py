@@ -13,7 +13,7 @@ from .errors import (
     TaskCancelled,
     TaskParamsError,
 )
-from .files import discard_published_outputs, prepare_inputs, upload_outputs
+from .files import prepare_inputs, upload_outputs
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
 from .worker import ForeignTarget, Worker, parse_synpusher_targets, run_hybrid
@@ -47,5 +47,4 @@ __all__ = [
     "run_hybrid",
     "prepare_inputs",
     "upload_outputs",
-    "discard_published_outputs",
 ]

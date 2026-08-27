@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -1269,12 +1270,13 @@ async def test_heartbeat_stopped_when_worker_cancelled_mid_report(
 
 
 # ---------------------------------------------------------------------------
-# Partial-failure cleanup: published, then failed
+# Post-publish orphans: published, then failed
 # ---------------------------------------------------------------------------
-# upload_outputs cleans up after its *own* partial failure. These cover the
-# other half: publishing fully succeeded, and the attempt failed anyway. The
-# backend only sweeps a staging dir (or accepts an output manifest) for a task
-# it recorded as complete, so without this the artifacts are permanent orphans.
+# Publishing fully succeeded and the attempt failed anyway. The backend only
+# sweeps a staging dir (or accepts an output manifest) for a task it recorded
+# as complete, so those artifacts are orphans nothing ever reaches. The SDK
+# logs them and leaves them: temp/<task_id> is shared with any re-queued
+# attempt, so a delete here can land on a live successor's output.
 
 
 class _CancelAfterLastUploadClient(FakeBackendClient):
@@ -1341,11 +1343,13 @@ async def test_late_cancel_after_full_publish_reports_the_remote_orphans(
 
 
 @pytest.mark.asyncio
-async def test_unencodable_result_after_publish_discards_the_staging_dir(
-    make_worker, tmp_path,
+async def test_unencodable_result_after_publish_keeps_and_logs_the_outputs(
+    make_worker, tmp_path, caplog,
 ):
-    """The encode pre-check rewrites a completed outcome to a failure — and
-    the outputs it already staged onto the shared volume have to go with it."""
+    """The encode pre-check rewrites a completed outcome to a failure — the
+    outputs it already staged onto the shared volume are then orphans the
+    backend will never sweep, so they get logged. They are *not* deleted: the
+    staging path is shared with any re-queued attempt of this task."""
     (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
     shared = tmp_path / "shared"
     client = FakeBackendClient()
@@ -1364,12 +1368,21 @@ async def test_unencodable_result_after_publish_discards_the_staging_dir(
         handlers={TaskType.DETECT_CUT_PLANES: handler},
         shared_volume_path=str(shared),
     )
-    await worker.run_one()
+    with caplog.at_level("WARNING"):
+        await worker.run_one()
 
     assert client.completed_tasks == []
     assert "could not be encoded" in client.failed_tasks[0]["error"]
-    # Staged during the run, reclaimed because the task ends failed.
-    assert not (shared / "temp" / "1").exists()
+
+    staging = shared / "temp" / "1"
+    assert (staging / "planes.stl").read_bytes() == b"cut-planes"
+    assert os.listdir(staging) == ["planes.stl"], (
+        "a failed attempt must leave no .part scratch file behind"
+    )
+    assert any(
+        "planes.stl" in r.getMessage() and "never sweep them" in r.getMessage()
+        for r in caplog.records if r.levelname == "WARNING"
+    ), "the orphan left on the shared volume was not logged"
 
 
 @pytest.mark.asyncio
@@ -1401,3 +1414,4 @@ async def test_handler_failure_before_publish_leaves_nothing_to_discard(
     assert not any(
         "remain published" in r.getMessage() for r in caplog.records
     )
+    assert not (shared / "temp" / "1").exists()

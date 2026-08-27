@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -165,13 +166,14 @@ async def test_per_type_env_override_resolved(
 
 
 @pytest.mark.asyncio
-async def test_timeout_after_publish_discards_the_staging_dir(
-    make_worker, fake_client, tmp_path,
+async def test_timeout_after_publish_keeps_and_logs_the_staged_outputs(
+    make_worker, fake_client, tmp_path, caplog,
 ):
     """A watchdog deadline that lands after the handler published its outputs
-    fails the task — and the published artifacts must go with it. The backend
-    only sweeps a staging dir for a task it recorded as *complete*, so leaving
-    them behind orphans GB-scale artifacts on the shared volume for good."""
+    fails the task. The backend only sweeps a staging dir for a task it
+    recorded as *complete*, so the artifacts are orphans — logged for an
+    operator, and left in place: ``temp/<task_id>`` is shared with any
+    re-queued attempt, so a delete here can land on a live successor."""
     _queue(fake_client, tmp_path)
     shared = tmp_path / "shared"
 
@@ -186,27 +188,42 @@ async def test_timeout_after_publish_discards_the_staging_dir(
         shared_volume_path=str(shared),
         _watchdog_factory=lambda **kw: _ImmediateWatchdog(fire=True),
     )
-    await w.run_one()
+    with caplog.at_level("WARNING"):
+        await w.run_one()
 
     assert fake_client.completed_tasks == []
     assert "timeout: exceeded 60s" in fake_client.failed_tasks[0]["error"]
-    assert not (shared / "temp" / "1").exists()
+
+    staging = shared / "temp" / "1"
+    assert (staging / "planes.stl").read_bytes() == b"cut-planes"
+    assert os.listdir(staging) == ["planes.stl"], (
+        "a timed-out attempt must leave no .part scratch file behind"
+    )
+    assert any(
+        "planes.stl" in r.getMessage() and "never sweep them" in r.getMessage()
+        for r in caplog.records if r.levelname == "WARNING"
+    ), "the orphan left on the shared volume was not logged"
 
 
 @pytest.mark.asyncio
-async def test_timeout_reclaim_spares_a_requeued_attempts_outputs(
+async def test_timeout_failure_handling_never_removes_a_successors_output(
     make_worker, fake_client, tmp_path, monkeypatch,
 ):
-    """The watchdog's report can hand the task to a successor before this
-    attempt's cleanup runs.
+    """Regression: the stale attempt's failure handling must not touch a path
+    a successor has since published to.
 
-    ``_make_sync_fail`` reports the timeout from the watchdog thread while
-    the event loop is still wedged, so the backend can re-queue the task and
-    a second attempt can stage fresh outputs into the same
-    ``temp/<task_id>`` — the shared staging path — before this attempt
-    resumes and reclaims. It must reclaim only what it can still prove is
-    its own.
+    ``_make_sync_fail`` reports the timeout from the watchdog thread while the
+    event loop is still wedged, so the backend can re-queue the task and a
+    second attempt can publish into the same ``temp/<task_id>`` before this
+    attempt resumes. Barriers pin the interleaving that used to lose the
+    successor's file: the stale attempt observes the staged path (what an
+    ownership check would have done), *then* the successor's ``os.replace``
+    lands, and only then does the stale attempt act on its observation.
     """
+    import threading
+
+    import task_worker_api.worker as worker_mod
+
     _queue(fake_client, tmp_path)
     shared = tmp_path / "shared"
     staged_path = shared / "temp" / "1" / "planes.stl"
@@ -215,18 +232,29 @@ async def test_timeout_reclaim_spares_a_requeued_attempts_outputs(
         (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
         return {"output_files": {"planes": "planes.stl"}}
 
-    import task_worker_api.worker as worker_mod
-    real_discard = worker_mod.discard_published_outputs
+    observed = threading.Barrier(2)
+    republished = threading.Barrier(2)
+    real_warn = worker_mod._warn_published_orphans
 
-    async def discard_after_a_requeued_attempt_republished(*args, **kwargs):
-        # Between this attempt's publish and its cleanup, the re-queued
-        # attempt lands its own outputs at the same path.
-        staged_path.write_bytes(b"second attempt's cut-planes")
-        return await real_discard(*args, **kwargs)
+    def successor_publishes():
+        observed.wait(timeout=5)
+        part = staged_path.with_name(".successor.part")
+        part.write_bytes(b"second attempt's cut-planes")
+        os.replace(part, staged_path)  # atomic publish onto the same name
+        republished.wait(timeout=5)
+
+    successor = threading.Thread(target=successor_publishes)
+
+    def warn_after_a_requeued_attempt_republished(*args, **kwargs):
+        # Whatever this attempt learns about the staged path, it learns here.
+        os.stat(staged_path)
+        observed.wait(timeout=5)
+        republished.wait(timeout=5)
+        return real_warn(*args, **kwargs)
 
     monkeypatch.setattr(
-        worker_mod, "discard_published_outputs",
-        discard_after_a_requeued_attempt_republished,
+        worker_mod, "_warn_published_orphans",
+        warn_after_a_requeued_attempt_republished,
     )
 
     w = make_worker(
@@ -236,10 +264,16 @@ async def test_timeout_reclaim_spares_a_requeued_attempts_outputs(
         shared_volume_path=str(shared),
         _watchdog_factory=lambda **kw: _ImmediateWatchdog(fire=True),
     )
-    await w.run_one()
+    successor.start()
+    try:
+        await w.run_one()
+    finally:
+        successor.join(timeout=10)
+    assert not successor.is_alive()
 
     assert "timeout: exceeded 60s" in fake_client.failed_tasks[0]["error"]
     assert staged_path.read_bytes() == b"second attempt's cut-planes"
+    assert os.listdir(staged_path.parent) == ["planes.stl"]
 
 
 @pytest.mark.asyncio
@@ -296,17 +330,17 @@ class _WedgedLoopWatchdog:
 
 
 @pytest.mark.asyncio
-async def test_watchdog_winning_the_report_still_discards_published_outputs(
-    make_worker, fake_client, tmp_path,
+async def test_watchdog_winning_the_report_still_logs_published_outputs(
+    make_worker, fake_client, tmp_path, caplog,
 ):
-    """Cleanup must not hang off winning the terminal report.
+    """The orphan warning must not hang off winning the terminal report.
 
     The watchdog reports the timeout while the loop is wedged, so the resumed
     ``_run_one`` never sends a report of its own — but it is still the only
-    thing that knows what this attempt staged onto the shared volume, and the
-    backend only sweeps a staging dir for a task it recorded as *complete*.
-    Skipping the discard here leaves exactly the post-publish orphan the
-    cleanup exists to prevent.
+    thing that knows what this attempt staged onto the shared volume (the
+    watchdog's ``fail`` carries no such record), and the backend only sweeps a
+    staging dir for a task it recorded as *complete*. Skipping the warning
+    here leaves exactly the post-publish orphan unreported.
     """
     _queue(fake_client, tmp_path)
     shared = tmp_path / "shared"
@@ -328,11 +362,17 @@ async def test_watchdog_winning_the_report_still_discards_published_outputs(
         shared_volume_path=str(shared),
         _watchdog_factory=factory,
     )
-    await w.run_one()
+    with caplog.at_level("WARNING"):
+        await w.run_one()
 
     # The watchdog owned the report: the loop sent neither terminal status.
     assert built[0].won_report is True
     assert fake_client.completed_tasks == []
     assert fake_client.failed_tasks == []
-    # ...and the outputs it published are still reclaimed.
-    assert not (shared / "temp" / "1").exists()
+    # ...and the outputs it published are still reported, and still there.
+    assert (shared / "temp" / "1" / "planes.stl").read_bytes() == b"cut-planes"
+    assert os.listdir(shared / "temp" / "1") == ["planes.stl"]
+    assert any(
+        "planes.stl" in r.getMessage() and "never sweep them" in r.getMessage()
+        for r in caplog.records if r.levelname == "WARNING"
+    )

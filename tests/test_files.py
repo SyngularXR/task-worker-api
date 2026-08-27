@@ -19,7 +19,7 @@ import pytest
 from task_worker_api.context import ClaimedTask, FileContext
 from task_worker_api.enums import TaskStatus, TaskType
 from task_worker_api.files import (
-    discard_published_outputs,
+    _warn_published_orphans,
     prepare_inputs,
     upload_outputs,
 )
@@ -73,25 +73,36 @@ class _FlakyUploadClient(FakeBackendClient):
 
 
 # ---------------------------------------------------------------------------#
-# upload_outputs — local mode (shared-volume staging dir) partial cleanup
+# upload_outputs — local mode (shared-volume staging dir) partial failure
+#
+# A publish that fails partway through keeps what it already published. The
+# staging dir is shared by every attempt of the task, so unlinking files
+# 1..N-1 here can land on a successor's publish — this attempt has no way to
+# tell its own bytes from a re-queued attempt's. The orphan is logged and left
+# for an operator instead. The failing copy's own ``.part`` scratch file is the
+# one exception: that name is this call's alone.
 # ---------------------------------------------------------------------------#
 
 
 @pytest.mark.asyncio
-async def test_local_mode_cleans_staging_dir_on_partial_copy_failure(tmp_path):
-    """When a copy into the staging dir fails partway through, the
-    partially-populated staging dir must be removed so a retried task
-    starts clean — the backend's sweeper only removes staging dirs for
-    tasks it recorded as complete, so a failed task's partial dir would
-    otherwise linger as an orphan.
+async def test_local_mode_keeps_published_files_on_partial_copy_failure(
+    tmp_path,
+):
+    """When a copy into the staging dir fails partway through, the files
+    already published stay put, and so does the staging dir.
+
+    They are orphans — the backend's sweeper only touches staging dirs for
+    tasks it recorded as complete — but this attempt cannot prove they are
+    still its own to remove: the same directory is where a re-queued attempt
+    of this task publishes.
     """
     shared = tmp_path / "shared"
     out_dir = tmp_path / "work" / "out"
     out_dir.mkdir(parents=True)
 
-    # Two output files; the second's source is missing → copy2 raises.
+    # Two output files; the second's source is missing → the copy raises.
     (out_dir / "a.stl").write_bytes(b"aaa")
-    # "b.stl" deliberately not created → shutil.copy2 raises FileNotFoundError.
+    # "b.stl" deliberately not created → the copy raises FileNotFoundError.
 
     task = _claimed(11, params={"input_path": "/ignored"})
     file_ctx = _file_ctx(out_dir)
@@ -104,17 +115,20 @@ async def test_local_mode_cleans_staging_dir_on_partial_copy_failure(tmp_path):
         )
 
     staging = shared / "temp" / "11"
-    assert not staging.exists(), (
-        "partial staging dir must be removed on copy failure"
+    assert (staging / "a.stl").read_bytes() == b"aaa", (
+        "an already-published file must survive a later copy's failure"
     )
 
 
 @pytest.mark.asyncio
-async def test_local_mode_cleans_staging_dir_when_second_copy_fails(tmp_path):
-    """A more targeted partial-failure: the first copy succeeds (file lands
-    in the staging dir), then the second copy fails. The cleanup must
-    remove the *entire* staging dir including the successfully-copied
-    first file — no partial artifact survives."""
+async def test_local_mode_partial_failure_leaves_no_part_file_and_logs_it(
+    tmp_path, caplog,
+):
+    """The one thing a failing publish *does* remove is its own scratch file:
+    that name is this call's alone, and leaving it would keep the staging dir
+    non-empty and defeat the consumer's ``rmdir``. What it leaves behind
+    instead is a WARNING naming the orphan, and the record the caller needs
+    to repeat that warning if the attempt goes on to fail."""
     shared = tmp_path / "shared"
     out_dir = tmp_path / "work" / "out"
     out_dir.mkdir(parents=True)
@@ -123,16 +137,27 @@ async def test_local_mode_cleans_staging_dir_when_second_copy_fails(tmp_path):
 
     task = _claimed(14, params={"input_path": "/ignored"})
     file_ctx = _file_ctx(out_dir)
+    staged: list[str] = []
 
-    with pytest.raises(FileNotFoundError):
-        await upload_outputs(
-            task, FakeBackendClient(), file_ctx,
-            output_files={"a": "a.stl", "b": "b.stl"},
-            shared_volume_path=str(shared),
-        )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(FileNotFoundError):
+            await upload_outputs(
+                task, FakeBackendClient(), file_ctx,
+                output_files={"a": "a.stl", "b": "b.stl"},
+                shared_volume_path=str(shared),
+                staged=staged,
+            )
 
     staging = shared / "temp" / "14"
-    assert not staging.exists()
+    assert os.listdir(staging) == ["a.stl"], (
+        "the failing copy must remove its own scratch file and nothing else"
+    )
+    assert staged == [str(staging / "a.stl")]
+    assert any(
+        "a.stl" in r.getMessage()
+        and "publishing failed partway through" in r.getMessage()
+        for r in caplog.records if r.levelname == "WARNING"
+    ), "the orphan this attempt left on the shared volume was not logged"
 
 
 @pytest.mark.asyncio
@@ -266,12 +291,11 @@ async def test_publish_survives_a_concurrent_attempts_cleanup_rmdir(
     """A concurrent attempt's cleanup removing the staging dir must not fail
     this publish.
 
-    ``temp/<task_id>`` is shared by every attempt of the task, and a failing
-    attempt's reclaim ``rmdir``s it the moment it comes up empty
-    (:func:`_reclaim_staged`) — which is exactly what it is in the window
-    between this attempt's ``mkdir`` and the moment its first copy creates a
-    scratch file in it. Losing that race used to fail an attempt whose
-    outputs were perfectly fine.
+    ``temp/<task_id>`` is the backend consumer's to sweep, and it ``rmdir``s
+    the dir the moment it comes up empty — which is exactly what it is in the
+    window between this attempt's ``mkdir`` and the moment its first copy
+    creates a scratch file in it. Losing that race used to fail an attempt
+    whose outputs were perfectly fine.
     """
     import os
     from task_worker_api import files as files_mod
@@ -796,8 +820,8 @@ async def test_upload_outputs_remote_aborts_mid_batch_when_cancel_set_after_firs
 @pytest.mark.asyncio
 async def test_upload_outputs_local_aborts_when_cancelled(tmp_path):
     """Local-mode (shared-volume staging) upload_outputs must also honor a
-    set ``cancelled`` event — abort between copies and clean up the partial
-    staging dir, rather than copying every remaining file."""
+    set ``cancelled`` event — abort between copies rather than copying every
+    remaining file, leaving nothing of its own behind."""
     import asyncio
     from task_worker_api.errors import TaskCancelled
 
@@ -821,9 +845,11 @@ async def test_upload_outputs_local_aborts_when_cancelled(tmp_path):
             cancelled=cancelled,
         )
 
-    # Cancel raised before the first copy → no staging dir created.
+    # Cancel raised before the first copy → the staging dir exists (it is
+    # made up front) but holds nothing: no output, and no scratch file. It is
+    # not removed — a re-queued attempt of this task publishes into it.
     staging = shared / "temp" / "53"
-    assert not staging.exists()
+    assert os.listdir(staging) == []
 
 
 @pytest.mark.asyncio
@@ -1057,8 +1083,8 @@ async def test_upload_outputs_local_aborts_on_mid_copy_cancel(
     tmp_path, monkeypatch,
 ):
     """Same for the local-mode staging copy in upload_outputs: a cancel
-    mid-copy raises TaskCancelled, and the existing partial-cleanup contract
-    still removes the whole staging dir."""
+    mid-copy raises TaskCancelled, and the half-written scratch file it was
+    filling goes with it — nothing published, and no litter."""
     import asyncio
     from task_worker_api import files as files_mod
     from task_worker_api.errors import TaskCancelled
@@ -1088,8 +1114,9 @@ async def test_upload_outputs_local_aborts_on_mid_copy_cancel(
     with pytest.raises(TaskCancelled, match="cancelled by user"):
         await uploading
 
-    assert not (shared / "temp" / "62").exists(), (
-        "staging dir must be cleaned up when a cancel aborts a copy mid-file"
+    assert os.listdir(shared / "temp" / "62") == [], (
+        "the aborted copy's scratch file must be removed when a cancel "
+        "aborts it mid-file"
     )
 
 
@@ -1270,58 +1297,6 @@ async def test_copyfile_async_copystat_failure_removes_copy(
         await files_mod._copyfile_async(src, dest)
 
     assert not dest.exists()
-
-
-# ---------------------------------------------------------------------------#
-# Local-mode staging cleanup runs off the event loop.
-#
-# The staging dir holds the outputs published so far (colmap-splat PLYs,
-# Neural-Canvas splats), so a synchronous ``shutil.rmtree`` freezes the loop
-# for the whole delete — the heartbeat stops ticking and the CancelGuard poll
-# stalls while the failure is being reported. Same bug class as the blocking
-# local-mode copies; these cleanups were missed.
-# ---------------------------------------------------------------------------#
-
-
-@pytest.mark.asyncio
-async def test_local_mode_staging_cleanup_runs_off_the_event_loop(
-    tmp_path, monkeypatch,
-):
-    """Unlinking the staged outputs must run in a worker thread, and must
-    still empty the dir — identical semantics, just off the loop."""
-    import threading
-    from task_worker_api import files as files_mod
-
-    loop_thread = threading.current_thread()
-    reclaim_threads: list[threading.Thread] = []
-    real_reclaim = files_mod._reclaim_staged
-
-    def spy_reclaim(published, dest_dir):
-        reclaim_threads.append(threading.current_thread())
-        return real_reclaim(published, dest_dir)
-
-    monkeypatch.setattr(files_mod, "_reclaim_staged", spy_reclaim)
-
-    shared = tmp_path / "shared"
-    out_dir = tmp_path / "work" / "out"
-    out_dir.mkdir(parents=True)
-    (out_dir / "a.stl").write_bytes(b"aaa")
-    # "b.stl" missing → the second copy raises, triggering the cleanup.
-
-    task = _claimed(71, params={"input_path": "/ignored"})
-
-    with pytest.raises(FileNotFoundError):
-        await upload_outputs(
-            task, FakeBackendClient(), _file_ctx(out_dir),
-            output_files={"a": "a.stl", "b": "b.stl"},
-            shared_volume_path=str(shared),
-        )
-
-    assert reclaim_threads, "staging dir was never cleaned up"
-    assert all(t is not loop_thread for t in reclaim_threads), (
-        "staging-dir cleanup ran on the event loop thread"
-    )
-    assert not (shared / "temp" / "71").exists()
 
 
 # ---------------------------------------------------------------------------#
@@ -1602,26 +1577,23 @@ async def test_upload_outputs_no_shared_volume_rejects_escaping_name(tmp_path):
             shared_volume_path=None,
         )
 
-
 # ---------------------------------------------------------------------------#
-# discard_published_outputs — cleanup for a task that publishes, then fails
+# _warn_published_orphans — the artifacts a failing attempt leaves behind
 # ---------------------------------------------------------------------------#
-# upload_outputs only cleans up after its *own* partial failure. A publish
-# that fully succeeds and is followed by a failing attempt (a cancel landing
-# after the last upload, a watchdog deadline, an unencodable result) leaves
-# artifacts the backend never sweeps — it only sweeps for tasks it recorded as
-# complete. This is the reclaim for that case.
-
-
-def _owned(*paths):
-    """The ownership record ``upload_outputs`` fills as it stages each file."""
-    from task_worker_api.files import _staged_identity
-
-    return {str(p): _staged_identity(p) for p in paths}
+# A publish that fully succeeds and is followed by a failing attempt (a cancel
+# landing after the last upload, a watchdog deadline, an unencodable result)
+# leaves artifacts the backend never sweeps — it only sweeps for tasks it
+# recorded as complete. The SDK logs them; it does not delete them. temp/<id>
+# is shared with every re-queued attempt of the task, so a delete here can
+# land on a live successor's output, and a stat-then-unlink ownership check
+# does not close that window. Reclamation is deferred until the fleet has an
+# attempt-unique staging path or a lease on the shared one.
 
 
 @pytest.mark.asyncio
-async def test_discard_removes_the_local_staging_dir(tmp_path):
+async def test_warn_leaves_the_local_staging_dir_and_its_files_alone(
+    tmp_path, caplog,
+):
     shared = tmp_path / "shared"
     staging = shared / "temp" / "31"
     staging.mkdir(parents=True)
@@ -1629,63 +1601,60 @@ async def test_discard_removes_the_local_staging_dir(tmp_path):
     (staging / "b.stl").write_bytes(b"published-b")
 
     task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
-    await discard_published_outputs(
-        task, str(shared), _owned(staging / "a.stl", staging / "b.stl"),
-        reason="the task failed",
-    )
+    with caplog.at_level("WARNING"):
+        _warn_published_orphans(
+            task, str(shared),
+            [str(staging / "a.stl"), str(staging / "b.stl")],
+            reason="the task is being reported failed",
+        )
 
-    assert not staging.exists()
-    # Only this task's dir goes — the shared volume itself is untouched.
-    assert shared.exists()
-
-
-@pytest.mark.asyncio
-async def test_discard_leaves_other_tasks_staging_dirs_alone(tmp_path):
-    shared = tmp_path / "shared"
-    (shared / "temp" / "31").mkdir(parents=True)
-    sibling = shared / "temp" / "32"
-    sibling.mkdir(parents=True)
-    (sibling / "keep.stl").write_bytes(b"other task's output")
-
-    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
-    await discard_published_outputs(task, str(shared), {}, reason="failed")
-
-    assert not (shared / "temp" / "31").exists()
-    assert (sibling / "keep.stl").read_bytes() == b"other task's output"
+    assert (staging / "a.stl").read_bytes() == b"published-a"
+    assert (staging / "b.stl").read_bytes() == b"published-b"
+    assert sorted(os.listdir(staging)) == ["a.stl", "b.stl"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "a.stl" in m and "b.stl" in m and "reported failed" in m
+        and str(staging) in m
+        for m in warnings
+    ), warnings
 
 
 @pytest.mark.asyncio
-async def test_discard_is_a_noop_when_no_staging_dir_exists(tmp_path):
-    """A task that failed before publishing anything has nothing to reclaim,
-    and must not turn that into a second failure."""
+async def test_warn_is_silent_when_nothing_was_published(tmp_path, caplog):
+    """A task that failed before publishing anything has no orphan to report,
+    and must not manufacture a warning about one."""
     shared = tmp_path / "shared"
     shared.mkdir()
     task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
 
-    await discard_published_outputs(task, str(shared), None, reason="failed")
+    with caplog.at_level("WARNING"):
+        _warn_published_orphans(task, str(shared), None, reason="failed")
+        _warn_published_orphans(task, str(shared), [], reason="failed")
 
-    assert shared.exists()
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
 
 @pytest.mark.asyncio
-async def test_discard_without_shared_volume_is_a_noop(tmp_path):
+async def test_warn_without_shared_volume_is_silent(tmp_path, caplog):
     """No shared volume means outputs never left the per-task workdir, which
-    ``Worker._run_one`` removes after every attempt."""
+    ``Worker._run_one`` removes after every attempt — nothing is orphaned."""
     task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
-    await discard_published_outputs(
-        task, None, {"/tmp/whatever": None}, reason="x",
-    )
+
+    with caplog.at_level("WARNING"):
+        _warn_published_orphans(task, None, ["/tmp/whatever"], reason="x")
+
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
 
 @pytest.mark.asyncio
-async def test_discard_warns_for_remote_uploads_it_cannot_delete(tmp_path, caplog):
-    """Remote mode has no delete route, so the reclaim is a log an operator
-    can reconcile from — not silence."""
+async def test_warn_names_remote_uploads_it_cannot_delete(tmp_path, caplog):
+    """Remote mode has no delete route, so the log an operator can reconcile
+    from is the whole remedy — silence here is how these went unnoticed."""
     task = _claimed(31, params={"input_files": {"mesh": "in.ply"}})
 
     with caplog.at_level("WARNING"):
-        await discard_published_outputs(
-            task, str(tmp_path / "shared"), {"a.stl": None, "b.stl": None},
+        _warn_published_orphans(
+            task, str(tmp_path / "shared"), ["a.stl", "b.stl"],
             reason="the task is being reported failed",
         )
 
@@ -1697,123 +1666,39 @@ async def test_discard_warns_for_remote_uploads_it_cannot_delete(tmp_path, caplo
 
 
 @pytest.mark.asyncio
-async def test_discard_leaves_a_requeued_attempts_outputs_alone(tmp_path, caplog):
-    """The reclaim must not delete a *newer* attempt's outputs.
-
-    Every attempt of a task stages into the same ``temp/<task_id>``, and a
-    failing attempt cannot assume it is still the current one: the watchdog
-    reports a timeout ``fail`` from its own thread while the event loop is
-    wedged, and the backend's stale-task sweeper re-queues a task whose
-    heartbeat lapsed with no report at all. Either way a second attempt can
-    have republished into that directory before this one resumes and cleans
-    up — and deleting a live attempt's outputs is worse than the orphan this
-    cleanup exists to prevent.
-    """
-    shared = tmp_path / "shared"
-    staging = shared / "temp" / "31"
-    staging.mkdir(parents=True)
-    mine = staging / "a.stl"
-    theirs = staging / "b.stl"
-    mine.write_bytes(b"attempt-1")
-    theirs.write_bytes(b"attempt-1")
-    published = _owned(mine, theirs)
-
-    # The task is re-queued; a second attempt republishes into the same path.
-    mine.write_bytes(b"attempt-2 (regenerated, different bytes)")
-    theirs.unlink()
-
+async def test_warn_never_raises(tmp_path, caplog):
+    """Contract: this runs while a failure is already being reported, on the
+    path that still owes the backend a terminal status. An error here must not
+    displace the real failure."""
     task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+
+    class _Exploding(list):
+        def __len__(self):
+            raise OSError("boom")
+
     with caplog.at_level("WARNING"):
-        await discard_published_outputs(
-            task, str(shared), published, reason="the task failed",
+        _warn_published_orphans(
+            task, str(tmp_path / "shared"), _Exploding(["a.stl"]),
+            reason="failed",
         )
 
-    assert mine.read_bytes() == b"attempt-2 (regenerated, different bytes)"
-    # And the directory the new attempt is staging into survives with it.
-    assert staging.exists()
     assert any(
-        "no longer the files this attempt published" in r.getMessage()
-        for r in caplog.records if r.levelname == "WARNING"
+        "could not report published outputs" in r.getMessage()
+        for r in caplog.records
     )
-
-
-@pytest.mark.asyncio
-async def test_discard_spares_a_requeued_attempt_that_regenerated_identical_bytes(
-    tmp_path, caplog,
-):
-    """The same guard, in the case size alone cannot see.
-
-    The sibling test above lets a *shorter* record catch the successor: its
-    bytes differ in length. The fleet's normal re-run does not. A re-queued
-    task runs the same deterministic pipeline over the same inputs and
-    regenerates a byte-identical artifact, and the copy overwrites the path
-    in place (``copyfile`` truncates rather than replaces), so the successor's
-    file has this attempt's inode *and* its size. Only the timestamps moved —
-    ``copystat`` stamps the successor's source mtime, and ctime is the
-    kernel's on every write — which is why the record carries them. Reduce
-    :func:`_staged_identity` to ``(st_ino, st_size)`` and this attempt
-    silently deletes a live successor's published output.
-    """
-    shared = tmp_path / "shared"
-    staging = shared / "temp" / "31"
-    staging.mkdir(parents=True)
-    mine = staging / "a.stl"
-    mine.write_bytes(b"deterministic-output")
-    published = _owned(mine)
-    before = mine.stat()
-
-    # The re-queued attempt republishes: same path, same deterministic bytes,
-    # overwritten in place. os.utime models copystat stamping *its* source's
-    # mtime, so the test does not lean on filesystem timestamp granularity.
-    mine.write_bytes(b"deterministic-output")
-    os.utime(mine, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
-
-    after = mine.stat()
-    # The hard case really is the one under test: only timestamps separate them.
-    assert (after.st_ino, after.st_size) == (before.st_ino, before.st_size)
-
-    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
-    with caplog.at_level("WARNING"):
-        await discard_published_outputs(
-            task, str(shared), published, reason="the task failed",
-        )
-
-    assert mine.read_bytes() == b"deterministic-output"
-    assert staging.exists()
-    assert any(
-        "no longer the files this attempt published" in r.getMessage()
-        for r in caplog.records if r.levelname == "WARNING"
-    )
-
-
-@pytest.mark.asyncio
-async def test_discard_only_touches_its_own_staging_dir(tmp_path):
-    """The record is an unlink list, so it is a trust boundary: a path that
-    is not in this task's staging dir is never removed."""
-    shared = tmp_path / "shared"
-    (shared / "temp" / "31").mkdir(parents=True)
-    outsider = tmp_path / "not-a-staged-output.stl"
-    outsider.write_bytes(b"keep me")
-
-    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
-    await discard_published_outputs(
-        task, str(shared), _owned(outsider), reason="failed",
-    )
-
-    assert outsider.read_bytes() == b"keep me"
 
 
 @pytest.mark.asyncio
 async def test_upload_outputs_records_what_it_staged(tmp_path):
-    """The ownership record is filled as each copy lands — recording it after
-    the publish would capture a concurrent attempt's file as this one's."""
+    """The record is filled as each artifact is published, so the caller can
+    name the orphans if the attempt still ends failed."""
     shared = tmp_path / "shared"
     out_dir = tmp_path / "work" / "out"
     out_dir.mkdir(parents=True)
     (out_dir / "a.stl").write_bytes(b"aaa")
 
     task = _claimed(71, params={"input_path": "/ignored"})
-    staged: dict = {}
+    staged: list[str] = []
     manifest = await upload_outputs(
         task, FakeBackendClient(), _file_ctx(out_dir),
         output_files={"a": "a.stl"}, shared_volume_path=str(shared),
@@ -1822,28 +1707,62 @@ async def test_upload_outputs_records_what_it_staged(tmp_path):
 
     dest = shared / "temp" / "71" / "a.stl"
     assert manifest == {"a": str(dest)}
-    assert list(staged) == [str(dest)]
-    from task_worker_api.files import _staged_identity
-    assert staged[str(dest)] == _staged_identity(dest)
+    assert staged == [str(dest)]
+
 
 @pytest.mark.asyncio
-async def test_discard_never_raises_when_cleanup_fails(tmp_path, caplog, monkeypatch):
-    """Contract: this runs while a failure is already being reported, on the
-    path that still owes the backend a terminal status. A cleanup error must
-    not displace the real failure."""
+async def test_a_successor_publishing_mid_warning_keeps_its_output(tmp_path):
+    """Regression: a stale attempt's failure handling must never remove a
+    successor's published path.
+
+    Every attempt of a task stages into the same ``temp/<task_id>``, and a
+    failing attempt cannot assume it is still the current one — the watchdog
+    reports a timeout ``fail`` from its own thread while the event loop is
+    wedged, and the backend's stale-task sweeper re-queues a task whose
+    heartbeat lapsed with no report at all. Barriers pin the interleaving that
+    used to lose the successor's file: the stale attempt observes the path
+    (what an ownership check would have done), *then* the successor's
+    ``os.replace`` lands, and only then does the stale attempt act on its
+    observation. It must still be there afterwards.
+    """
+    import threading
+
     shared = tmp_path / "shared"
-    (shared / "temp" / "31").mkdir(parents=True)
+    staging = shared / "temp" / "31"
+    staging.mkdir(parents=True)
+    published = staging / "a.stl"
+    published.write_bytes(b"stale attempt's output")
 
-    def boom(*a, **kw):
-        raise OSError("read-only filesystem")
+    observed = threading.Barrier(2)
+    republished = threading.Barrier(2)
 
-    monkeypatch.setattr("task_worker_api.files._reclaim_staged", boom)
-    task = _claimed(31, params={"input_path": str(tmp_path / "in.stl")})
+    def stale_failure_handling():
+        # Whatever the stale attempt learns about the path, it learns here.
+        os.stat(published)
+        observed.wait(timeout=5)
+        republished.wait(timeout=5)
+        _warn_published_orphans(
+            _claimed(31, params={"input_path": str(tmp_path / "in.stl")}),
+            str(shared), [str(published)], reason="the task failed",
+        )
 
-    with caplog.at_level("WARNING"):
-        await discard_published_outputs(task, str(shared), {}, reason="failed")
+    def successor_publishes():
+        observed.wait(timeout=5)
+        part = staging / ".successor.part"
+        part.write_bytes(b"successor's output")
+        os.replace(part, published)  # atomic publish onto the same name
+        republished.wait(timeout=5)
 
-    assert any(
-        "could not discard published outputs" in r.getMessage()
-        for r in caplog.records
-    )
+    threads = [
+        threading.Thread(target=stale_failure_handling),
+        threading.Thread(target=successor_publishes),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive()
+
+    assert published.read_bytes() == b"successor's output"
+    assert os.listdir(staging) == ["a.stl"]
+    assert staging.exists()
