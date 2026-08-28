@@ -28,6 +28,16 @@ a watchdog deadline, an unencodable result — see ``Worker._run_one``) —
 removes only its own uniquely named ``.part`` scratch file, and its caller
 logs what it left behind; see :func:`_warn_published_orphans`.
 
+An attempt that is *killed* (SIGKILL, the watchdog's ``os._exit``) runs no
+cleanup at all, so its scratch file outlives it and would keep the staging
+dir non-empty forever — the consumer's non-recursive ``rmdir`` never
+succeeds, and the directory the ``temp/`` layout exists to avoid leaks once
+per killed publish. Scratch files are therefore written under an exclusive
+``flock`` the kernel drops on process death, and every local publish first
+reclaims the ones whose lock it can take: dead predecessors' residue goes,
+a live successor's file stays. See :func:`_open_scratch` and
+:func:`_sweep_dead_scratch`.
+
 Reclaiming those orphans is deferred, deliberately. ``temp/<task_id>`` is
 shared by every attempt of the task, and a failing attempt cannot prove the
 file at a published name is still the one it wrote: the backend can already
@@ -53,11 +63,17 @@ import inspect
 import logging
 import ntpath
 import os
+import re
 import shutil
 import stat
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — non-POSIX; workers run on Linux
+    fcntl = None  # type: ignore[assignment]
 
 from .context import ClaimedTask, FileContext
 from .errors import CrossBoxLocalModeError, ProtocolError, TaskCancelled
@@ -66,6 +82,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from .client import BackendClient
 
 log = logging.getLogger(__name__)
+
+#: The scratch names :func:`_stage_output` publishes through:
+#: ``.<uuid4 hex>.part``. Matched exactly, because :func:`_sweep_dead_scratch`
+#: unlinks what it matches and a published output may legitimately start with
+#: a dot.
+_SCRATCH_NAME_RE = re.compile(r"\.[0-9a-f]{32}\.part")
 
 #: Bytes moved per ``_copyfile_async`` iteration. Each filesystem operation is
 #: offloaded from the event-loop thread; chunking adds cancellation points
@@ -515,6 +537,13 @@ async def upload_outputs(
     touched: the staging path is shared by every attempt of the task, and
     this attempt cannot prove the file at a published name is still its own.
 
+    A killed attempt cleans up nothing, so before staging anything this
+    reclaims the scratch files left in ``temp/<task_id>`` by attempts that no
+    longer exist — proven by their ``flock`` being free — and leaves a live
+    concurrent attempt's alone. That is what keeps the staging dir sweepable
+    by the consumer's ``rmdir`` across a mid-publish kill; see
+    :func:`_sweep_dead_scratch`.
+
     Warning about those leftovers is the *caller's* job, not this function's:
     a partial publish fails the attempt, and the attempt's terminal path
     already warns about everything it published (``Worker._run_one``, via
@@ -597,6 +626,10 @@ async def upload_outputs(
         # artifacts to their permanent home.
         dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
         dest_dir.mkdir(parents=True, exist_ok=True)
+        # Off the loop: it stats and unlinks on the shared volume, which can
+        # be a slow mount, and nothing here is cancellation-critical — no
+        # artifact has been published yet.
+        await asyncio.to_thread(_sweep_dead_scratch, dest_dir)
         manifest: dict[str, str] = {}
         for key, (filename, src) in output_sources.items():
             if cancelled is not None and cancelled.is_set():
@@ -623,6 +656,121 @@ async def upload_outputs(
     }
 
 
+def _open_scratch(dest: Path) -> "tuple[Path, int | None]":
+    """Create this publish's scratch file and hold it locked while it is written.
+
+    The scratch name is unique per call, which is what makes removing it on
+    failure safe — but only for a failure the process lives through. A worker
+    killed mid-copy (SIGKILL from the container runtime, the watchdog's
+    ``os._exit`` hard exit on an in-process wedge) runs no cleanup at all, and
+    leaves a ``.part`` file in ``temp/<task_id>`` that outlives it. Nothing
+    could then tell that file apart from a *live* attempt's scratch file, so
+    nothing dared remove it: it sat in the staging dir keeping the backend
+    consumer's non-recursive ``rmdir`` from ever succeeding, one leaked
+    directory (plus a partial GB-scale artifact) per killed publish.
+
+    An exclusive ``flock`` held for the lifetime of the scratch file is the
+    difference, because the kernel drops it when the process dies however it
+    dies. A lock that can still be taken therefore means no live attempt is
+    writing that file, which is exactly what :func:`_sweep_dead_scratch` needs
+    to reclaim a predecessor's leftovers without touching a running one's.
+
+    Returns the scratch path and the locked descriptor, or ``None`` for the
+    descriptor when the platform or filesystem has no ``flock`` (Windows;
+    exotic mounts). Unlocked is the pre-existing behaviour and stays safe:
+    the sweep refuses to reclaim what it cannot prove is dead, so those
+    scratch files are simply never swept.
+    """
+    # Fixed-length name: an output filename has no length limit of its own,
+    # so building the scratch name out of it could overrun NAME_MAX.
+    part = dest.with_name(f".{uuid.uuid4().hex}.part")
+    for _ in range(2):
+        # O_EXCL so this is provably a name nothing else holds, and created
+        # *before* the copy opens it: the gap it closes is the copy's own
+        # first write, which is where a multi-GB publish spends its time and
+        # so where a kill lands.
+        fd = os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                pass  # filesystem without flock — leave it unlocked
+            else:
+                if os.fstat(fd).st_nlink:
+                    return part, fd
+                # A concurrent attempt's sweep unlinked this name in the
+                # window between the create and the lock, so the lock now
+                # protects an inode no name points at. Take a fresh name —
+                # once, since losing twice means losing the same microsecond
+                # window on both tries; the copy creates whatever it is
+                # handed, and an unlocked scratch file is merely unsweepable.
+                os.close(fd)
+                part = dest.with_name(f".{uuid.uuid4().hex}.part")
+                continue
+        os.close(fd)
+        break
+    return part, None
+
+
+def _sweep_dead_scratch(dest_dir: Path) -> None:
+    """Remove scratch files left by attempts that were killed mid-publish.
+
+    Called once per local publish, before this attempt stages anything, so a
+    retry of a task whose predecessor was killed mid-copy starts from a
+    staging dir holding published outputs and nothing else — the layout
+    ``docs/fleet/conventions.md`` § 10 promises consumers, whose sweep is a
+    non-recursive ``rmdir`` that any leftover defeats.
+
+    Only a file whose lock this can take is removed: a live attempt of the
+    same task holds an exclusive ``flock`` on its scratch file for as long as
+    it is writing it (see :func:`_open_scratch`), and the kernel releases it
+    when — and only when — that process dies. So this reclaims a dead
+    predecessor's residue and leaves a running successor's alone, which is
+    the distinction that made blanket reclamation unsafe. Anything it cannot
+    prove is dead it leaves in place, including every scratch file on a
+    filesystem without ``flock``: an orphan an operator sweeps beats
+    destroying a live publish.
+
+    Published outputs are never candidates — only the exact
+    ``.<uuid4 hex>.part`` shape is, and only inside this task's own staging
+    dir. Best-effort throughout: a publish must not fail over housekeeping.
+    """
+    if fcntl is None:
+        return
+    try:
+        names = os.listdir(dest_dir)
+    except OSError:
+        return
+    swept = []
+    for name in names:
+        if not _SCRATCH_NAME_RE.fullmatch(name):
+            continue
+        path = dest_dir / name
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            continue  # a live attempt is writing it, or the fs has no locks
+        else:
+            try:
+                os.unlink(path)
+                swept.append(name)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+    if swept:
+        log.warning(
+            "reclaimed %d abandoned scratch file(s) (%s) under %s: a previous "
+            "attempt of this task was killed mid-publish. Its partial output "
+            "is gone; this attempt republishes from scratch.",
+            len(swept), ", ".join(swept), dest_dir,
+        )
+
+
 async def _stage_output(
     src: Path,
     dest: Path,
@@ -646,7 +794,12 @@ async def _stage_output(
 
     The scratch name is this call's alone, which is what makes removing it on
     failure safe — it is the only name in the staging dir no other attempt
-    can hold. The published name is never removed; see the module docstring.
+    can hold. It is also held under an exclusive ``flock`` for as long as it
+    exists, so the one failure this call cannot clean up after — being killed
+    outright, mid-copy — leaves a scratch file the *next* attempt can prove
+    dead and reclaim; see :func:`_open_scratch` and
+    :func:`_sweep_dead_scratch`. The published name is never removed; see the
+    module docstring.
 
     The returned ``(st_dev, st_ino)`` is that same scratch file's, read before
     the rename that moves it onto ``dest`` — so it identifies the artifact
@@ -655,31 +808,26 @@ async def _stage_output(
     whose published name a concurrent attempt has since taken over can find
     out before it reports a manifest pointing at the other attempt's bytes.
     """
-    # Fixed-length name: an output filename has no length limit of its own,
-    # so building the scratch name out of it could overrun NAME_MAX.
-    part = dest.with_name(f".{uuid.uuid4().hex}.part")
     try:
-        try:
-            await _copyfile_async(
-                src, part, cancelled=cancelled, cancel_message=cancel_message,
-            )
-        except FileNotFoundError:
-            if dest.parent.exists():
-                raise  # the *source* is what's missing; not ours to repair
-            # The staging dir is the backend consumer's to sweep, and it
-            # ``rmdir``s it the moment it comes up empty — which is exactly
-            # what it is between our caller's mkdir and the first copy
-            # creating a scratch file in it. Losing that race would fail an
-            # attempt whose outputs are fine. The dir being gone is the whole
-            # problem and mkdir makes it again, so remaking it is the whole
-            # repair: one retry, because losing twice means losing the same
-            # sub-millisecond window on both tries. Later files are already
-            # safe — by then the dir holds this attempt's published outputs,
-            # so it is not empty for anyone to remove.
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            await _copyfile_async(
-                src, part, cancelled=cancelled, cancel_message=cancel_message,
-            )
+        part, lock_fd = _open_scratch(dest)
+    except FileNotFoundError:
+        # The staging dir is the backend consumer's to sweep, and it
+        # ``rmdir``s it the moment it comes up empty — which is exactly what
+        # it is between our caller's mkdir and this scratch file's creation.
+        # Losing that race would fail an attempt whose outputs are fine. The
+        # dir being gone is the whole problem and mkdir makes it again, so
+        # remaking it is the whole repair: one retry, because losing twice
+        # means losing the same sub-millisecond window on both tries. Only
+        # the create can lose it: from here on the dir holds this attempt's
+        # scratch file, so a non-recursive rmdir cannot empty it — which is
+        # why the copy below now treats ``FileNotFoundError`` as the *source*
+        # being missing, and leaves that to the caller as before.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part, lock_fd = _open_scratch(dest)
+    try:
+        await _copyfile_async(
+            src, part, cancelled=cancelled, cancel_message=cancel_message,
+        )
         # Read from the scratch name, never from ``dest`` after the rename:
         # ``dest`` is shared with every attempt of this task, so a successor's
         # publish landing in the interval would be adopted as this attempt's —
@@ -717,6 +865,12 @@ async def _stage_output(
         except OSError:
             pass
         raise
+    finally:
+        # Releases the scratch file's lock. Past the rename there is nothing
+        # left to protect: the inode is published under a name no sweep looks
+        # at, and this attempt owns it until a successor renames over it.
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def _unowned_outputs(

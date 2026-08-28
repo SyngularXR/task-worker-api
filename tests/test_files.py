@@ -229,6 +229,140 @@ async def test_local_mode_stages_flat_so_a_consumer_can_rmdir_the_task_dir(
 
 
 @pytest.mark.asyncio
+async def test_a_killed_attempts_scratch_file_is_reclaimed_by_the_next_attempt(
+    tmp_path,
+):
+    """A worker killed mid-publish runs no cleanup; the next attempt must do
+    it, or the staging dir never ``rmdir``s again.
+
+    ``_stage_output``'s ``except BaseException`` covers every failure the
+    process survives — but not a SIGKILL from the container runtime, and not
+    the watchdog's ``os._exit`` hard exit on an in-process wedge, which is a
+    routine fleet event. The ``.part`` file then outlives the attempt that
+    wrote it and sits in ``temp/<task_id>`` for good: the consumer's
+    non-recursive ``rmdir`` (SynPusher-Vue's ``cleanup_task_staging_dir``)
+    finds the directory non-empty and leaks it, together with the partial —
+    GB-scale, for a colmap-splat PLY — artifact inside.
+    """
+    import os
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    # What a killed predecessor leaves behind: a scratch file whose lock the
+    # kernel released when the process died.
+    staging = shared / "temp" / "70"
+    staging.mkdir(parents=True)
+    abandoned = staging / f".{'a1' * 16}.part"
+    abandoned.write_bytes(b"half of a multi-GB artifact")
+
+    manifest = await upload_outputs(
+        _claimed(70, params={"input_path": "/ignored"}),
+        FakeBackendClient(), _file_ctx(out_dir),
+        output_files={"a": "a.stl"},
+        shared_volume_path=str(shared),
+    )
+
+    assert not abandoned.exists(), (
+        "a dead attempt's scratch file must be reclaimed — nothing else ever "
+        "removes it, and it defeats the consumer's rmdir"
+    )
+    assert os.listdir(staging) == ["a.stl"]
+
+    # The consumer's contract, end to end: move the outputs out, then rmdir.
+    os.replace(manifest["a"], tmp_path / "a.stl")
+    os.rmdir(staging)
+
+
+@pytest.mark.asyncio
+async def test_a_live_attempts_scratch_file_survives_the_reclaim(tmp_path):
+    """Reclaiming must not touch a *running* attempt's scratch file.
+
+    Every attempt of a task stages into the same ``temp/<task_id>``, so the
+    reclaim runs while a concurrent attempt may be minutes into a multi-GB
+    copy. It removes only what it can lock, and a live publish holds its
+    scratch file locked for as long as that file exists — which is the whole
+    difference between reclaiming residue and destroying someone's publish.
+    """
+    import os
+
+    fcntl = pytest.importorskip("fcntl")
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    staging = shared / "temp" / "71"
+    staging.mkdir(parents=True)
+    live = staging / f".{'b2' * 16}.part"
+    fd = os.open(live, os.O_CREAT | os.O_WRONLY, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        await upload_outputs(
+            _claimed(71, params={"input_path": "/ignored"}),
+            FakeBackendClient(), _file_ctx(out_dir),
+            output_files={"a": "a.stl"},
+            shared_volume_path=str(shared),
+        )
+        assert live.exists(), (
+            "the scratch file of an attempt that is still writing it must "
+            "survive — unlinking it fails a live publish"
+        )
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.asyncio
+async def test_a_publish_holds_its_scratch_file_locked_while_it_writes(
+    tmp_path, monkeypatch,
+):
+    """The lock the reclaim reads must be held across the copy — the window a
+    kill actually lands in, and where a multi-GB publish spends its time.
+
+    Without it every scratch file looks dead, so a concurrent attempt's
+    reclaim would unlink one being written.
+    """
+    import os
+
+    fcntl = pytest.importorskip("fcntl")
+    from task_worker_api import files as files_mod
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+
+    real_copy = files_mod._copyfile_async
+    probes = []
+
+    async def probing_copy(src, dest, **kwargs):
+        fd = os.open(dest, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            probes.append("locked")
+        else:
+            probes.append("free")
+        finally:
+            os.close(fd)
+        return await real_copy(src, dest, **kwargs)
+
+    monkeypatch.setattr(files_mod, "_copyfile_async", probing_copy)
+
+    await upload_outputs(
+        _claimed(72, params={"input_path": "/ignored"}),
+        FakeBackendClient(), _file_ctx(out_dir),
+        output_files={"a": "a.stl"},
+        shared_volume_path=str(shared),
+    )
+
+    assert probes == ["locked"]
+
+
+@pytest.mark.asyncio
 async def test_publish_leaves_a_concurrent_attempts_file_intact(
     tmp_path, monkeypatch,
 ):
@@ -292,9 +426,9 @@ async def test_publish_survives_a_concurrent_attempts_cleanup_rmdir(
 
     ``temp/<task_id>`` is the backend consumer's to sweep, and it ``rmdir``s
     the dir the moment it comes up empty — which is exactly what it is in the
-    window between this attempt's ``mkdir`` and the moment its first copy
-    creates a scratch file in it. Losing that race used to fail an attempt
-    whose outputs were perfectly fine.
+    window between this attempt's ``mkdir`` and the moment it creates its
+    first scratch file in it. Losing that race used to fail an attempt whose
+    outputs were perfectly fine.
     """
     import os
     from task_worker_api import files as files_mod
@@ -304,17 +438,17 @@ async def test_publish_survives_a_concurrent_attempts_cleanup_rmdir(
     out_dir.mkdir(parents=True)
     (out_dir / "a.stl").write_bytes(b"aaa")
 
-    real_copy = files_mod._copyfile_async
-    copies = []
+    real_open_scratch = files_mod._open_scratch
+    opens = []
 
-    async def racing_copy(src, dest, **kwargs):
-        copies.append(dest)
-        if len(copies) == 1:
+    def racing_open_scratch(dest):
+        opens.append(dest)
+        if len(opens) == 1:
             # The other attempt's reclaim found the dir empty and took it.
             os.rmdir(dest.parent)
-        return await real_copy(src, dest, **kwargs)
+        return real_open_scratch(dest)
 
-    monkeypatch.setattr(files_mod, "_copyfile_async", racing_copy)
+    monkeypatch.setattr(files_mod, "_open_scratch", racing_open_scratch)
 
     manifest = await upload_outputs(
         _claimed(64, params={"input_path": "/ignored"}),

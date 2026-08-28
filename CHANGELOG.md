@@ -112,6 +112,25 @@
   `temp/<task_id>/`, `output_files` still carries their absolute paths, and a
   consumer that moves the artifacts out and `rmdir`s `temp/<task_id>`
   non-recursively still finds it empty.
+- A worker killed mid-publish no longer strands its scratch file on the shared
+  volume. The cleanup above covers every failure the process lives through, but
+  not a SIGKILL from the container runtime and not the watchdog's `os._exit`
+  hard exit on an in-process wedge — a routine fleet event. The `.part` file
+  outlived the attempt that wrote it, and nothing could tell it apart from a
+  *live* attempt's scratch file, so nothing removed it: `temp/<task_id>` stayed
+  non-empty for good, the consumer's non-recursive `rmdir` never succeeded
+  again, and one staging directory plus one partial (GB-scale, for a
+  colmap-splat PLY) artifact leaked per killed publish — which would have made
+  the unchanged on-volume contract above false. Scratch files are now written
+  under an exclusive `flock` held for as long as the file exists, and every
+  local publish reclaims the scratch files in its staging dir whose lock it can
+  take *before* staging anything of its own. The kernel releases that lock when
+  — and only when — the process holding it dies, so lockable means written by an
+  attempt that no longer exists: a dead predecessor's residue goes, a running
+  successor's file stays. Only the exact `.<32 hex>.part` shape is a candidate,
+  and only inside that task's own staging dir; anything the SDK cannot prove is
+  dead is left in place, including every scratch file on a filesystem without
+  `flock`, where behaviour is unchanged. Needs nothing from consumers.
 - The rename that publishes a local-mode output no longer runs in
   `asyncio.to_thread`. `to_thread` cannot be cancelled — cancelling the await
   abandons the worker thread, which performs the rename anyway — so a task
