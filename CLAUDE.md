@@ -58,14 +58,14 @@ artifacts/task-worker-types/  Generated TypeScript artifact (committed; drift-ch
 
 ```bash
 pip install -e ".[dev]"   # editable install — required, the package is shipped, not vendored
-pytest -q                  # 52 tests at v0.5.0
+pytest -q                  # 551 tests at v0.16.0
 ```
 
 Test framework: pytest + pytest-asyncio. Integration tests in `tests/test_payload_log_integration.py` use `httpx.MockTransport` (built-in, no extra dep) to exercise paths `FakeBackendClient` bypasses.
 
-## Cross-repo coordinates (as of v0.5.0)
+## Cross-repo coordinates (as of v0.16.0)
 
-- **SDK release tag**: `v0.5.0` — see [`docs/fleet/workers.json`](docs/fleet/workers.json) `sdk.current_release` for the live value.
+- **SDK release tag**: `v0.16.0` — see [`docs/fleet/workers.json`](docs/fleet/workers.json) `sdk.current_release` for the live value.
 - **Workers consuming the SDK**: Neural-Canvas, Blender-CLI, colmap-splat. Status per worker in `workers.json`.
 - **Deployment**: surgiclaw in `syngar-deployment-scripts`. Mounts `${SHARED_DATA_PATH}:/app/shared` for every worker.
 - **Backend**: SynPusher-Vue's Nexus Core dispatches tasks. Should fetch `workers.json` to know handler routing.

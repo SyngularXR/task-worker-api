@@ -623,7 +623,7 @@ Look at these for reference when building yours:
 | Repo | Task types | Cancel pattern | Notes |
 |---|---|---|---|
 | [Blender-CLI](https://github.com/SyngularXR/Blender-CLI) | `detect_cut_planes`, `model_initializing` | Subprocess (Pattern 2) | Shells out to `blender-pipe` because bpy segfaults on threadpools. Minimal main.py. |
-| [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `gs_build` | Subprocess (Pattern 2) | Wraps run.sh + tails status.json + stall detection. Custom cancel_then_terminate watcher. |
+| [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `gs_build`, `spatial_gs_build` | Subprocess (Pattern 2) | Wraps run.sh + tails status.json + stall detection. Custom cancel_then_terminate watcher. |
 | [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `segmentation`, `spatial_recon` | Threadpool (Pattern 3) | Hybrid mode: FastAPI app + Worker on one loop via `run_hybrid`; one shared admission guard serializes GPU work. |
 
 ---

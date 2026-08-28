@@ -21,7 +21,7 @@ The companion [`docs/adding-a-worker.md`](../adding-a-worker.md) is the deeper "
 |---|---|---|---|---|---|
 | `neural-canvas` | [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `syngular/neural-canvas` | `segmentation`, `spatial_recon` | hybrid (FastAPI + worker) | single |
 | `blender-worker` | [Blender-CLI](https://github.com/SyngularXR/Blender-CLI) | `syngular/blender-worker` | `optimize`, `uv_unwrap`, `render`, `pipeline`, `cinematic_baking`, `model_initializing`, `detect_cut_planes` | polling | single |
-| `colmap-splat-worker` | [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `syngular/colmap-splat-worker` | `gs_build` | polling | horizontal |
+| `colmap-splat-worker` | [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `syngular/colmap-splat-worker` | `gs_build`, `spatial_gs_build` | polling | horizontal |
 
 For the canonical, machine-readable version of this table — **including current SDK pin per worker, env var contracts, and links** — see [`workers.json`](workers.json).
 
