@@ -3,6 +3,8 @@
 ## Unreleased
 
 **Features:**
+- Add the dedicated `spatial_gs_build` task contract for independently training
+  Gaussian Auras from completed spatial captures.
 - Add the strict `spatial_recon` task params contract and packaged
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
