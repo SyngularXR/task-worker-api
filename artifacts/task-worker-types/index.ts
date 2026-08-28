@@ -18,6 +18,7 @@ export type TaskType =
   | 'finalize_synthetic'
   | 'finalize_segment'
   | 'spatial_recon'
+  | 'spatial_gs_build'
 ;
 
 export const TaskType = {
@@ -34,6 +35,7 @@ export const TaskType = {
   FINALIZE_SYNTHETIC: 'finalize_synthetic' as const,
   FINALIZE_SEGMENTATION: 'finalize_segment' as const,
   SPATIAL_RECONSTRUCTION: 'spatial_recon' as const,
+  SPATIAL_GS_BUILD: 'spatial_gs_build' as const,
 } as const;
 
 export enum TaskStatus {
@@ -244,6 +246,19 @@ export interface SpatialReconstructionParams {
   coordinate_frame: string;
 }
 
+/**
+ * Build a Gaussian Aura from one immutable spatial capture.
+ */
+export interface SpatialGsBuildParams {
+  case_guid: string;
+  capture_hash: string;
+  capture_root_rel: string;
+  coordinate_frame: string;
+  iterations?: number;
+  max_image_size?: number;
+  max_splats?: number;
+}
+
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
@@ -256,4 +271,5 @@ export interface TaskParamsByType {
   'deploy_case': DeployCaseParams;
   'generate_synthetic': GenerateSyntheticParams;
   'spatial_recon': SpatialReconstructionParams;
+  'spatial_gs_build': SpatialGsBuildParams;
 }

@@ -6,11 +6,12 @@ own defaults are the single source of truth for tuning.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field
 
 from ._base import TaskParamsBase
+from .spatial_reconstruction import SpatialReconstructionParams
 
 
 class GsBuildParams(TaskParamsBase):
@@ -55,3 +56,12 @@ class GsBuildParams(TaskParamsBase):
 # Pydantic model, so a future divergence is a one-line class split rather than
 # a cross-repo migration.
 Gs4dBuildParams = GsBuildParams
+
+
+class SpatialGsBuildParams(SpatialReconstructionParams):
+    """Build a Gaussian Aura from one immutable spatial capture."""
+
+    coordinate_frame: Literal["syngar_anchor_v1"]
+    iterations: Optional[int] = Field(default=None, gt=0)
+    max_image_size: Optional[int] = Field(default=None, gt=0)
+    max_splats: Optional[int] = Field(default=None, gt=0)

@@ -56,3 +56,9 @@ def test_every_registry_interface_emitted_once(generated_ts):
 def test_gs4d_build_in_task_type_enum(generated_ts):
     assert "| 'gs4d_build'" in generated_ts
     assert "GS4D_BUILD: 'gs4d_build' as const" in generated_ts
+
+
+def test_spatial_gs_build_contract_is_generated(generated_ts):
+    assert "| 'spatial_gs_build'" in generated_ts
+    assert "SPATIAL_GS_BUILD: 'spatial_gs_build' as const" in generated_ts
+    assert "'spatial_gs_build': SpatialGsBuildParams;" in generated_ts
