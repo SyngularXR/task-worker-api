@@ -1079,20 +1079,6 @@ class Worker:
             # outcome in parallel. Ticks during the report are what tell the
             # sweeper this worker is still alive and finishing the task.
             try:
-                # Single terminal report. If the watchdog fired, the deadline
-                # won; otherwise report the handler outcome. The guard makes
-                # this exactly-once even against the watchdog's hard-exit path.
-                # Claimed up front rather than used as the ``if`` of this
-                # whole block: losing the claim settles who *reports*, not
-                # what this attempt still owes the operator. The watchdog's
-                # phase-3 path claims the guard and reports the timeout from
-                # its own thread while this loop is wedged; when the loop
-                # resumes it is still the only thing that knows what this
-                # attempt staged, so the orphan warning below has to run
-                # whenever the deadline beats the loop to the report. So only
-                # the report itself hangs off ``won``.
-                won = guard.claim()
-
                 # Ownership of what this attempt published. ``temp/<task_id>``
                 # is shared by every attempt of a task, and this attempt is not
                 # the only thing that can hand the task on: the watchdog sends
@@ -1121,7 +1107,38 @@ class Worker:
                 # the report itself; closing it needs what safe reclamation
                 # needs, a staging path unique per attempt that every consumer
                 # understands, or a lease on the shared one.
-                lost = _unowned_outputs(owned)
+                #
+                # Off the event loop, and *before* the guard is claimed. These
+                # stats hit the shared volume, and a stalled NFS/CIFS mount
+                # blocks whoever runs them for as long as it likes. Claiming
+                # first and then stalling here holds the sole right to report
+                # while nothing can exercise it: the watchdog's phase-3 claim
+                # fails, so it skips its synchronous timeout ``fail`` and
+                # hard-exits the process with the task still in_progress —
+                # exactly the failure the watchdog exists to prevent, on the
+                # unreliable-I/O path this check adds. Checking first leaves
+                # the guard free for that path, and ``to_thread`` keeps the
+                # loop turning meanwhile, so the heartbeat that holds the
+                # stale-task sweeper off (and hybrid mode's FastAPI app)
+                # survives a merely slow mount. Nothing here needs the claim:
+                # the check is read-only, and the report it can rewrite is
+                # still decided under ``won`` below.
+                lost = await asyncio.to_thread(_unowned_outputs, owned)
+
+                # Single terminal report. If the watchdog fired, the deadline
+                # won; otherwise report the handler outcome. The guard makes
+                # this exactly-once even against the watchdog's hard-exit path.
+                # Claimed as its own step rather than used as the ``if`` of
+                # this whole block: losing the claim settles who *reports*, not
+                # what this attempt still owes the operator. The watchdog's
+                # phase-3 path claims the guard and reports the timeout from
+                # its own thread while this loop is wedged; when the loop
+                # resumes it is still the only thing that knows what this
+                # attempt staged, so the orphan warning below has to run
+                # whenever the deadline beats the loop to the report. So only
+                # the report itself hangs off ``won``.
+                won = guard.claim()
+
                 if lost:
                     taken = set(lost)
                     published[:] = [p for p in published if p not in taken]

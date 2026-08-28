@@ -1540,6 +1540,92 @@ async def test_an_undisturbed_publish_still_completes(
 
 
 @pytest.mark.asyncio
+async def test_a_stalled_ownership_check_does_not_hold_the_terminal_guard(
+    make_worker, tmp_path, monkeypatch,
+):
+    """Regression: the ownership check runs off the loop and *before* the
+    guard is claimed.
+
+    Its stats hit the shared volume, and a stalled NFS/CIFS mount blocks them
+    for as long as it likes. An attempt that claims the TerminalGuard first
+    and then stalls here holds the sole right to report while nothing can
+    exercise it: the watchdog's phase-3 claim fails, so it skips its
+    synchronous timeout ``fail`` and hard-exits with the task still
+    in_progress, waiting on the sweeper — the very failure the watchdog
+    exists to prevent. The stalled check below stands in for the mount, and
+    claims the guard the Worker handed the watchdog exactly as phase 3 would.
+    """
+    import threading
+
+    from task_worker_api import worker as worker_mod
+
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    shared = tmp_path / "shared"
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    guards = []
+
+    class _GuardCapturingWatchdog:
+        """Never fires; it is here only to hand the test the same
+        TerminalGuard the real watchdog thread would be racing for."""
+
+        def __init__(self, *, guard, **kwargs):
+            guards.append(guard)
+
+        def start(self):
+            pass
+
+        def stop(self) -> bool:
+            return False
+
+    loop_thread = threading.current_thread()
+    deadline = {}
+    real_unowned = worker_mod._unowned_outputs
+
+    def stalled_ownership_check(owned):
+        # The mount hangs here. Whatever the watchdog does now, it does
+        # against an attempt that will not come back for a while.
+        deadline["thread"] = threading.current_thread()
+        deadline["claimed"] = guards[0].claim()
+        return real_unowned(owned)
+
+    monkeypatch.setattr(
+        worker_mod, "_unowned_outputs", stalled_ownership_check,
+    )
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        shared_volume_path=str(shared),
+        task_timeout_s=60.0,
+        _watchdog_factory=_GuardCapturingWatchdog,
+    )
+    await worker.run_one()
+
+    assert deadline.get("claimed") is True, (
+        "the ownership check ran holding the terminal guard: a stalled shared "
+        "volume leaves the watchdog unable to claim it, so it hard-exits "
+        "without reporting and the task sits in_progress until the sweeper"
+    )
+    assert deadline["thread"] is not loop_thread, (
+        "the ownership check ran on the event loop thread: a stalled shared "
+        "volume freezes the heartbeat straight into the sweeper's window"
+    )
+    assert client.completed_tasks == [] and client.failed_tasks == [], (
+        "the attempt reported after losing the claim — the terminal report "
+        "must stay exactly-once"
+    )
+
+
+@pytest.mark.asyncio
 async def test_partial_publish_failure_warns_about_the_orphans_once(
     make_worker, tmp_path, caplog,
 ):

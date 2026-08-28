@@ -78,8 +78,13 @@
   compare-and-complete — but it bounds the window to the terminal report
   instead of the whole attempt; closing it needs what safe reclamation needs (an
   attempt-unique staging path every consumer understands, or a lease on the
-  shared one). Pass `owned=` alongside `staged=` if you override `_run_one`; see
-  `docs/fleet/conventions.md` § 10.
+  shared one). The re-check runs off the event loop and *before* the
+  `TerminalGuard` is claimed: its stats touch the shared volume, and an attempt
+  that claimed first and then stalled on a hung mount would hold the sole right
+  to report while unable to use it — the watchdog's phase-3 claim would fail, so
+  it would skip its synchronous timeout `fail` and hard-exit with the task still
+  `in_progress`. Pass `owned=` alongside `staged=` if you override `_run_one`;
+  see `docs/fleet/conventions.md` § 10.
 - One partial publish now emits one orphan warning, not two. `upload_outputs`
   logged the files it had already published before re-raising, and the terminal
   path logs everything the attempt published whenever it ends failed — which a
