@@ -43,7 +43,12 @@ from .client import (
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
-from .files import _warn_published_orphans, prepare_inputs, upload_outputs
+from .files import (
+    _unowned_outputs,
+    _warn_published_orphans,
+    prepare_inputs,
+    upload_outputs,
+)
 from .payload_log import PayloadLogger, sanitize_worker_id
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
@@ -893,6 +898,13 @@ class Worker:
         the terminal report: losing the race decides who reports, not what
         this attempt owes the operator. See the ``_warn_published_orphans``
         call below.
+
+        That shared path cuts the other way too: a concurrent attempt can
+        publish onto the very names this one did, leaving this attempt's
+        manifest pointing at the other's artifact. So the outputs are
+        re-identified before the terminal report, and an attempt that no
+        longer owns what it published is reported failed rather than
+        completed. See the ``_unowned_outputs`` call below.
         """
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
@@ -932,6 +944,11 @@ class Worker:
         # the orphans this attempt leaves on the shared volume if it still
         # fails. Not a delete list — see the warning call there.
         published: list[str] = []
+        # Filled alongside it, local mode only: the identity of the artifact
+        # this attempt's publish committed at each of those paths, so the
+        # terminal-report block below can tell them from a concurrent
+        # attempt's.
+        owned: dict[str, tuple[int, int]] = {}
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1035,7 +1052,7 @@ class Worker:
                         task, target.client, file_ctx, output_files,
                         self.shared_volume_path, cancelled=cancelled,
                         foreign=not target.is_home,
-                        staged=published,
+                        staged=published, owned=owned,
                     )
                     result = {**result, "output_files": delivered}
             outcome = ("complete", result or {})
@@ -1075,6 +1092,55 @@ class Worker:
                 # whenever the deadline beats the loop to the report. So only
                 # the report itself hangs off ``won``.
                 won = guard.claim()
+
+                # Ownership of what this attempt published. ``temp/<task_id>``
+                # is shared by every attempt of a task, and this attempt is not
+                # the only thing that can hand the task on: the watchdog sends
+                # a timeout ``fail`` from its own thread, and the backend's
+                # stale-task sweeper re-queues a task whose heartbeat lapsed
+                # with no report at all. Either way a successor can have
+                # claimed the task and renamed its own artifacts onto these
+                # very names while this loop was wedged. The publish rename
+                # keeps that from splicing bytes, but it does not keep the
+                # name pointing at this attempt's file — the paths in this
+                # manifest then hold the successor's, complete and valid and
+                # not what this attempt's result describes. Consumers move
+                # each manifest path to the case's permanent home on a
+                # ``complete``, so nothing downstream would ever notice. Fail
+                # instead: the successor still owns the task and reports its
+                # own outcome.
+                #
+                # The lost paths also stop being this attempt's orphans — they
+                # are a live attempt's outputs now, and naming them in the
+                # warning below would invite an operator to sweep them.
+                #
+                # ponytail: a stat, so a successor can still land between this
+                # check and the backend's write — POSIX has no
+                # compare-and-complete. It shrinks the window from the whole
+                # attempt (publish → handler wrap-up → guard exit → report) to
+                # the report itself; closing it needs what safe reclamation
+                # needs, a staging path unique per attempt that every consumer
+                # understands, or a lease on the shared one.
+                lost = _unowned_outputs(owned)
+                if lost:
+                    taken = set(lost)
+                    published[:] = [p for p in published if p not in taken]
+                    if won and not fired and outcome[0] == "complete":
+                        log.error(
+                            "task %s: a concurrent attempt republished %d of "
+                            "this attempt's staged output file(s) (%s); "
+                            "reporting the task failed instead — completing "
+                            "would point the result at another attempt's "
+                            "artifacts",
+                            task.id, len(lost), ", ".join(lost),
+                        )
+                        outcome = (
+                            "fail",
+                            "handler succeeded but a concurrent attempt of "
+                            "this task republished its staged output file(s) "
+                            f"({', '.join(lost)}); the result no longer "
+                            "describes what is on the shared volume",
+                        )
 
                 # Determine the terminal method + payload up front so the
                 # except handler can log *which* report failed and on which

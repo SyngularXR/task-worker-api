@@ -1415,3 +1415,172 @@ async def test_handler_failure_before_publish_leaves_nothing_to_discard(
         "remain published" in r.getMessage() for r in caplog.records
     )
     assert not (shared / "temp" / "1").exists()
+
+
+# ---------------------------------------------------------------------------
+# Publish ownership: an attempt must not report another attempt's artifact
+# ---------------------------------------------------------------------------
+# Every attempt of a task publishes into the same temp/<task_id>. The publish
+# rename keeps two concurrent attempts from splicing one file, but it does not
+# keep the published name pointing at the attempt that wrote it: whoever
+# renames last owns the name, and the loser's manifest still points there.
+
+
+@pytest.mark.asyncio
+async def test_a_successor_republishing_stops_this_attempt_completing(
+    make_worker, tmp_path, monkeypatch, caplog,
+):
+    """Regression: attempt A publishes, attempt B republishes the same name,
+    and A must not report ``complete`` pointing at B's artifact.
+
+    B exists because the backend already handed the task on — the watchdog's
+    timeout ``fail`` from its own thread, or the stale-task sweeper re-queueing
+    a task whose heartbeat lapsed — while A was still running. A's result
+    describes the bytes A computed; the path in its manifest holds B's. The
+    backend's post-complete hook moves that path to the case's permanent home,
+    so a consumer would receive a complete, valid artifact for a computation
+    nobody ever ran, with nothing anywhere reporting a problem.
+
+    A therefore reports the failure. B still owns the task and reports its own
+    outcome, and B's artifact is left exactly where B put it — the one thing
+    worse than an orphan is deleting a live attempt's output.
+    """
+    from pathlib import Path
+    from task_worker_api import worker as worker_mod
+
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    shared = tmp_path / "shared"
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"attempt A's planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    real_upload = worker_mod.upload_outputs
+
+    async def upload_then_successor_republishes(*args, **kwargs):
+        manifest = await real_upload(*args, **kwargs)
+        # The successor stages its own artifact and renames it onto the same
+        # published name — an atomic publish, exactly like this attempt's.
+        dest = Path(manifest["planes"])
+        part = dest.with_name(".successor.part")
+        part.write_bytes(b"attempt B's planes")
+        os.replace(part, dest)
+        return manifest
+
+    monkeypatch.setattr(
+        worker_mod, "upload_outputs", upload_then_successor_republishes,
+    )
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        shared_volume_path=str(shared),
+    )
+    with caplog.at_level("WARNING"):
+        await worker.run_one()
+
+    assert client.completed_tasks == [], (
+        "completing here hands the consumer the successor's artifact under "
+        "this attempt's result"
+    )
+    assert "republished" in client.failed_tasks[0]["error"]
+    assert "planes.stl" in client.failed_tasks[0]["error"]
+
+    published = shared / "temp" / "1" / "planes.stl"
+    assert published.read_bytes() == b"attempt B's planes", (
+        "the successor's output must be left alone"
+    )
+    assert not any(
+        "planes.stl" in r.getMessage() and "never sweep them" in r.getMessage()
+        for r in caplog.records if r.levelname == "WARNING"
+    ), (
+        "a path a live successor owns is not this attempt's orphan — naming "
+        "it invites an operator to sweep a running attempt's output"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_undisturbed_publish_still_completes(
+    make_worker, tmp_path, caplog,
+):
+    """The ownership check must not misfire on the ordinary case: nothing
+    touched the staged output, so the attempt completes and its manifest is
+    the published path."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    shared = tmp_path / "shared"
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        shared_volume_path=str(shared),
+    )
+    with caplog.at_level("WARNING"):
+        await worker.run_one()
+
+    published = shared / "temp" / "1" / "planes.stl"
+    assert client.failed_tasks == []
+    assert client.completed_tasks[0]["result"]["output_files"] == {
+        "planes": str(published),
+    }
+    assert published.read_bytes() == b"cut-planes"
+
+
+@pytest.mark.asyncio
+async def test_partial_publish_failure_warns_about_the_orphans_once(
+    make_worker, tmp_path, caplog,
+):
+    """Regression: one partial publish, one orphan warning.
+
+    ``upload_outputs`` used to log the files it had already published before
+    re-raising, and the terminal path below logs everything the attempt
+    published whenever it ends failed — so a publish that failed partway
+    through produced the same list twice, under two different reasons, for an
+    operator to reconcile as if they were two events.
+    """
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    shared = tmp_path / "shared"
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "a.stl").write_bytes(b"out-a")
+        # "b.stl" is declared but never written → its copy raises after a.stl
+        # has already been published.
+        return {"output_files": {"a": "a.stl", "b": "b.stl"}}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        shared_volume_path=str(shared),
+    )
+    with caplog.at_level("WARNING"):
+        await worker.run_one()
+
+    assert client.completed_tasks == []
+    orphan_warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "a.stl" in r.getMessage()
+    ]
+    assert len(orphan_warnings) == 1, (
+        f"expected exactly one orphan warning, got {len(orphan_warnings)}: "
+        f"{[r.getMessage() for r in orphan_warnings]}"
+    )
+    assert "never sweep them" in orphan_warnings[0].getMessage()
+    assert (shared / "temp" / "1" / "a.stl").read_bytes() == b"out-a"

@@ -56,6 +56,37 @@
   the shared one. Until one of those lands the orphan is a logged, operator-swept
   file, which beats deleting a live attempt's outputs. Remote mode has no delete
   route in the worker protocol regardless.
+- An attempt no longer reports outputs a concurrent attempt has taken over.
+  The publish rename below settles *what* sits at a staged name, not *whose* it
+  is: every attempt of a task publishes into the same `temp/<task_id>/`, so
+  attempt A could publish, attempt B — the successor the backend handed the task
+  to after a watchdog `fail` or a stale-task sweep, while A was still running —
+  could rename its own artifact onto the same path, and A would then report
+  `complete` with a manifest pointing at B's file. A complete, valid artifact
+  for a computation A's result does not describe, and one the backend's
+  post-complete hook moves straight to the case's permanent home, so no
+  consumer could ever tell. `upload_outputs` now records the `(st_dev, st_ino)`
+  its rename committed at each published path — read off the scratch name, the
+  one name in that directory no other attempt can hold — and `Worker._run_one`
+  re-checks every published path against it immediately before the terminal
+  report. A path whose inode changed, or that is gone, is reported as a
+  **failure** naming it rather than completed on, and is dropped from the orphan
+  warning: it is a live attempt's output now, not this attempt's to have an
+  operator sweep. The successor still owns the task and reports its own outcome.
+  Being a `stat`, this narrows rather than closes — a successor can still land
+  between the check and the backend's write, POSIX having no
+  compare-and-complete — but it bounds the window to the terminal report
+  instead of the whole attempt; closing it needs what safe reclamation needs (an
+  attempt-unique staging path every consumer understands, or a lease on the
+  shared one). Pass `owned=` alongside `staged=` if you override `_run_one`; see
+  `docs/fleet/conventions.md` § 10.
+- One partial publish now emits one orphan warning, not two. `upload_outputs`
+  logged the files it had already published before re-raising, and the terminal
+  path logs everything the attempt published whenever it ends failed — which a
+  partial publish always does. The same file list therefore reached an operator
+  twice under two different reasons, reading as two separate events. The publish
+  helper now only records what it published (in `staged`) and lets its caller —
+  which warns for *every* failure mode, not just this one — do the warning.
 - Local-mode output publishing is now atomic. Every attempt of a task stages
   into the same `temp/<task_id>/`, and the copy went straight into the
   published name — which truncates it on `open`. Two attempts of one task

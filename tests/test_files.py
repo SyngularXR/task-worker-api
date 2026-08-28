@@ -19,6 +19,7 @@ import pytest
 from task_worker_api.context import ClaimedTask, FileContext
 from task_worker_api.enums import TaskStatus, TaskType
 from task_worker_api.files import (
+    _unowned_outputs,
     _warn_published_orphans,
     prepare_inputs,
     upload_outputs,
@@ -127,8 +128,8 @@ async def test_local_mode_partial_failure_leaves_no_part_file_and_logs_it(
     """The one thing a failing publish *does* remove is its own scratch file:
     that name is this call's alone, and leaving it would keep the staging dir
     non-empty and defeat the consumer's ``rmdir``. What it leaves behind
-    instead is a WARNING naming the orphan, and the record the caller needs
-    to repeat that warning if the attempt goes on to fail."""
+    instead is the record the caller warns about the orphan from — once, on
+    the attempt's terminal path, not once here and again there."""
     shared = tmp_path / "shared"
     out_dir = tmp_path / "work" / "out"
     out_dir.mkdir(parents=True)
@@ -153,11 +154,9 @@ async def test_local_mode_partial_failure_leaves_no_part_file_and_logs_it(
         "the failing copy must remove its own scratch file and nothing else"
     )
     assert staged == [str(staging / "a.stl")]
-    assert any(
-        "a.stl" in r.getMessage()
-        and "publishing failed partway through" in r.getMessage()
-        for r in caplog.records if r.levelname == "WARNING"
-    ), "the orphan this attempt left on the shared volume was not logged"
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == [], (
+        "the orphan warning is the terminal path's to emit, once"
+    )
 
 
 @pytest.mark.asyncio
@@ -360,11 +359,19 @@ async def test_local_mode_no_staging_dir_when_shared_volume_unset(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_remote_mode_logs_partial_uploads_on_failure(tmp_path, caplog):
+async def test_remote_mode_records_partial_uploads_without_warning(
+    tmp_path, caplog,
+):
     """When an upload fails after some files uploaded successfully, the
-    partial uploads that remain on the backend must be surfaced in a
-    WARNING so an operator can reconcile. The exception still propagates
-    so the task is marked failed and retried."""
+    files already on the backend are recorded for the caller — and *not*
+    warned about here.
+
+    The attempt's terminal path warns about everything it published (see
+    ``Worker._run_one``), and this record is what it names them from.
+    Warning here as well meant one partial publish produced the same orphan
+    list twice. The exception still propagates so the task is marked failed
+    and retried.
+    """
     out_dir = tmp_path / "work" / "out"
     out_dir.mkdir(parents=True)
     (out_dir / "a.stl").write_bytes(b"aaa")
@@ -374,6 +381,7 @@ async def test_remote_mode_logs_partial_uploads_on_failure(tmp_path, caplog):
     task = _claimed(21, params={"input_files": {"mesh": "in.ply"}})
     file_ctx = _file_ctx(out_dir)
     client = _FlakyUploadClient(fail_on={"c.stl"})
+    staged: list[str] = []
 
     with caplog.at_level("WARNING"):
         with pytest.raises(RuntimeError, match="upload failed for c.stl"):
@@ -381,19 +389,19 @@ async def test_remote_mode_logs_partial_uploads_on_failure(tmp_path, caplog):
                 task, client, file_ctx,
                 output_files={"a": "a.stl", "b": "b.stl", "c": "c.stl"},
                 shared_volume_path=None,
+                staged=staged,
             )
 
     # a and b uploaded before c failed.
     assert (21, "a.stl") in client.uploaded_files
     assert (21, "b.stl") in client.uploaded_files
     assert (21, "c.stl") not in client.uploaded_files
-    # The partial state was surfaced.
-    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert any(
-        "2 output file(s)" in r.getMessage()
-        and "a.stl" in r.getMessage()
-        and "b.stl" in r.getMessage()
-        for r in warnings
+    assert staged == ["a.stl", "b.stl"], (
+        "the caller needs the delivered filenames to warn about them once"
+    )
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == [], (
+        "the orphan warning belongs to the attempt's terminal path, which "
+        "runs for every failure — not to this call as well"
     )
 
 
@@ -1826,3 +1834,49 @@ async def test_a_successor_publishing_mid_warning_keeps_its_output(tmp_path):
     assert published.read_bytes() == b"successor's output"
     assert os.listdir(staging) == ["a.stl"]
     assert staging.exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_outputs_records_which_artifact_it_published(tmp_path):
+    """The identity record is what tells this attempt's published file from a
+    concurrent attempt's.
+
+    Every attempt of a task publishes into the same ``temp/<task_id>``, so the
+    rename that makes a publish atomic still leaves the *name* up for grabs: a
+    successor renaming its own artifact onto it wins it whole. The identity is
+    taken from the scratch file the rename commits — a name no other attempt
+    can hold — so what it names can only ever be this attempt's artifact, and
+    re-checking it later catches the takeover the rename cannot prevent.
+    """
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"this attempt's output")
+    (out_dir / "b.stl").write_bytes(b"also this attempt's")
+
+    owned: dict[str, tuple[int, int]] = {}
+    manifest = await upload_outputs(
+        _claimed(81, params={"input_path": "/ignored"}),
+        FakeBackendClient(), _file_ctx(out_dir),
+        output_files={"a": "a.stl", "b": "b.stl"},
+        shared_volume_path=str(shared), owned=owned,
+    )
+
+    staging = shared / "temp" / "81"
+    assert set(owned) == {str(staging / "a.stl"), str(staging / "b.stl")}
+    assert _unowned_outputs(owned) == [], (
+        "nothing has touched these; they are still this attempt's"
+    )
+
+    # A successor of this task publishes its own artifact onto a.stl — the
+    # same atomic rename this attempt used, onto the same shared name.
+    part = staging / ".successor.part"
+    part.write_bytes(b"the successor's output")
+    os.replace(part, staging / "a.stl")
+    # ...and the backend swept b.stl out from under this attempt.
+    os.unlink(staging / "b.stl")
+
+    assert sorted(_unowned_outputs(owned)) == sorted(manifest.values()), (
+        "a republished name and a name that is simply gone are both names "
+        "this attempt can no longer report as its result"
+    )
