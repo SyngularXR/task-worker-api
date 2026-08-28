@@ -1626,6 +1626,71 @@ async def test_a_stalled_ownership_check_does_not_hold_the_terminal_guard(
 
 
 @pytest.mark.asyncio
+async def test_a_hung_ownership_check_still_reports_the_task(
+    make_worker, tmp_path, monkeypatch,
+):
+    """Regression: the ownership check is bounded, so a hung mount still ends
+    the attempt.
+
+    By the time it runs, ``wd.stop()`` has disarmed the watchdog, and the
+    heartbeat this attempt is still sending is what tells the backend the task
+    is alive — so nothing would ever time an unbounded stat out, and the task
+    would sit ``in_progress`` with neither the watchdog nor the stale-task
+    sweeper behind it. Bounded, the attempt lands terminal and says which
+    volume stopped answering.
+    """
+    import threading
+
+    from task_worker_api import worker as worker_mod
+
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    shared = tmp_path / "shared"
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "planes.stl").write_bytes(b"cut-planes")
+        return {"output_files": {"planes": "planes.stl"}}
+
+    # The mount never answers. Released in the finally below so the stat
+    # thread doesn't outlive the test.
+    mount_answers = threading.Event()
+
+    def hung_ownership_check(owned):
+        mount_answers.wait(timeout=30)
+        return []
+
+    monkeypatch.setattr(worker_mod, "_unowned_outputs", hung_ownership_check)
+    monkeypatch.setattr(worker_mod, "_OWNERSHIP_CHECK_TIMEOUT_S", 0.05)
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        shared_volume_path=str(shared),
+    )
+    try:
+        await asyncio.wait_for(worker.run_one(), timeout=10)
+    finally:
+        mount_answers.set()
+
+    assert client.completed_tasks == [], (
+        "completed on paths it never managed to re-identify"
+    )
+    assert len(client.failed_tasks) == 1
+    error = client.failed_tasks[0]["error"]
+    assert "could not verify" in error and "planes.stl" in error, (
+        f"the failure should name the unverified outputs, got: {error!r}"
+    )
+    assert "republished" not in error, (
+        "a stalled mount is not a concurrent attempt — sending an operator "
+        "after a phantom successor costs a real debugging hour"
+    )
+
+
+@pytest.mark.asyncio
 async def test_partial_publish_failure_warns_about_the_orphans_once(
     make_worker, tmp_path, caplog,
 ):

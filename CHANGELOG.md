@@ -83,7 +83,12 @@
   that claimed first and then stalled on a hung mount would hold the sole right
   to report while unable to use it — the watchdog's phase-3 claim would fail, so
   it would skip its synchronous timeout `fail` and hard-exit with the task still
-  `in_progress`. Pass `owned=` alongside `staged=` if you override `_run_one`;
+  `in_progress`. It is bounded at 30s for the same reason from the other side:
+  the watchdog has been stopped by then and the attempt's own heartbeat holds
+  the stale-task sweeper off, so an unbounded stat against a hung mount would
+  park the task `in_progress` with nothing left to rescue it. A check that times
+  out fails the task, naming the stalled volume rather than a phantom concurrent
+  attempt. Pass `owned=` alongside `staged=` if you override `_run_one`;
   see `docs/fleet/conventions.md` § 10.
 - One partial publish now emits one orphan warning, not two. `upload_outputs`
   logged the files it had already published before re-raising, and the terminal

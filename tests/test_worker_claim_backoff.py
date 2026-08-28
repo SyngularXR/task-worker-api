@@ -66,10 +66,21 @@ class _RecoveringClient(_AlwaysFailingClient):
 
 
 def _capture_wait_timeouts(monkeypatch) -> list[float]:
-    """Capture the timeout that the poll loop actually passes to wait_for."""
+    """Capture the timeout that the poll loop actually passes to wait_for.
+
+    Only the *idle* wait, which is the loop waiting on ``self._stop``. This
+    patches the asyncio module attribute, so it sees every ``wait_for`` in
+    ``worker.py`` — including the bound on ``_run_one``'s output-ownership
+    check. Swallowing that one would record a wait the poll loop never made
+    and fail every task a test runs through the loop; everything that isn't
+    the stop-event wait is delegated to the real ``wait_for``.
+    """
     waits: list[float] = []
+    real_wait_for = asyncio.wait_for
 
     async def _wait_for(awaitable, timeout):
+        if getattr(awaitable, "__qualname__", "") != "Event.wait":
+            return await real_wait_for(awaitable, timeout)
         waits.append(timeout)
         awaitable.close()
         await asyncio.sleep(0)

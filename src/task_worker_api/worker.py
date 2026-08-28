@@ -156,6 +156,19 @@ class _Target:
     skip_cycles: int = field(default=0)
 
 
+# Ceiling on the pre-report output-ownership check (``_unowned_outputs``).
+# It is the only filesystem work left on the terminal path, it runs *after*
+# ``wd.stop()`` has disarmed the watchdog, and its stats hit the shared
+# volume — where a hung NFS/CIFS mount blocks a stat indefinitely. Unbounded,
+# that parks the attempt forever with its heartbeat still ticking, so the
+# backend keeps seeing a live task and the stale-task sweeper never reclaims
+# it either: no watchdog, no sweeper, no terminal report. Bounded, the worst
+# case is one slow attempt reported failed. 30s is far past a healthy mount's
+# microseconds and past a merely loaded one's, so a timeout means the mount
+# is not answering.
+_OWNERSHIP_CHECK_TIMEOUT_S = 30.0
+
+
 def _positive_finite_s(name: str, value: float) -> float:
     """Validate a poll-loop delay knob, or raise ``ValueError``.
 
@@ -903,8 +916,9 @@ class Worker:
         publish onto the very names this one did, leaving this attempt's
         manifest pointing at the other's artifact. So the outputs are
         re-identified before the terminal report, and an attempt that no
-        longer owns what it published is reported failed rather than
-        completed. See the ``_unowned_outputs`` call below.
+        longer owns what it published — or that a stalled shared volume left
+        unable to say either way — is reported failed rather than completed.
+        See the ``_unowned_outputs`` call below.
         """
         task_dir = self.work_dir / f"task_{task.id}"
         progress = ProgressReporter(
@@ -1123,7 +1137,53 @@ class Worker:
                 # survives a merely slow mount. Nothing here needs the claim:
                 # the check is read-only, and the report it can rewrite is
                 # still decided under ``won`` below.
-                lost = await asyncio.to_thread(_unowned_outputs, owned)
+                #
+                # Bounded as well as off-loop. ``to_thread`` keeps a hung
+                # mount from freezing the loop, but it does not make the stat
+                # end, and by here ``fired = wd.stop()`` has already disarmed
+                # the watchdog — so nothing would ever time this out. The
+                # heartbeat keeps ticking meanwhile, which is exactly what
+                # tells the backend the task is alive, so the stale-task
+                # sweeper would not reclaim it either: the attempt parks
+                # in_progress forever with no watchdog and no sweeper behind
+                # it. A check that cannot answer is one this attempt cannot
+                # vouch for, which is what ``_unowned_outputs`` already treats
+                # an unreadable path as — so fail rather than complete onto
+                # paths whose contents are unverified. Reported here, with the
+                # cause named, instead of through the republish branch below:
+                # a stalled mount is not a concurrent attempt, and sending an
+                # operator after a phantom successor costs a real debugging
+                # hour. Safe before the claim because ``outcome`` is only ever
+                # read under ``won`` (and against ``fired``) below.
+                #
+                # ponytail: the stat thread stays parked in the default
+                # executor until the mount answers — a thread is not
+                # cancellable — so each stalled attempt costs one pool slot.
+                # Acceptable while a worker runs one task at a time and a dead
+                # mount fails every task anyway; bounding it properly needs a
+                # per-attempt executor to abandon, or stats that can time out.
+                try:
+                    lost = await asyncio.wait_for(
+                        asyncio.to_thread(_unowned_outputs, owned),
+                        _OWNERSHIP_CHECK_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    lost = sorted(owned)
+                    log.error(
+                        "task %s: the staged-output ownership check did not "
+                        "answer within %.0fs — the shared volume is not "
+                        "responding; treating this attempt's %d published "
+                        "path(s) as unverified",
+                        task.id, _OWNERSHIP_CHECK_TIMEOUT_S, len(lost),
+                    )
+                    if outcome[0] == "complete":
+                        outcome = (
+                            "fail",
+                            "handler succeeded but the shared volume stopped "
+                            "answering, so this attempt could not verify that "
+                            "its staged output file(s) "
+                            f"({', '.join(lost)}) are still its own",
+                        )
 
                 # Single terminal report. If the watchdog fired, the deadline
                 # won; otherwise report the handler outcome. The guard makes
