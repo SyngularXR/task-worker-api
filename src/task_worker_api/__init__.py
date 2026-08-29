@@ -18,7 +18,7 @@ from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
 from .worker import ForeignTarget, Worker, parse_synpusher_targets, run_hybrid
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 __all__ = [
     "__version__",

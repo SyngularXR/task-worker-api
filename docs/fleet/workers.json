@@ -6,8 +6,8 @@
   "sdk": {
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
-    "current_release": "v0.14.0",
-    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.14.0",
+    "current_release": "v0.16.0",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.16.0",
     "release_workflow": ".github/workflows/release.yml — publishes wheel + tag on every merge to main"
   },
   "workers": [
@@ -127,10 +127,10 @@
       "compose_service": "colmap-splat-worker",
       "mode": "polling",
       "mode_description": "Standalone Worker.run_forever() polling loop. Image's baked-in CMD is ['--help'] (back-compat with legacy 'docker run colmap-splat --help' callers); worker mode is gated on ENABLE_TASK_WORKER=true env var.",
-      "task_types": ["gs_build"],
+      "task_types": ["gs_build", "spatial_gs_build"],
       "sdk_pin": {
         "style": "git_ref",
-        "version": "v0.5.0",
+        "version": "v0.16.0",
         "file": "requirements.txt",
         "line_pattern": "task-worker-api @ git+https://github.com/SyngularXR/task-worker-api.git@v{version}",
         "build_dependency": "Dockerfile must pre-install hatchling (task-worker-api's PEP 517 backend) because requirements.txt installs run with --no-build-isolation for torch/CUDA pinning."

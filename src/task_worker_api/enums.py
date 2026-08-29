@@ -35,6 +35,7 @@ class TaskType(str, Enum):
     # fit the backend's task_type column (CharEnumField max_length=20).
     FINALIZE_SEGMENTATION = "finalize_segment"
     SPATIAL_RECONSTRUCTION = "spatial_recon"
+    SPATIAL_GS_BUILD = "spatial_gs_build"
 
 
 class TaskStatus(IntEnum):
