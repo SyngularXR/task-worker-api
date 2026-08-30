@@ -146,16 +146,32 @@ class _Target:
 
 
 def _positive_finite_s(name: str, value: float) -> float:
-    """Validate a poll-loop delay knob, or raise ``ValueError``.
+    """Validate a worker pacing knob, or raise ``ValueError``.
 
-    These two knobs are the poll loop's only pacing, and every degenerate
-    value breaks it in a way that is silent at construction and expensive in
-    production: ``0``/negative spins the claim loop at full speed against the
-    backend, ``inf`` makes the first idle wait never end (the worker stops
-    polling for good), and ``NaN`` fails every comparison in ``_claim_wait_s``
-    — so the cap never matches, the doubling loop runs once per accumulated
-    failure, and ``asyncio.wait_for(timeout=nan)`` waits forever. Rejecting
-    them here is what makes the capped-and-still-polling guarantee real.
+    These knobs are the worker's only pacing, and every degenerate value
+    breaks it in a way that is silent at construction and expensive in
+    production — against the one backend the whole fleet shares:
+
+    * ``poll_interval_s`` / ``claim_backoff_max_s``: ``0``/negative spins the
+      claim loop at full speed, ``inf`` makes the first idle wait never end
+      (the worker stops polling for good), and ``NaN`` fails every comparison
+      in ``_claim_wait_s`` — so the cap never matches, the doubling loop runs
+      once per accumulated failure, and ``asyncio.wait_for(timeout=nan)``
+      waits forever.
+    * ``heartbeat_interval_s``: ``<= 0`` (and ``NaN``, which fails the sleep's
+      own clamp) turns ``ProgressReporter._heartbeat_loop``'s sleep into a
+      no-op, hammering ``PUT /tasks/{id}/progress`` as fast as the backend
+      answers; ``inf`` never heartbeats at all, so the task looks stale.
+    * ``cancel_poll_interval_s``: the same two failures against ``CancelGuard``
+      and ``GET /tasks/{id}/cancel-status``.
+    * ``timeout_grace_s``: ``NaN`` makes ``TaskWatchdog._wait`` return
+      instantly at both grace phases (``end = now + nan``, so the loop never
+      runs), collapsing SIGTERM → grace → SIGKILL → grace → hard-exit into an
+      immediate container kill on the first deadline; ``<= 0`` does the same,
+      and ``inf`` means the escalation never reaches the hard exit.
+
+    Rejecting them here is what makes the capped-and-still-polling guarantee
+    real.
     """
     if not math.isfinite(value) or value <= 0:
         raise ValueError(
@@ -326,12 +342,18 @@ class Worker:
         # rolls all three) and would otherwise share one deterministic
         # schedule. Tests that assert exact delays pass retry_jitter=False.
         self.retry_jitter = retry_jitter
-        self.heartbeat_interval_s = heartbeat_interval_s
+        self.heartbeat_interval_s = _positive_finite_s(
+            "heartbeat_interval_s", heartbeat_interval_s,
+        )
         self.heartbeat_warn_threshold = heartbeat_warn_threshold
-        self.cancel_poll_interval_s = cancel_poll_interval_s
+        self.cancel_poll_interval_s = _positive_finite_s(
+            "cancel_poll_interval_s", cancel_poll_interval_s,
+        )
         self.task_timeout_s = task_timeout_s
         self.task_timeouts = task_timeouts or {}
-        self.timeout_grace_s = timeout_grace_s
+        self.timeout_grace_s = _positive_finite_s(
+            "timeout_grace_s", timeout_grace_s,
+        )
         self._on_hard_exit = on_hard_exit or (lambda: os._exit(75))
         self._timeout_env = parse_timeouts_env(os.environ.get("WORKER_TASK_TIMEOUTS"))
         self._watchdog_factory = _watchdog_factory
