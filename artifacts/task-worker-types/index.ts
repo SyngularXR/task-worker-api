@@ -138,6 +138,10 @@ export interface GsBuildParams {
   scene_path?: string;
   /** Scene id; defaults to dir basename. */
   scene_id?: string;
+  /** Home-box marker file; keeps local claims on the shared-volume path. */
+  input_path?: string;
+  /** Foreign-worker scene bundle, normally {'scene': 'scene.zip'}. */
+  input_files?: Record<string, string>;
   /** Prior-phase PLY to warm-start from (4D); absolute, on shared volume. */
   warm_start_ply?: string;
   method?: string;

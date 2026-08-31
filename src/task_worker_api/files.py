@@ -324,6 +324,11 @@ def _require_foreign_capable(task: ClaimedTask) -> None:
     """
     params = task.params or {}
     local_only = [k for k in _LOCAL_ONLY_PARAM_KEYS if params.get(k)]
+    input_files = params.get("input_files") or {}
+    if (params.get("scene") or params.get("scene_path")) and "scene" not in input_files:
+        local_only.append("scene")
+    if params.get("warm_start_ply") and "warm_start" not in input_files:
+        local_only.append("warm_start_ply")
     if local_only:
         raise CrossBoxLocalModeError(
             f"cross-box claim refused: task {task.id} ({task.task_type.value}) "
