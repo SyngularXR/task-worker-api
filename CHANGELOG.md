@@ -9,6 +9,23 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `Worker` now validates its remaining pacing knobs — `heartbeat_interval_s`,
+  `cancel_poll_interval_s` and `timeout_grace_s` — through the same
+  finite-and-positive guard that already covered `poll_interval_s` and
+  `claim_backoff_max_s`. Each was silently accepted at construction and paid
+  for in production, against the one backend the whole fleet shares.
+  `heartbeat_interval_s <= 0` turned the heartbeat loop's `asyncio.sleep` into
+  a no-op, so the worker hammered `PUT /tasks/{id}/progress` as fast as the
+  backend could answer; `cancel_poll_interval_s <= 0` did the same to the
+  cancel guard's `GET /tasks/{id}/cancel-status`. `timeout_grace_s=NaN` made
+  `TaskWatchdog._wait(nan)` return instantly at *both* grace phases (`end =
+  now + nan`, so the loop body never runs), collapsing SIGTERM → grace →
+  SIGKILL → grace → hard-exit into an immediate `os._exit(75)` container kill
+  on the first deadline. `inf` is rejected for the same reason it is on the
+  poll knobs: the wait never ends, so the worker never heartbeats, never
+  notices a cancel, and never reaches the hard exit. Defaults (10s / 2s / 15s)
+  and wire formats are unchanged, and ints keep working — only a consumer
+  already passing a broken value sees the new `ValueError`.
 - `BackendClient` now validates `retry_backoff_s`, the base of its
   exponential-backoff schedule (`retry_backoff_s * 2**n`) and the last retry
   knob with no guard on it — `max_retries`, `retry_backoff_max_s` and

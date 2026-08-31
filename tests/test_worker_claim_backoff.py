@@ -257,27 +257,38 @@ def test_healthy_wait_is_never_jittered(make_worker, fake_client):
 # ----- pacing knob validation ------------------------------------------------
 
 
+_PACING_KNOBS = [
+    "poll_interval_s",
+    "claim_backoff_max_s",
+    "heartbeat_interval_s",
+    "cancel_poll_interval_s",
+    "timeout_grace_s",
+]
+
+
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
-@pytest.mark.parametrize("knob", ["poll_interval_s", "claim_backoff_max_s"])
+@pytest.mark.parametrize("knob", _PACING_KNOBS)
 def test_degenerate_pacing_knobs_are_rejected(make_worker, fake_client, knob, bad):
-    """Zero/negative spins the claim loop at full speed; ``inf`` makes the
-    first idle wait never end; ``NaN`` fails every comparison in
-    ``_claim_wait_s`` (so the cap never matches and the wait is never-ending
-    too). All are silent at construction and expensive in production."""
+    """Every pacing knob fails the same two ways, silently at construction and
+    expensively in production against the one backend the fleet shares.
+
+    Too fast: zero/negative (and ``NaN``, which fails the same comparisons)
+    spins the claim loop, the heartbeat's ``PUT /progress`` and the cancel
+    guard's ``GET /cancel-status`` at full speed, and collapses the watchdog's
+    SIGTERM → grace → SIGKILL → grace escalation into an immediate hard exit.
+    Too slow: ``inf`` makes the first idle wait never end, never heartbeats,
+    never notices a cancel, and never reaches the hard exit."""
     with pytest.raises(ValueError, match=knob):
         make_worker(client=fake_client, **{knob: bad})
 
 
-def test_valid_pacing_knobs_are_coerced_to_float(make_worker, fake_client):
+@pytest.mark.parametrize("knob", _PACING_KNOBS)
+def test_valid_pacing_knobs_are_coerced_to_float(make_worker, fake_client, knob):
     """Ints are a normal way to spell these (``int(os.environ[...])``) and must
     keep working."""
-    worker = make_worker(
-        client=fake_client, poll_interval_s=5, claim_backoff_max_s=60,
-    )
-    assert worker.poll_interval_s == 5.0
-    assert worker.claim_backoff_max_s == 60.0
-    assert type(worker.poll_interval_s) is float
-    assert type(worker.claim_backoff_max_s) is float
+    worker = make_worker(client=fake_client, **{knob: 7})
+    assert getattr(worker, knob) == 7.0
+    assert type(getattr(worker, knob)) is float
 
 
 # ----- _claim failure bookkeeping --------------------------------------------
