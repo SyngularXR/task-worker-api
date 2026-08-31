@@ -42,6 +42,17 @@ def _mi_task(params: dict, task_id: int = 1) -> ClaimedTask:
     )
 
 
+def _gs_task(params: dict, task_id: int = 2) -> ClaimedTask:
+    return ClaimedTask(
+        id=task_id,
+        task_type=TaskType.GS_BUILD,
+        case_id=1,
+        item_key="aura",
+        status=TaskStatus.PENDING,
+        params=params,
+    )
+
+
 def _foreign(fake: FakeBackendClient, types=None) -> ForeignTarget:
     return ForeignTarget(
         url="http://foreign-box:5000/api/v1",
@@ -347,6 +358,17 @@ def test_require_foreign_capable_refuses_local_only_params(params):
 def test_require_foreign_capable_accepts_dual_and_pure_param():
     _require_foreign_capable(_mi_task({"input_path": "/x", "input_files": {"a": "a"}}))
     _require_foreign_capable(_mi_task({"some_knob": 3}))
+
+
+def test_require_foreign_capable_requires_scene_bundle():
+    with pytest.raises(CrossBoxLocalModeError, match="shared-volume-only"):
+        _require_foreign_capable(_gs_task({"scene": "/app/shared/grid/gs"}))
+
+    _require_foreign_capable(_gs_task({
+        "scene": "/app/shared/grid/gs",
+        "input_path": "/app/shared/grid/gs/train_images/000.png",
+        "input_files": {"scene": "scene.zip"},
+    }))
 
 
 @pytest.mark.asyncio

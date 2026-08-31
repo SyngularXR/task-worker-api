@@ -120,6 +120,15 @@ def test_gs_build_warm_start_ply_optional():
     assert GsBuildParams().warm_start_ply is None
 
 
+def test_gs_build_accepts_cross_box_scene_bundle():
+    params = GsBuildParams(
+        scene="/app/shared/grid/gs",
+        input_path="/app/shared/grid/gs/train_images/000.png",
+        input_files={"scene": "scene.zip"},
+    )
+    assert params.input_files == {"scene": "scene.zip"}
+
+
 def test_gs4d_build_registered():
     """GS4D_BUILD must be in the registry so Worker.__init__ doesn't reject a
     handler for it (the colmap-splat worker reuses gs_build.run for 4D phases)."""

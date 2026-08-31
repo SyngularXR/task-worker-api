@@ -22,6 +22,14 @@ class GsBuildParams(TaskParamsBase):
     scene: Optional[str] = Field(default=None, description="Scene directory on shared volume.")
     scene_path: Optional[str] = Field(default=None, description="Alias for `scene`.")
     scene_id: Optional[str] = Field(default=None, description="Scene id; defaults to dir basename.")
+    input_path: Optional[str] = Field(
+        default=None,
+        description="Home-box marker file; keeps local claims on the shared-volume path.",
+    )
+    input_files: Optional[dict[str, str]] = Field(
+        default=None,
+        description="Foreign-worker scene bundle, normally {'scene': 'scene.zip'}.",
+    )
 
     # 4D warm-chain (sub-project #4): seed this phase's Gaussian init from a
     # prior phase's trained PLY (run.sh `--warm-start-ply`). Absolute path under
