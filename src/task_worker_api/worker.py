@@ -616,9 +616,21 @@ class Worker:
             )
         self._payload_logger.cleanup_old_files()
 
-        cleanup_interval_s = float(
-            os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
-        )
+        cleanup_raw = os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
+        try:
+            cleanup_interval_s = float(cleanup_raw)
+            if not math.isfinite(cleanup_interval_s) or cleanup_interval_s <= 0:
+                raise ValueError(
+                    f"cleanup interval must be a finite positive number of "
+                    f"seconds, got {cleanup_interval_s}"
+                )
+        except (ValueError, TypeError):
+            log.warning(
+                "payload_log: WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S=%r is "
+                "invalid; falling back to 3600 seconds",
+                cleanup_raw,
+            )
+            cleanup_interval_s = 3600.0
         cleanup_task = asyncio.create_task(
             self._periodic_cleanup_loop(cleanup_interval_s)
         )

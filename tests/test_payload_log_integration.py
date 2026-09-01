@@ -215,3 +215,24 @@ async def test_run_forever_periodic_cleanup(
 
     # 1 startup + at least 2 periodic firings during 300ms with 50ms interval.
     assert counter["n"] >= 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "nan", "inf"])
+async def test_run_forever_cleanup_interval_falls_back_on_bad_value(
+    make_worker, fake_client, tmp_path, monkeypatch, caplog, bad,
+):
+    """Bad WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S must not crash run_forever
+    (or spin the cleanup loop); it falls back to 3600 with a WARNING."""
+    monkeypatch.setenv("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", bad)
+    worker = make_worker(
+        client=fake_client,
+        shared_volume_path=str(tmp_path / "shared"),
+        poll_interval_s=0.05,
+    )
+    asyncio.create_task(_shutdown_after(worker, 0.05))
+    with caplog.at_level("WARNING"):
+        await asyncio.wait_for(worker.run_forever(), timeout=2.0)
+    assert any(
+        "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S" in r.message for r in caplog.records
+    )
