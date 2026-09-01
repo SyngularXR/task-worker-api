@@ -26,6 +26,18 @@ def test_parse_env_skips_malformed(caplog):
     assert any("WORKER_TASK_TIMEOUTS" in r.message for r in caplog.records)
 
 
+def test_parse_env_skips_non_finite(caplog):
+    # float() accepts these, but nan fails _run_one's `timeout_s > 0` (watchdog
+    # never starts) and inf never fires — skip them so the default applies.
+    with caplog.at_level("WARNING"):
+        out = parse_timeouts_env("default=nan,render=inf,detect_cut_planes=-inf,gs_build=60")
+    assert out == {"gs_build": 60.0}
+    non_finite_warnings = [
+        r for r in caplog.records if "non-finite" in r.message
+    ]
+    assert len(non_finite_warnings) == 3
+
+
 def test_resolution_precedence_env_per_type_wins():
     # env per-type > ctor per-type > env default > ctor default
     t = resolve_task_timeout(

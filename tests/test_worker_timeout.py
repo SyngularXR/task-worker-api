@@ -43,6 +43,42 @@ def test_make_sync_fail_builds_put_request(monkeypatch):
     assert captured["closed"] is True
 
 
+# ----- constructor validation ----------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_task_timeout_s_rejected(make_worker, fake_client, bad):
+    """NaN fails _run_one's `timeout_s > 0` check (watchdog never starts) and
+    inf never fires — either way a wedged handler runs unbounded with no log
+    line saying why. Reject at construction like the pacing knobs."""
+    with pytest.raises(ValueError, match="task_timeout_s"):
+        make_worker(client=fake_client, task_timeout_s=bad)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_task_timeouts_value_rejected(make_worker, fake_client, bad):
+    with pytest.raises(ValueError, match="task_timeouts"):
+        make_worker(
+            client=fake_client,
+            task_timeouts={TaskType.DETECT_CUT_PLANES: bad},
+        )
+
+
+def test_zero_and_negative_task_timeouts_still_allowed(make_worker, fake_client):
+    """<= 0 is the documented "no timeout" escape hatch — only non-finite is
+    rejected. Ints stay usable and are coerced to float."""
+    w = make_worker(
+        client=fake_client,
+        task_timeout_s=0.0,
+        task_timeouts={TaskType.DETECT_CUT_PLANES: -1, TaskType.GS_BUILD: 60},
+    )
+    assert w.task_timeout_s == 0.0
+    assert w.task_timeouts == {
+        TaskType.DETECT_CUT_PLANES: -1.0, TaskType.GS_BUILD: 60.0,
+    }
+    assert all(type(v) is float for v in w.task_timeouts.values())
+
+
 # ----- Worker wiring (deterministic watchdog double) -----------------------
 
 
