@@ -157,23 +157,42 @@ async def test_local_mode_keeps_staging_dir_on_success(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_local_mode_no_staging_dir_when_shared_volume_unset(tmp_path):
-    """Without shared_volume_path, upload_outputs returns output_dir paths
-    and creates no staging dir — nothing to clean up."""
+async def test_local_mode_no_staging_dir_when_shared_volume_unset(
+    tmp_path, caplog,
+):
+    """Without shared_volume_path, upload_outputs warns once and preserves
+    its output_dir-path manifest contract."""
     out_dir = tmp_path / "work" / "out"
     out_dir.mkdir(parents=True)
     (out_dir / "a.stl").write_bytes(b"aaa")
+    (out_dir / "b.stl").write_bytes(b"bbb")
 
     task = _claimed(13, params={"input_path": "/ignored"})
     file_ctx = _file_ctx(out_dir)
 
-    manifest = await upload_outputs(
-        task, FakeBackendClient(), file_ctx,
-        output_files={"a": "a.stl"},
-        shared_volume_path=None,
-    )
+    with caplog.at_level("WARNING", logger="task_worker_api.files"):
+        manifest = await upload_outputs(
+            task, FakeBackendClient(), file_ctx,
+            output_files={"a": "a.stl", "b": "b.stl"},
+            shared_volume_path=None,
+        )
 
-    assert manifest == {"a": str(out_dir / "a.stl")}
+    assert manifest == {
+        "a": str(out_dir / "a.stl"),
+        "b": str(out_dir / "b.stl"),
+    }
+    warnings = [
+        record for record in caplog.records
+        if record.name == "task_worker_api.files"
+        and record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    warning = warnings[0].getMessage()
+    assert "task 13" in warning
+    assert str(out_dir / "a.stl") in warning
+    assert str(out_dir / "b.stl") in warning
+    assert "SHARED_VOLUME_PATH" in warning
+    assert "Worker(shared_volume_path=...)" in warning
     # No staging dir created anywhere.
     assert not (tmp_path / "temp").exists()
 
