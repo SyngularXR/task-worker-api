@@ -181,6 +181,24 @@ def _positive_finite_s(name: str, value: float) -> float:
     return float(value)
 
 
+def _finite_task_timeout_s(name: str, value: float) -> float:
+    """Validate a task-timeout value, or raise ``ValueError``.
+
+    Unlike the pacing knobs, ``<= 0`` is legal here — it is the documented
+    "no timeout" escape hatch for a known-unbounded task type. Non-finite
+    values defeat the timeout silently instead of loudly: ``NaN`` fails
+    ``_run_one``'s ``timeout_s > 0`` check, so the watchdog is never started
+    and a wedged handler runs unbounded with no log line saying why; ``inf``
+    starts a watchdog whose deadline never arrives — the same unbounded run,
+    one thread more expensive.
+    """
+    if not math.isfinite(value):
+        raise ValueError(
+            f"{name} must be a finite number of seconds (got {value!r})"
+        )
+    return float(value)
+
+
 def _make_sync_fail(
     base_url: str, api_key: str, task_id: int, worker_id: str, *, timeout_s: float = 3.0,
     attempts: int = 3, retry_sleep_s: float = 2.0,
@@ -349,8 +367,13 @@ class Worker:
         self.cancel_poll_interval_s = _positive_finite_s(
             "cancel_poll_interval_s", cancel_poll_interval_s,
         )
-        self.task_timeout_s = task_timeout_s
-        self.task_timeouts = task_timeouts or {}
+        self.task_timeout_s = _finite_task_timeout_s(
+            "task_timeout_s", task_timeout_s,
+        )
+        self.task_timeouts = {
+            t: _finite_task_timeout_s(f"task_timeouts[{t}]", v)
+            for t, v in (task_timeouts or {}).items()
+        }
         self.timeout_grace_s = _positive_finite_s(
             "timeout_grace_s", timeout_grace_s,
         )

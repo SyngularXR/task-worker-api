@@ -9,6 +9,20 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- Non-finite task timeouts are now rejected instead of silently disabling the
+  per-task watchdog. `WORKER_TASK_TIMEOUTS='gs_build=nan'` parsed cleanly
+  (`float('nan')` succeeds), `resolve_task_timeout` returned `NaN`, and
+  `_run_one`'s `timeout_s > 0` gate is `False` for `NaN` — so the watchdog was
+  never started and a wedged handler ran unbounded with no log line saying
+  why, on exactly the task types operators bother to configure timeouts for;
+  `inf` reached `TaskWatchdog` with a deadline that never arrives, for the
+  same effect. `parse_timeouts_env` now skips non-finite entries with the same
+  WARNING it already emits for malformed ones (so the documented default
+  applies instead), and the `Worker` constructor rejects non-finite
+  `task_timeout_s` / `task_timeouts` values with a `ValueError`, like its
+  pacing knobs. `<= 0` remains the documented "no timeout" escape hatch, and
+  ints keep working — only a consumer already passing a broken value sees the
+  new `ValueError`.
 - `Worker` now validates its remaining pacing knobs — `heartbeat_interval_s`,
   `cancel_poll_interval_s` and `timeout_grace_s` — through the same
   finite-and-positive guard that already covered `poll_interval_s` and

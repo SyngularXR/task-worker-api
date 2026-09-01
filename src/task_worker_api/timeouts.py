@@ -11,6 +11,7 @@ task type).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
 from .enums import TaskType
@@ -24,8 +25,11 @@ def parse_timeouts_env(raw: Optional[str]) -> dict[str, float]:
     """Parse ``WORKER_TASK_TIMEOUTS='default=1800,gs_build=7200'`` into a dict.
 
     Keys are lowercased task-type values plus the literal ``default``. Malformed
-    entries are skipped with a WARNING; this never raises (a bad env var must
-    not crash worker startup).
+    and non-finite entries are skipped with a WARNING; this never raises (a bad
+    env var must not crash worker startup). Non-finite values are rejected
+    because they defeat the timeout silently: ``nan`` fails ``_run_one``'s
+    ``timeout_s > 0`` check so the watchdog is never started, and ``inf``
+    starts one whose deadline never arrives.
     """
     result: dict[str, float] = {}
     if not raw:
@@ -42,11 +46,18 @@ def parse_timeouts_env(raw: Optional[str]) -> dict[str, float]:
         key, _, val = part.partition("=")
         key = key.strip().lower()
         try:
-            result[key] = float(val.strip())
+            value = float(val.strip())
         except ValueError:
             log.warning(
                 "WORKER_TASK_TIMEOUTS: ignoring non-numeric value in %r", part
             )
+            continue
+        if not math.isfinite(value):
+            log.warning(
+                "WORKER_TASK_TIMEOUTS: ignoring non-finite value in %r", part
+            )
+            continue
+        result[key] = value
     return result
 
 
