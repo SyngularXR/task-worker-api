@@ -614,7 +614,7 @@ class Worker:
                 self.shared_volume_path,
                 os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
             )
-        self._payload_logger.cleanup_old_files()
+        await asyncio.to_thread(self._payload_logger.cleanup_old_files)
 
         cleanup_raw = os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
         try:
@@ -755,7 +755,7 @@ class Worker:
                 await asyncio.sleep(interval_s)
                 if self._stop.is_set():
                     return
-                self._payload_logger.cleanup_old_files()
+                await asyncio.to_thread(self._payload_logger.cleanup_old_files)
         except asyncio.CancelledError:
             raise
 
