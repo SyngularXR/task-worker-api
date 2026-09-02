@@ -9,6 +9,18 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- Foreign target polling in `Worker._claim` is now round-robin instead of
+  fixed listed order. The sweep returns on the first successful claim, so with
+  two or more boxes in `SYNPUSHER_TARGETS` a target with a standing backlog
+  claimed every cycle and the targets after it were never polled at all — not
+  merely deprioritised. The start index now advances one step per cycle, so
+  each target gets first pick every `len(targets)` cycles; home keeps its
+  first refusal every cycle and a backoff-skipped target stays skipped. The
+  per-target backoff exponent is also bounded: `failures` increments forever
+  against a permanently dead box, so `2 ** failures` built an ever-wider
+  throwaway integer every cycle even though the result was always clamped to
+  the 32-cycle ceiling. Worker-local and additive — no wire or
+  `SYNPUSHER_TARGETS` format change.
 - `Worker` now reclaims orphaned `task_<id>` scratch directories at startup
   and on the existing periodic cleanup timer. A process killed mid-task cannot
   run its normal `finally` cleanup, so GB-scale staging trees previously

@@ -234,6 +234,64 @@ async def test_dead_foreign_target_backs_off_and_recovers(make_worker):
     assert record.count("dead") == 2
 
 
+class _BusyFake(_RecordingFake):
+    """A target with a standing backlog: every poll yields a task."""
+
+    async def claim_next(self, task_types, worker_id):
+        self._record.append(self._label)
+        return _mi_task({"job_id": "j", "base_name": "x",
+                         "input_files": {"x.stl": "x.stl"}})
+
+
+@pytest.mark.asyncio
+async def test_backlogged_foreign_target_does_not_starve_the_next(make_worker):
+    """Round-robin: a target that claims every cycle must not monopolise the
+    sweep. With a fixed order, ``quiet`` would never be polled at all."""
+    record: list[str] = []
+    home = _RecordingFake("home", record)
+    busy = _BusyFake("busy", record)
+    quiet = _RecordingFake("quiet", record)
+
+    worker = make_worker(
+        client=home,
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        foreign_targets=[
+            ForeignTarget(url="http://busy/api/v1", api_key="k1",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=busy),
+            ForeignTarget(url="http://quiet/api/v1", api_key="k2",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=quiet),
+        ],
+    )
+    for _ in range(4):
+        assert await worker._claim() is not None  # busy always has work
+
+    assert record == [
+        "home", "busy",           # cycle 1: starts at index 0
+        "home", "quiet", "busy",  # cycle 2: quiet gets first pick
+        "home", "busy",           # cycle 3: back to index 0
+        "home", "quiet", "busy",  # cycle 4
+    ]
+
+
+@pytest.mark.asyncio
+async def test_foreign_backoff_exponent_stays_bounded(make_worker):
+    """A worker left running for days against a dead box keeps a small
+    exponent — the skip is the ceiling either way, the arithmetic isn't."""
+    record: list[str] = []
+    dead = _DeadFake("dead", record)
+    worker = make_worker(
+        client=_RecordingFake("home", record),
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        foreign_targets=[_foreign(dead)],
+    )
+    tgt = worker._foreign_targets[0]
+    tgt.failures = 100_000
+
+    assert await worker._claim() is None
+    assert tgt.failures == 100_001
+    assert tgt.skip_cycles == 32  # _FOREIGN_BACKOFF_MAX_CYCLES, as before
+
+
 # ---------------------------------------------------------------------------
 # Per-task binding + foreign mode rules (worker level)
 # ---------------------------------------------------------------------------
