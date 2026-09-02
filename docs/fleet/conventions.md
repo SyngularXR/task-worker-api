@@ -54,6 +54,8 @@ Workers in **polling mode** (everything except hybrid):
 - `WORKER_WORKDIR` — ephemeral per-task scratch dir (e.g., `/tmp/colmap-splat-worker`)
 - `ENABLE_TASK_WORKER=true` — dual-mode images (colmap-splat) gate worker mode on this
 
+All worker modes may set `WORKER_WORKDIR_CLEANUP_MIN_AGE_S`, the minimum age for reclaiming orphaned `task_<id>` scratch dirs (default `86400`; invalid/non-positive values fall back with a WARNING).
+
 ## 4. Payload logging contract (v0.5.0+)
 
 Three env vars, all optional:
@@ -62,7 +64,7 @@ Three env vars, all optional:
 |---|---|---|
 | `WORKER_PAYLOAD_LOG_ENABLED` | `true` | Master switch. `false` disables capture; cleanup of existing files still runs. |
 | `WORKER_PAYLOAD_LOG_RETENTION_DAYS` | `14` | mtime-based retention. Bad/zero/negative values fall back to 14 with a WARNING. |
-| `WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S` | `3600` | Periodic cleanup loop interval. Tighter values are useful for tests. Bad/zero/negative/non-finite values fall back to 3600 with a WARNING. |
+| `WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S` | `3600` | Periodic payload-log and orphan-workdir cleanup loop interval. Tighter values are useful for tests. Bad/zero/negative/non-finite values fall back to 3600 with a WARNING. |
 
 Files land under `/app/shared/_worker_payloads/{worker_id}/`:
 - `payloads-DATE-pidPID-BOOT.jsonl` — typed envelope per claimed task, captured before schema validation.

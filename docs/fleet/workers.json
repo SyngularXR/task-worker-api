@@ -30,6 +30,7 @@
         "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID"],
         "optional": [
           "SHARED_VOLUME_PATH",
+          "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
           "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S",
@@ -74,6 +75,7 @@
           "SHARED_VOLUME_PATH",
           "WORKER_WORKDIR",
           "WORKER_POLL_INTERVAL",
+          "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
           "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S",
@@ -109,6 +111,7 @@
           "SHARED_VOLUME_PATH",
           "WORKER_WORKDIR",
           "WORKER_POLL_INTERVAL",
+          "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
           "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S"
@@ -142,6 +145,7 @@
           "WORKER_WORKDIR",
           "WORKER_POLL_INTERVAL",
           "WORKER_TASK_TYPES",
+          "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
           "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S"
@@ -174,8 +178,13 @@
     },
     "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S": {
       "default": "3600",
-      "description": "Periodic cleanup interval (seconds). Keeps idle workers honest between rollover events. Tighter intervals are useful for tests.",
+      "description": "Periodic payload-log and orphan-workdir cleanup interval (seconds). Keeps idle workers honest between rollover events. Tighter intervals are useful for tests.",
       "since": "task-worker-api v0.5.0"
+    },
+    "WORKER_WORKDIR_CLEANUP_MIN_AGE_S": {
+      "default": "86400",
+      "description": "Minimum newest-tree mtime age before an orphaned task_<id> directory directly under WORKER_WORKDIR can be reclaimed at startup or on the periodic cleanup timer.",
+      "since": "task-worker-api v0.18.0"
     }
   },
   "links": {

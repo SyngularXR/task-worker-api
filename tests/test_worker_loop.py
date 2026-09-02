@@ -1044,6 +1044,71 @@ async def test_task_workdir_cleanup_runs_off_the_event_loop(
 # still on disk.
 
 
+def test_orphan_workdir_sweep_is_age_floored_and_narrow(tmp_path):
+    """Only old, inactive SDK task dirs directly under work_dir are removed."""
+    import os
+    import time
+
+    from task_worker_api import worker as worker_mod
+
+    work_dir = tmp_path / "work"
+    old = work_dir / "task_1"
+    active = work_dir / "task_2"
+    recently_touched = work_dir / "task_3"
+    malformed = work_dir / "task_backup"
+    nested = work_dir / "other" / "task_4"
+    for path in (old, active, recently_touched, malformed, nested):
+        (path / "in").mkdir(parents=True)
+        (path / "in" / "input.bin").write_bytes(b"input")
+
+    stale = time.time() - 7200
+    for root in (old, active, recently_touched, malformed, nested):
+        for path in reversed([root, *root.rglob("*")]):
+            os.utime(path, (stale, stale), follow_symlinks=False)
+    # The root can be old while a file written by a live/recent attempt is not.
+    fresh_file = recently_touched / "in" / "input.bin"
+    os.utime(fresh_file, None)
+
+    worker_mod._sweep_orphaned_workdirs(
+        work_dir,
+        active,
+        min_age_s=3600,
+    )
+
+    assert not old.exists()
+    assert active.exists()
+    assert recently_touched.exists()
+    assert malformed.exists()
+    assert nested.exists()
+
+
+def test_orphan_workdir_sweep_never_raises(tmp_path, monkeypatch, caplog):
+    """A filesystem failure is logged and left for the next timer firing."""
+    import os
+    import time
+
+    from task_worker_api import worker as worker_mod
+
+    orphan = tmp_path / "work" / "task_1"
+    orphan.mkdir(parents=True)
+    stale = time.time() - 7200
+    os.utime(orphan, (stale, stale))
+
+    def fail_remove(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(worker_mod.shutil, "rmtree", fail_remove)
+    with caplog.at_level("WARNING"):
+        worker_mod._sweep_orphaned_workdirs(
+            orphan.parent,
+            None,
+            min_age_s=3600,
+        )
+
+    assert orphan.exists()
+    assert any(str(orphan) in record.message for record in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_retry_does_not_inherit_the_dead_attempts_workdir(
     make_worker, fake_client, queue_cut_planes_task, tmp_path,
