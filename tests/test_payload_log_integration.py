@@ -192,7 +192,9 @@ async def test_run_forever_closes_logger_in_finally(make_worker, fake_client, tm
 async def test_run_forever_periodic_cleanup(
     make_worker, fake_client, tmp_path, monkeypatch,
 ):
-    """With a tight cleanup interval, the timer fires multiple times during the run."""
+    """Startup and periodic cleanup both run off the event loop."""
+    import threading
+
     monkeypatch.setenv("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "0.05")
     shared = tmp_path / "shared"
     worker = make_worker(
@@ -201,11 +203,12 @@ async def test_run_forever_periodic_cleanup(
         poll_interval_s=0.01,
     )
 
-    counter = {"n": 0}
+    loop_thread = threading.current_thread()
+    cleanup_threads: list[threading.Thread] = []
     real_cleanup = worker._payload_logger.cleanup_old_files
 
     def counting_cleanup():
-        counter["n"] += 1
+        cleanup_threads.append(threading.current_thread())
         real_cleanup()
 
     worker._payload_logger.cleanup_old_files = counting_cleanup  # type: ignore[method-assign]
@@ -214,7 +217,8 @@ async def test_run_forever_periodic_cleanup(
     await asyncio.wait_for(worker.run_forever(), timeout=2.0)
 
     # 1 startup + at least 2 periodic firings during 300ms with 50ms interval.
-    assert counter["n"] >= 3
+    assert len(cleanup_threads) >= 3
+    assert all(thread is not loop_thread for thread in cleanup_threads)
 
 
 @pytest.mark.asyncio
