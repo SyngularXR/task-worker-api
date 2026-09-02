@@ -183,8 +183,8 @@
     },
     "WORKER_WORKDIR_CLEANUP_MIN_AGE_S": {
       "default": "86400",
-      "description": "Minimum newest-tree mtime age before an orphaned task_<id> directory directly under WORKER_WORKDIR can be reclaimed at startup or on the periodic cleanup timer.",
-      "since": "task-worker-api v0.18.0"
+      "description": "Minimum newest-tree mtime age before an orphaned task_<id> directory directly under the configured work_dir (WORKER_WORKDIR or the platform temp directory by default) can be reclaimed at startup or on the periodic cleanup timer.",
+      "since": "task-worker-api v0.17.0"
     }
   },
   "links": {

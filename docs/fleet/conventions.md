@@ -54,7 +54,9 @@ Workers in **polling mode** (everything except hybrid):
 - `WORKER_WORKDIR` — ephemeral per-task scratch dir (e.g., `/tmp/colmap-splat-worker`)
 - `ENABLE_TASK_WORKER=true` — dual-mode images (colmap-splat) gate worker mode on this
 
-All worker modes may set `WORKER_WORKDIR_CLEANUP_MIN_AGE_S`, the minimum age for reclaiming orphaned `task_<id>` scratch dirs (default `86400`; invalid/non-positive values fall back with a WARNING).
+All worker modes may set `WORKER_WORKDIR_CLEANUP_MIN_AGE_S`, the minimum age for reclaiming orphaned `task_<id>` dirs directly under the worker's scratch root (`Worker(work_dir=...)`, otherwise `WORKER_WORKDIR`, otherwise the platform temp directory). The default is `86400`; invalid/non-positive values fall back with a WARNING.
+
+Active-dir protection is process-local. When horizontally scaled replicas share a scratch root, do not set `WORKER_WORKDIR_CLEANUP_MIN_AGE_S` below the longest possible task duration, or one replica may reclaim another replica's live directory.
 
 ## 4. Payload logging contract (v0.5.0+)
 

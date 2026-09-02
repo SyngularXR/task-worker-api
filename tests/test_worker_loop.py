@@ -1086,6 +1086,7 @@ def test_orphan_workdir_sweep_never_raises(tmp_path, monkeypatch, caplog):
     """A filesystem failure is logged and left for the next timer firing."""
     import os
     import time
+    from types import SimpleNamespace
 
     from task_worker_api import worker as worker_mod
 
@@ -1097,7 +1098,7 @@ def test_orphan_workdir_sweep_never_raises(tmp_path, monkeypatch, caplog):
     def fail_remove(path):
         raise PermissionError(13, "Permission denied", str(path))
 
-    monkeypatch.setattr(worker_mod.shutil, "rmtree", fail_remove)
+    monkeypatch.setattr(worker_mod, "shutil", SimpleNamespace(rmtree=fail_remove))
     with caplog.at_level("WARNING"):
         worker_mod._sweep_orphaned_workdirs(
             orphan.parent,

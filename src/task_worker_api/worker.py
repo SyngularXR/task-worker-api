@@ -435,6 +435,26 @@ class Worker:
         self._watchdog_factory = _watchdog_factory
         self._active_task_dir: Optional[Path] = None
         self._workdir_cleanup_lock = asyncio.Lock()
+        workdir_age_raw = os.environ.get(
+            "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
+            str(_DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S),
+        )
+        try:
+            self._workdir_cleanup_min_age_s = float(workdir_age_raw)
+            if (
+                not math.isfinite(self._workdir_cleanup_min_age_s)
+                or self._workdir_cleanup_min_age_s <= 0
+            ):
+                raise ValueError
+        except (ValueError, TypeError):
+            log.warning(
+                "workdir cleanup: WORKER_WORKDIR_CLEANUP_MIN_AGE_S=%r is "
+                "invalid; falling back to %d seconds",
+                workdir_age_raw, _DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S,
+            )
+            self._workdir_cleanup_min_age_s = float(
+                _DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S
+            )
 
         self._payload_logger = self._build_payload_logger()
 
@@ -669,22 +689,6 @@ class Worker:
                 self.shared_volume_path,
                 os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
             )
-        workdir_age_raw = os.environ.get(
-            "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
-            str(_DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S),
-        )
-        try:
-            workdir_min_age_s = float(workdir_age_raw)
-            if not math.isfinite(workdir_min_age_s) or workdir_min_age_s <= 0:
-                raise ValueError
-        except (ValueError, TypeError):
-            log.warning(
-                "workdir cleanup: WORKER_WORKDIR_CLEANUP_MIN_AGE_S=%r is "
-                "invalid; falling back to %d seconds",
-                workdir_age_raw, _DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S,
-            )
-            workdir_min_age_s = float(_DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S)
-        self._workdir_cleanup_min_age_s = workdir_min_age_s
         await self._run_cleanup()
 
         cleanup_raw = os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
@@ -831,7 +835,7 @@ class Worker:
             raise
 
     async def _run_cleanup(self) -> None:
-        """Run all worker-local retention off-loop; never raise."""
+        """Run all worker-local retention off the event loop."""
         await asyncio.to_thread(self._payload_logger.cleanup_old_files)
         # Serializing only the sweep against task activation closes the race
         # where an old path is selected, then reclaimed and recreated for a
@@ -1307,8 +1311,9 @@ class Worker:
                     shutil.rmtree, task_dir, ignore_errors=True,
                 )
             finally:
-                async with self._workdir_cleanup_lock:
-                    self._active_task_dir = None
+                # This assignment must not await: cancellation during cleanup
+                # must not leave a dead task protected from future sweeps.
+                self._active_task_dir = None
 
 
 async def run_hybrid(

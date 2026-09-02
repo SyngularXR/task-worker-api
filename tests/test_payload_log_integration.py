@@ -155,7 +155,7 @@ async def test_run_forever_logs_startup_state(make_worker, fake_client, tmp_path
 
 @pytest.mark.asyncio
 async def test_run_forever_runs_startup_cleanup(make_worker, fake_client, tmp_path):
-    """Pre-existing expired files in the worker dir are gone after startup."""
+    """Startup removes expired payload files and orphaned task workdirs."""
     shared = tmp_path / "shared"
     worker_dir = shared / "_worker_payloads" / "w"
     worker_dir.mkdir(parents=True)
@@ -163,6 +163,10 @@ async def test_run_forever_runs_startup_cleanup(make_worker, fake_client, tmp_pa
     expired.write_text("{}\n", encoding="utf-8")
     age_s = 30 * 86400
     os.utime(expired, (time.time() - age_s, time.time() - age_s))
+    orphan = tmp_path / "work" / "task_99"
+    orphan.mkdir(parents=True)
+    orphan_age_s = 2 * 86400
+    os.utime(orphan, (time.time() - orphan_age_s,) * 2)
 
     worker = make_worker(
         client=fake_client,
@@ -173,6 +177,14 @@ async def test_run_forever_runs_startup_cleanup(make_worker, fake_client, tmp_pa
     await asyncio.wait_for(worker.run_forever(), timeout=2.0)
 
     assert not expired.exists()
+    assert not orphan.exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_can_run_before_run_forever(make_worker, fake_client):
+    worker = make_worker(client=fake_client)
+
+    await worker._run_cleanup()
 
 
 @pytest.mark.asyncio
@@ -255,16 +267,13 @@ async def test_run_forever_cleanup_interval_falls_back_on_bad_value(
     )
 
 
-@pytest.mark.asyncio
-async def test_run_forever_workdir_cleanup_age_falls_back_on_bad_value(
+def test_workdir_cleanup_age_falls_back_on_bad_value(
     make_worker, fake_client, monkeypatch, caplog,
 ):
     monkeypatch.setenv("WORKER_WORKDIR_CLEANUP_MIN_AGE_S", "nan")
-    worker = make_worker(client=fake_client, poll_interval_s=0.05)
-    asyncio.create_task(_shutdown_after(worker, 0.05))
 
     with caplog.at_level("WARNING"):
-        await asyncio.wait_for(worker.run_forever(), timeout=2.0)
+        worker = make_worker(client=fake_client, poll_interval_s=0.05)
 
     assert worker._workdir_cleanup_min_age_s == 24 * 60 * 60
     assert any(
