@@ -59,6 +59,12 @@ HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
 # within a minute.
 _DEFAULT_CLAIM_BACKOFF_MAX_S = _DEFAULT_BACKOFF_MAX_S
 
+# A full day is well beyond the fleet's longest configured task timeout (the
+# 3-hour cinematic_baking job), so a quiet tree this old cannot be a healthy
+# attempt. Operators can raise this floor for unusually slow local storage.
+_DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S = 24 * 60 * 60
+_TASK_WORKDIR_RE = re.compile(r"task_\d+")
+
 #: Cap on how many poll cycles a connect-failing foreign target is skipped.
 #: 32 cycles at the default 5s poll interval ≈ 2.7 min between attempts —
 #: enough to stop a dead target from consuming a retry burst every cycle,
@@ -275,6 +281,53 @@ def _clear_workdir(task_dir: Path) -> None:
         )
 
 
+def _newest_tree_mtime(path: Path) -> float:
+    """Return the newest mtime in ``path`` without following symlinks."""
+    newest = path.stat(follow_symlinks=False).st_mtime
+    pending = [path]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                newest = max(
+                    newest,
+                    entry.stat(follow_symlinks=False).st_mtime,
+                )
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+    return newest
+
+
+def _sweep_orphaned_workdirs(
+    work_dir: Path,
+    active_task_dir: Optional[Path],
+    min_age_s: float,
+) -> None:
+    """Best-effort removal of old SDK-owned task dirs. Runs in a thread."""
+    cutoff = time.time() - min_age_s
+    try:
+        candidates = list(work_dir.iterdir())
+    except Exception as e:  # noqa: BLE001 — cleanup must never stop polling
+        log.warning("workdir cleanup: could not scan %s: %s", work_dir, e)
+        return
+
+    for task_dir in candidates:
+        if not _TASK_WORKDIR_RE.fullmatch(task_dir.name):
+            continue
+        try:
+            if (
+                task_dir == active_task_dir
+                or task_dir.is_symlink()
+                or not task_dir.is_dir()
+            ):
+                continue
+            if _newest_tree_mtime(task_dir) >= cutoff:
+                continue
+            shutil.rmtree(task_dir)
+            log.info("workdir cleanup: removed orphaned %s", task_dir)
+        except Exception as e:  # noqa: BLE001 — cleanup must never stop polling
+            log.warning("workdir cleanup: could not remove %s: %s", task_dir, e)
+
+
 def _result_encode_error(result: object) -> Optional[str]:
     """The error ``complete()`` would raise encoding ``result``, or ``None``.
 
@@ -380,6 +433,28 @@ class Worker:
         self._on_hard_exit = on_hard_exit or (lambda: os._exit(75))
         self._timeout_env = parse_timeouts_env(os.environ.get("WORKER_TASK_TIMEOUTS"))
         self._watchdog_factory = _watchdog_factory
+        self._active_task_dir: Optional[Path] = None
+        self._workdir_cleanup_lock = asyncio.Lock()
+        workdir_age_raw = os.environ.get(
+            "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
+            str(_DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S),
+        )
+        try:
+            self._workdir_cleanup_min_age_s = float(workdir_age_raw)
+            if (
+                not math.isfinite(self._workdir_cleanup_min_age_s)
+                or self._workdir_cleanup_min_age_s <= 0
+            ):
+                raise ValueError
+        except (ValueError, TypeError):
+            log.warning(
+                "workdir cleanup: WORKER_WORKDIR_CLEANUP_MIN_AGE_S=%r is "
+                "invalid; falling back to %d seconds",
+                workdir_age_raw, _DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S,
+            )
+            self._workdir_cleanup_min_age_s = float(
+                _DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S
+            )
 
         self._payload_logger = self._build_payload_logger()
 
@@ -614,7 +689,7 @@ class Worker:
                 self.shared_volume_path,
                 os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
             )
-        await asyncio.to_thread(self._payload_logger.cleanup_old_files)
+        await self._run_cleanup()
 
         cleanup_raw = os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
         try:
@@ -755,9 +830,23 @@ class Worker:
                 await asyncio.sleep(interval_s)
                 if self._stop.is_set():
                     return
-                await asyncio.to_thread(self._payload_logger.cleanup_old_files)
+                await self._run_cleanup()
         except asyncio.CancelledError:
             raise
+
+    async def _run_cleanup(self) -> None:
+        """Run all worker-local retention off the event loop."""
+        await asyncio.to_thread(self._payload_logger.cleanup_old_files)
+        # Serializing only the sweep against task activation closes the race
+        # where an old path is selected, then reclaimed and recreated for a
+        # new attempt before rmtree starts. Waiting here never blocks the loop.
+        async with self._workdir_cleanup_lock:
+            await asyncio.to_thread(
+                _sweep_orphaned_workdirs,
+                self.work_dir,
+                self._active_task_dir,
+                self._workdir_cleanup_min_age_s,
+            )
 
     async def run_one(self) -> bool:
         """Process exactly one claim cycle. Returns True iff a task ran.
@@ -997,6 +1086,11 @@ class Worker:
             # prepare_inputs still tears the heartbeat down cleanly.
             await progress.start_heartbeat()
 
+            # A periodic sweep may already be removing this old path. Wait for
+            # it off-loop, then mark the path active before staging any files.
+            async with self._workdir_cleanup_lock:
+                self._active_task_dir = task_dir
+
             # Each attempt starts from a clean workdir. The finally block
             # below removes ``task_dir`` after every attempt, but a mid-task
             # kill (OOM killer, SIGKILL, host reboot) never runs it and the
@@ -1212,7 +1306,14 @@ class Worker:
             # delete — in hybrid mode that stalls the FastAPI app, and in any
             # mode it delays the next claim. ``ignore_errors=True`` keeps this
             # non-raising, so the semantics are unchanged.
-            await asyncio.to_thread(shutil.rmtree, task_dir, ignore_errors=True)
+            try:
+                await asyncio.to_thread(
+                    shutil.rmtree, task_dir, ignore_errors=True,
+                )
+            finally:
+                # This assignment must not await: cancellation during cleanup
+                # must not leave a dead task protected from future sweeps.
+                self._active_task_dir = None
 
 
 async def run_hybrid(

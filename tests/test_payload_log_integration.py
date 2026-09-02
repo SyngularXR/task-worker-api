@@ -155,7 +155,7 @@ async def test_run_forever_logs_startup_state(make_worker, fake_client, tmp_path
 
 @pytest.mark.asyncio
 async def test_run_forever_runs_startup_cleanup(make_worker, fake_client, tmp_path):
-    """Pre-existing expired files in the worker dir are gone after startup."""
+    """Startup removes expired payload files and orphaned task workdirs."""
     shared = tmp_path / "shared"
     worker_dir = shared / "_worker_payloads" / "w"
     worker_dir.mkdir(parents=True)
@@ -163,6 +163,10 @@ async def test_run_forever_runs_startup_cleanup(make_worker, fake_client, tmp_pa
     expired.write_text("{}\n", encoding="utf-8")
     age_s = 30 * 86400
     os.utime(expired, (time.time() - age_s, time.time() - age_s))
+    orphan = tmp_path / "work" / "task_99"
+    orphan.mkdir(parents=True)
+    orphan_age_s = 2 * 86400
+    os.utime(orphan, (time.time() - orphan_age_s,) * 2)
 
     worker = make_worker(
         client=fake_client,
@@ -173,6 +177,14 @@ async def test_run_forever_runs_startup_cleanup(make_worker, fake_client, tmp_pa
     await asyncio.wait_for(worker.run_forever(), timeout=2.0)
 
     assert not expired.exists()
+    assert not orphan.exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_can_run_before_run_forever(make_worker, fake_client):
+    worker = make_worker(client=fake_client)
+
+    await worker._run_cleanup()
 
 
 @pytest.mark.asyncio
@@ -192,10 +204,13 @@ async def test_run_forever_closes_logger_in_finally(make_worker, fake_client, tm
 async def test_run_forever_periodic_cleanup(
     make_worker, fake_client, tmp_path, monkeypatch,
 ):
-    """Startup and periodic cleanup both run off the event loop."""
+    """Payload and orphan-workdir cleanup run at startup and periodically off-loop."""
     import threading
 
+    from task_worker_api import worker as worker_mod
+
     monkeypatch.setenv("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "0.05")
+    monkeypatch.setenv("WORKER_WORKDIR_CLEANUP_MIN_AGE_S", "0.01")
     shared = tmp_path / "shared"
     worker = make_worker(
         client=fake_client,
@@ -205,7 +220,9 @@ async def test_run_forever_periodic_cleanup(
 
     loop_thread = threading.current_thread()
     cleanup_threads: list[threading.Thread] = []
+    sweep_threads: list[threading.Thread] = []
     real_cleanup = worker._payload_logger.cleanup_old_files
+    real_sweep = worker_mod._sweep_orphaned_workdirs
 
     def counting_cleanup():
         cleanup_threads.append(threading.current_thread())
@@ -213,12 +230,20 @@ async def test_run_forever_periodic_cleanup(
 
     worker._payload_logger.cleanup_old_files = counting_cleanup  # type: ignore[method-assign]
 
+    def counting_sweep(*args, **kwargs):
+        sweep_threads.append(threading.current_thread())
+        real_sweep(*args, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "_sweep_orphaned_workdirs", counting_sweep)
+
     asyncio.create_task(_shutdown_after(worker, 0.3))
     await asyncio.wait_for(worker.run_forever(), timeout=2.0)
 
     # 1 startup + at least 2 periodic firings during 300ms with 50ms interval.
     assert len(cleanup_threads) >= 3
     assert all(thread is not loop_thread for thread in cleanup_threads)
+    assert len(sweep_threads) >= 3
+    assert all(thread is not loop_thread for thread in sweep_threads)
 
 
 @pytest.mark.asyncio
@@ -239,4 +264,19 @@ async def test_run_forever_cleanup_interval_falls_back_on_bad_value(
         await asyncio.wait_for(worker.run_forever(), timeout=2.0)
     assert any(
         "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S" in r.message for r in caplog.records
+    )
+
+
+def test_workdir_cleanup_age_falls_back_on_bad_value(
+    make_worker, fake_client, monkeypatch, caplog,
+):
+    monkeypatch.setenv("WORKER_WORKDIR_CLEANUP_MIN_AGE_S", "nan")
+
+    with caplog.at_level("WARNING"):
+        worker = make_worker(client=fake_client, poll_interval_s=0.05)
+
+    assert worker._workdir_cleanup_min_age_s == 24 * 60 * 60
+    assert any(
+        "WORKER_WORKDIR_CLEANUP_MIN_AGE_S" in record.message
+        for record in caplog.records
     )

@@ -9,6 +9,16 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `Worker` now reclaims orphaned `task_<id>` scratch directories at startup
+  and on the existing periodic cleanup timer. A process killed mid-task cannot
+  run its normal `finally` cleanup, so GB-scale staging trees previously
+  accumulated until operators removed them. Cleanup is deliberately narrow:
+  only directories directly under the configured work root whose entire tree
+  is older than 24 hours are removed; symlinks, active paths, newer trees, and
+  other names are left alone. The age floor is configurable with
+  `WORKER_WORKDIR_CLEANUP_MIN_AGE_S`. Active-path tracking is process-local, so
+  scaled replicas that share a work root must keep the floor at least as long
+  as their longest task duration.
 - Non-finite task timeouts are now rejected instead of silently disabling the
   per-task watchdog. `WORKER_TASK_TIMEOUTS='gs_build=nan'` parsed cleanly
   (`float('nan')` succeeds), `resolve_task_timeout` returned `NaN`, and
