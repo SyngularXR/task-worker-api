@@ -274,6 +274,50 @@ async def test_backlogged_foreign_target_does_not_starve_the_next(make_worker):
 
 
 @pytest.mark.asyncio
+async def test_backoff_advances_behind_a_backlogged_target(make_worker):
+    """Backoff is charged per poll cycle, not per target reached. ``busy``
+    claims every cycle and the sweep returns on the first claim, so ``dead``
+    is only reached on the cycles the rotation puts it first — its counter
+    must still advance on the cycles it isn't reached, or a recovered box
+    waits ``len(targets)`` times its backoff and the ceiling scales with
+    target count."""
+    record: list[str] = []
+    home = _RecordingFake("home", record)
+    dead = _DeadFake("dead", record)
+    busy = _BusyFake("busy", record)
+
+    worker = make_worker(
+        client=home,
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        foreign_targets=[
+            ForeignTarget(url="http://dead/api/v1", api_key="k1",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=dead),
+            ForeignTarget(url="http://busy/api/v1", api_key="k2",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=busy),
+        ],
+    )
+    tgt = worker._foreign_targets[0]
+    # Cycle 1: dead raises → 2-cycle backoff; busy claims and ends the sweep.
+    assert await worker._claim() is not None
+    assert record == ["home", "dead", "busy"]
+    assert tgt.skip_cycles == 2
+    # Cycle 2 starts at busy, which claims before dead is ever reached — the
+    # counter must advance anyway. Same on cycle 3.
+    assert await worker._claim() is not None
+    assert tgt.skip_cycles == 1
+    assert await worker._claim() is not None
+    assert tgt.skip_cycles == 0  # due again, on schedule
+    assert record.count("dead") == 1
+    # Cycle 4 starts at busy again, so the retry lands on cycle 5, the next
+    # cycle the rotation gives dead first pick. Decrementing in-sweep instead
+    # stalled the counter every other cycle and pushed this out to cycle 7.
+    assert await worker._claim() is not None
+    assert record.count("dead") == 1
+    assert await worker._claim() is not None
+    assert record.count("dead") == 2
+
+
+@pytest.mark.asyncio
 async def test_foreign_backoff_exponent_stays_bounded(make_worker):
     """A worker left running for days against a dead box keeps a small
     exponent — the skip is the ceiling either way, the arithmetic isn't."""

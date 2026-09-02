@@ -14,12 +14,16 @@
   two or more boxes in `SYNPUSHER_TARGETS` a target with a standing backlog
   claimed every cycle and the targets after it were never polled at all — not
   merely deprioritised. The start index now advances one step per cycle, so
-  each target gets first pick every `len(targets)` cycles; home keeps its
-  first refusal every cycle and a backoff-skipped target stays skipped. The
-  per-target backoff exponent is also bounded: `failures` increments forever
-  against a permanently dead box, so `2 ** failures` built an ever-wider
-  throwaway integer every cycle even though the result was always clamped to
-  the 32-cycle ceiling. Worker-local and additive — no wire or
+  each target gets first pick every `len(targets)` cycles, and home keeps its
+  first refusal every cycle. Per-target backoff is now charged once per poll
+  cycle rather than when the sweep reaches the target — since the sweep stops
+  at the first claim, a target behind a backlogged one is never reached, and
+  its counter would otherwise stall and stretch an N-cycle backoff to as much
+  as `N * len(targets)` cycles. The backoff exponent is also bounded:
+  `failures` increments forever against a permanently dead box, so
+  `2 ** failures` built an ever-wider throwaway integer every cycle even
+  though the result was always clamped to the 32-cycle ceiling. Worker-local
+  and additive — no wire or
   `SYNPUSHER_TARGETS` format change.
 - `Worker` now reclaims orphaned `task_<id>` scratch directories at startup
   and on the existing periodic cleanup timer. A process killed mid-task cannot

@@ -928,28 +928,35 @@ class Worker:
         Advancing the start index one step per cycle gives every target first
         pick every ``len(targets)`` cycles. One that fails to connect is
         skipped for exponentially more cycles (capped) so a dead target can't
-        starve the ones after it or consume a retry burst every cycle; the
-        rotation doesn't change that, a skipped target just burns its
-        ``skip_cycles`` decrement wherever it lands in the order. Home
-        failures keep driving the existing global idle-wait escalation;
-        foreign failures never touch it.
+        starve the ones after it or consume a retry burst every cycle. That
+        backoff is charged per poll cycle, before the sweep, rather than when
+        the sweep happens to reach the target: the sweep returns on the first
+        successful claim, so a target sitting behind a backlogged one is never
+        reached, and an in-sweep decrement would stall its counter — an
+        N-cycle backoff would take up to ``N * len(targets)`` cycles to
+        expire, scaling the ceiling with target count. Home failures keep
+        driving the existing global idle-wait escalation; foreign failures
+        never touch it.
         """
         claimed = await self._claim_home()
         if claimed is not None:
             return claimed, self._home_target
         targets = self._foreign_targets
-        if targets:
-            start = self._foreign_cursor
-            # Modulo on store, not on read: the cursor must stay small for the
-            # same reason the backoff exponent does.
-            self._foreign_cursor = (start + 1) % len(targets)
-            targets = targets[start:] + targets[:start]
-        for tgt in targets:
-            if self._stop.is_set():
-                return None
+        if not targets:
+            return None
+        start = self._foreign_cursor
+        # Modulo on store, not on read: the cursor must stay small for the
+        # same reason the backoff exponent does.
+        self._foreign_cursor = (start + 1) % len(targets)
+        due = []
+        for tgt in targets[start:] + targets[:start]:
             if tgt.skip_cycles > 0:
                 tgt.skip_cycles -= 1
-                continue
+            else:
+                due.append(tgt)
+        for tgt in due:
+            if self._stop.is_set():
+                return None
             try:
                 foreign_claim = await tgt.client.claim_next(
                     tgt.task_types, worker_id=self.worker_id,
