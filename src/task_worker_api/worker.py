@@ -71,6 +71,14 @@ _TASK_WORKDIR_RE = re.compile(r"task_\d+")
 #: short enough that a recovered box is picked back up within minutes.
 _FOREIGN_BACKOFF_MAX_CYCLES = 32
 
+#: Exponent ceiling for that backoff. ``min()`` already clamps the *result*,
+#: but not the exponentiation: ``failures`` keeps incrementing against a
+#: permanently dead box, so ``2 ** failures`` builds a wider throwaway integer
+#: every cycle for a worker left running for days. ``bit_length()`` is the
+#: first exponent whose power exceeds the ceiling, so clamping there keeps the
+#: arithmetic O(1) with no change to any skip value.
+_FOREIGN_BACKOFF_MAX_EXP = _FOREIGN_BACKOFF_MAX_CYCLES.bit_length()
+
 #: Bare fleet-default worker ids (``blender-worker-1``). Fine on a single
 #: box; ambiguous the moment two boxes' fleets poll the same target — the
 #: target's registry and ownership checks key on the worker_id string.
@@ -545,6 +553,8 @@ class Worker:
             else parse_synpusher_targets(os.environ.get("SYNPUSHER_TARGETS"))
         )
         self._foreign_targets: list[_Target] = []
+        #: Rotating start index into ``_foreign_targets`` (see ``_claim``).
+        self._foreign_cursor = 0
         home_norm = self.backend_url.rstrip("/")
         for spec in specs:
             spec_url = (spec.url or "").rstrip("/")
@@ -911,21 +921,42 @@ class Worker:
 
         Home gets first refusal every cycle — "help only when idle" falls out
         of the loop structure, since a worker only polls at all when it has no
-        task. Foreign targets are polled in listed order; one that fails to
-        connect is skipped for exponentially more cycles (capped) so a dead
-        target can't starve the ones after it or consume a retry burst every
-        cycle. Home failures keep driving the existing global idle-wait
-        escalation; foreign failures never touch it.
+        task. Foreign targets are then swept in round-robin order: the sweep
+        returns on the first successful claim, so a fixed order lets one
+        target with a standing backlog claim every cycle and the targets
+        after it are never polled at all — not merely deprioritised.
+        Advancing the start index one step per cycle gives every target first
+        pick every ``len(targets)`` cycles. One that fails to connect is
+        skipped for exponentially more cycles (capped) so a dead target can't
+        starve the ones after it or consume a retry burst every cycle. That
+        backoff is charged per poll cycle, before the sweep, rather than when
+        the sweep happens to reach the target: the sweep returns on the first
+        successful claim, so a target sitting behind a backlogged one is never
+        reached, and an in-sweep decrement would stall its counter — an
+        N-cycle backoff would take up to ``N * len(targets)`` cycles to
+        expire, scaling the ceiling with target count. Home failures keep
+        driving the existing global idle-wait escalation; foreign failures
+        never touch it.
         """
         claimed = await self._claim_home()
         if claimed is not None:
             return claimed, self._home_target
-        for tgt in self._foreign_targets:
-            if self._stop.is_set():
-                return None
+        targets = self._foreign_targets
+        if not targets:
+            return None
+        start = self._foreign_cursor
+        # Modulo on store, not on read: the cursor must stay small for the
+        # same reason the backoff exponent does.
+        self._foreign_cursor = (start + 1) % len(targets)
+        due = []
+        for tgt in targets[start:] + targets[:start]:
             if tgt.skip_cycles > 0:
                 tgt.skip_cycles -= 1
-                continue
+            else:
+                due.append(tgt)
+        for tgt in due:
+            if self._stop.is_set():
+                return None
             try:
                 foreign_claim = await tgt.client.claim_next(
                     tgt.task_types, worker_id=self.worker_id,
@@ -933,7 +964,8 @@ class Worker:
             except Exception as e:  # noqa: BLE001
                 tgt.failures += 1
                 tgt.skip_cycles = min(
-                    2 ** tgt.failures, _FOREIGN_BACKOFF_MAX_CYCLES,
+                    2 ** min(tgt.failures, _FOREIGN_BACKOFF_MAX_EXP),
+                    _FOREIGN_BACKOFF_MAX_CYCLES,
                 )
                 log.warning(
                     "foreign claim failed against %s (%d consecutive; "
