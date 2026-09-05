@@ -3570,3 +3570,78 @@ async def test_worker_mutations_send_claiming_worker_id(tmp_path):
 
     assert len(seen) == 6
     assert all(worker_id == "worker-7" for _, _, worker_id in seen)
+
+
+# -----------------------------------------------------------------------
+# HTTP deadline knob validation — timeout_s / file_timeout_s /
+# cancel_timeout_s / lifecycle_timeout_s go straight to httpx.Timeout, which
+# accepts any float. NaN yields an anyio deadline whose comparisons are all
+# False, so the request never times out (the unbounded hang
+# _per_request_timeout documents for None, through a different door); inf
+# disables the deadline outright; <= 0 puts it in the past so every request
+# fails instantly — cancel polls always fail (CancelGuard blind for the whole
+# task) and lifecycle writes always fail (terminal report lost, task orphaned
+# in_progress). Consumers build these from env, so a typo is a live path.
+# -----------------------------------------------------------------------
+
+_TIMEOUT_KNOBS = [
+    "timeout_s", "file_timeout_s", "cancel_timeout_s", "lifecycle_timeout_s",
+]
+
+
+@pytest.mark.parametrize("knob", _TIMEOUT_KNOBS)
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), float("-inf"), -1.0, 0],
+)
+def test_timeout_knob_validation_rejects_degenerate(knob, value):
+    """Every degenerate deadline is rejected at construction, naming the knob."""
+    with pytest.raises(ValueError, match=f"{knob} must be a finite number > 0"):
+        BackendClient("http://fake", "x", **{knob: value})
+
+
+def test_timeout_knob_validation_rejects_none_general_timeout():
+    """timeout_s is the client's own default — it has nothing to fall back to,
+    so None is not the documented opt-out it is for the other three; httpx
+    would read it as Timeout(None), i.e. no timeout on any facet."""
+    with pytest.raises(ValueError, match="timeout_s must be a finite number > 0"):
+        BackendClient("http://fake", "x", timeout_s=None)
+
+
+@pytest.mark.parametrize(
+    "knob", ["file_timeout_s", "cancel_timeout_s", "lifecycle_timeout_s"],
+)
+def test_timeout_knob_validation_keeps_none_opt_out(knob):
+    """None stays legal where it is documented: the per-request call inherits
+    the client's own timeout via the USE_CLIENT_DEFAULT sentinel."""
+    client = BackendClient("http://fake", "x", **{knob: None})
+    attr = {
+        "file_timeout_s": "_file_timeout",
+        "cancel_timeout_s": "_cancel_timeout",
+        "lifecycle_timeout_s": "_lifecycle_timeout",
+    }[knob]
+    assert getattr(client, attr) is httpx.USE_CLIENT_DEFAULT
+
+
+def test_timeout_knob_validation_leaves_defaults_unchanged():
+    """The guard rejects; it does not re-spell any default."""
+    client = BackendClient("http://fake", "x")
+    assert client._client.timeout.read == 30.0
+    assert client._file_timeout is httpx.USE_CLIENT_DEFAULT
+    assert client._cancel_timeout.read == 5.0
+    assert client._lifecycle_timeout.read == 15.0
+
+
+def test_timeout_knob_validation_runs_before_owning_a_client(monkeypatch):
+    """A late knob must not leak the AsyncClient an earlier one already built —
+    __init__ raises, so nobody is left to await close() on its pool."""
+    built = []
+    real = httpx.AsyncClient
+
+    def spy(*a, **kw):
+        built.append(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(httpx, "AsyncClient", spy)
+    with pytest.raises(ValueError, match="lifecycle_timeout_s"):
+        BackendClient("http://fake", "x", lifecycle_timeout_s=float("nan"))
+    assert built == []
