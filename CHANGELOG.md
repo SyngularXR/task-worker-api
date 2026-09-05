@@ -9,6 +9,14 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `Worker.__init__` now rejects duplicate foreign target URLs in
+  `SYNPUSHER_TARGETS`, raising `ProtocolError` naming the repeated URL. A
+  copy-pasted entry in a box's `.env.crossbox` built two `BackendClient`s
+  against one backend, doubling that box's claim traffic and connection count
+  every poll cycle and weighting it twice in the round-robin sweep. The home
+  box was already rejected; a repeat is now equally visible — the container
+  crash-loops instead of quietly double-polling. No wire or
+  `SYNPUSHER_TARGETS` format change.
 - Foreign target polling in `Worker._claim` is now round-robin instead of
   fixed listed order. The sweep returns on the first successful claim, so with
   two or more boxes in `SYNPUSHER_TARGETS` a target with a standing backlog

@@ -123,6 +123,31 @@ def test_worker_rejects_home_url_listed_as_foreign(make_worker):
         )
 
 
+def test_worker_rejects_duplicate_foreign_url(make_worker):
+    # A copy-pasted .env.crossbox entry would otherwise build two clients
+    # against one backend: double the claim traffic, double the round-robin
+    # weight.
+    with pytest.raises(ProtocolError, match="repeats target URL"):
+        make_worker(
+            handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+            backend_url="http://home:5000/api/v1",
+            foreign_targets=[
+                ForeignTarget(
+                    url="http://far:5000/api/v1",
+                    api_key="k",
+                    task_types=[TaskType.MODEL_INITIALIZING],
+                    client=FakeBackendClient(),
+                ),
+                ForeignTarget(
+                    url="http://far:5000/api/v1/",  # trailing slash only
+                    api_key="k",
+                    task_types=[TaskType.MODEL_INITIALIZING],
+                    client=FakeBackendClient(),
+                ),
+            ],
+        )
+
+
 def test_worker_rejects_target_with_no_handled_types(make_worker):
     with pytest.raises(ProtocolError, match="no task type this"):
         make_worker(

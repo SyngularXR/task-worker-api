@@ -556,7 +556,8 @@ class Worker:
         #: Rotating start index into ``_foreign_targets`` (see ``_claim``).
         self._foreign_cursor = 0
         home_norm = self.backend_url.rstrip("/")
-        for spec in specs:
+        seen_urls: set[str] = set()
+        for idx, spec in enumerate(specs):
             spec_url = (spec.url or "").rstrip("/")
             if spec_url and spec_url == home_norm:
                 raise ProtocolError(
@@ -564,6 +565,15 @@ class Worker:
                     "foreign targets are additive — remove the home URL from "
                     "the list."
                 )
+            if spec_url and spec_url in seen_urls:
+                raise ProtocolError(
+                    f"SYNPUSHER_TARGETS entry {idx} repeats target URL "
+                    f"{spec.url!r}. Each foreign target must be a distinct "
+                    "backend — a repeat doubles that box's claim traffic and "
+                    "weights it twice in the round-robin; remove the "
+                    "duplicate."
+                )
+            seen_urls.add(spec_url)
             usable = [t for t in spec.task_types if t in self.handlers]
             dropped = [t.value for t in spec.task_types if t not in self.handlers]
             if dropped:
