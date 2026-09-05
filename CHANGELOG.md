@@ -9,6 +9,15 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `Worker.run_forever` now runs its fatal startup check inside the guarded
+  region. The box-affinity verification ran after the periodic payload-log
+  cleanup task was created but before the `try`, so a mismatch — the
+  carefully-worded diagnostic for a typo'd `SYNPUSHER_URL` that would
+  otherwise route trusted shared-volume paths at a foreign box — escaped with
+  that task still pending, the home and every foreign client unclosed, and the
+  payload logger never closed. The operator saw "Task was destroyed but it is
+  pending" plus unclosed-socket warnings stacked on the one message that
+  mattered. The existing `finally` now does the teardown it was written for.
 - `Worker.__init__` now rejects duplicate foreign target URLs in
   `SYNPUSHER_TARGETS`, raising `ProtocolError` naming the repeated URL. A
   copy-pasted entry in a box's `.env.crossbox` built two `BackendClient`s

@@ -782,15 +782,18 @@ class Worker:
             self._periodic_cleanup_loop(cleanup_interval_s)
         )
 
-        if self._foreign_targets:
-            log.info(
-                "cross-box mode: %d foreign target(s): %s",
-                len(self._foreign_targets),
-                ", ".join(t.label for t in self._foreign_targets),
-            )
-            await self._verify_home_affinity()
-
+        # Startup checks belong inside the try: a fatal one (box affinity)
+        # must still run the finally, or its ProtocolError surfaces buried in
+        # "Task was destroyed but it is pending" and unclosed-socket noise.
         try:
+            if self._foreign_targets:
+                log.info(
+                    "cross-box mode: %d foreign target(s): %s",
+                    len(self._foreign_targets),
+                    ", ".join(t.label for t in self._foreign_targets),
+                )
+                await self._verify_home_affinity()
+
             while not self._stop.is_set():
                 claimed = await self._claim()
                 if claimed is None:
