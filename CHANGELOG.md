@@ -10,20 +10,18 @@
 
 **Fixes:**
 - `FakeBackendClient.complete` now runs the same encodability check as the
-  real `BackendClient.complete` and raises when a result could not be sent,
-  naming the offending path (`result['output_files'][0]['path']`). The real
-  call raises while httpx *builds* the request — nothing is transmitted —
-  which is why `Worker` pre-checks and converts it into a `fail()` report
-  rather than orphaning the task in_progress until the sweeper recomputes
-  hours of GPU work. The fake accepted any dict, so every consumer repo's
-  handler unit tests passed on results production rejects: a stray numpy
-  scalar, `Path` or `datetime` only surfaced on the box. The fake now mirrors
-  the class the encoder raised (`TypeError`, or `ValueError` for a cycle) with
-  the path named, because json reports the offending type but not where it
-  sits; where a message alone cannot rebuild that class — an unpaired
-  surrogate raises `UnicodeEncodeError`, whose constructor takes five
-  arguments — its nearest base that can is raised instead (`UnicodeError`,
-  still a `ValueError`), with the original kept as `__cause__`. Test suites
+  real `BackendClient.complete` and re-raises the encoder's own exception when
+  a result could not be sent. The real call raises while httpx *builds* the
+  request — nothing is transmitted — which is why `Worker` pre-checks and
+  converts it into a `fail()` report rather than orphaning the task
+  in_progress until the sweeper recomputes hours of GPU work. The fake
+  accepted any dict, so every consumer repo's handler unit tests passed on
+  results production rejects: a stray numpy scalar, `Path` or `datetime` only
+  surfaced on the box. The exception is passed through untouched — same class,
+  message and traceback as production (`TypeError` for a `Path`, `ValueError`
+  for a cycle, `UnicodeEncodeError` for an unpaired surrogate) — rather than
+  rebuilt, which cannot drift from the real client and cannot fail on a value
+  that is itself hostile to being formatted. Test suites
   that were passing unencodable results will now fail — that is the signal;
   fix the handler to return JSON types (`str(path)`, `dt.isoformat()`,
   `float(np_value)`). Confined to test code: no runtime or wire behaviour

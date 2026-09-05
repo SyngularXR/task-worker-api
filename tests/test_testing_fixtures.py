@@ -95,68 +95,77 @@ async def test_complete_rejects_result_the_real_client_could_not_encode():
 
     Otherwise a handler unit test passes on a result production rejects
     while httpx builds the request — the mismatch #56 had to paper over in
-    the worker. The offending path is named because json reports only the
-    type, and a real result is nested.
+    the worker.
     """
     fake = FakeBackendClient()
-    with pytest.raises(TypeError) as excinfo:
+    with pytest.raises(TypeError, match="PosixPath"):
         await fake.complete(42, {"output_files": [{"path": Path("/tmp/a.ply")}]})
-    assert "result['output_files'][0]['path']" in str(excinfo.value)
     assert fake.completed_tasks == []
 
 
 @_needs_rejection(float("nan"), "NaN")
 @pytest.mark.asyncio
-async def test_complete_rejects_nan_metric_naming_its_path():
+async def test_complete_rejects_nan_metric():
     """On httpx 0.28 — which encodes with ``allow_nan=False`` — a NaN metric
-    is a ``ValueError``, not a ``TypeError``, and the fake mirrors the class.
+    is a ``ValueError``, not a ``TypeError``, and the fake raises what the
+    encoder raised.
 
     Skipped on the older httpx the declared ``>=0.23`` range still allows,
     where ``json.dumps`` writes a bare ``NaN`` literal and the real client
     would put it on the wire too.
     """
     fake = FakeBackendClient()
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(ValueError):
         await fake.complete(7, {"metrics": {"psnr": float("nan")}})
-    assert "result['metrics']['psnr']" in str(excinfo.value)
     assert fake.completed_tasks == []
 
 
 @pytest.mark.asyncio
-async def test_complete_reports_the_container_when_no_child_is_at_fault():
-    """A non-string dict key fails at the dict itself, not at any child."""
+async def test_complete_raises_the_encoders_own_exception():
+    """The encoder's exception is re-raised as-is, never rebuilt.
+
+    A key whose ``__repr__`` raises is encodable-check-failing *and* hostile
+    to any message that formats it: rendering the offending value used to
+    replace httpx's ``TypeError`` ("keys must be str, int, ...") with the
+    key's own unrelated error. Whatever the installed httpx raises for a
+    result is exactly what the fake raises for it.
+    """
+    class HostileKey:
+        def __repr__(self):
+            raise RuntimeError("no repr for you")
+
+    result = {"outer": {HostileKey(): Path("/tmp/a.ply")}}
+    expected = _result_encode_exc(result)
+    assert isinstance(expected, TypeError)
+
     fake = FakeBackendClient()
-    with pytest.raises(TypeError) as excinfo:
-        await fake.complete(7, {"planes": {(1, 2): "corner"}})
-    assert "at result['planes'] " in str(excinfo.value)
+    with pytest.raises(type(expected)) as excinfo:
+        await fake.complete(7, result)
+    assert str(excinfo.value) == str(expected)
+    assert fake.completed_tasks == []
 
 
 @_needs_rejection("\ud800", "unpaired surrogates")
 @pytest.mark.asyncio
-async def test_complete_rejects_unpaired_surrogate_naming_its_path():
+async def test_complete_rejects_unpaired_surrogate():
     """An unpaired surrogate fails in ``.encode("utf-8")``, not in ``json``.
 
     httpx 0.28 encodes with ``ensure_ascii=False``, so the surrogate reaches
     the utf-8 step instead of being escaped — skipped on the older httpx the
     declared ``>=0.23`` range still allows, which escapes it and sends it.
-    ``UnicodeEncodeError``'s constructor demands five arguments, so rebuilding
-    the class from the message alone raised a bare ``TypeError`` ("function
-    takes exactly 5 arguments") that named neither the offending path nor the
-    real cause. The nearest base a message does construct is used instead —
-    still a ``ValueError``, as any ``UnicodeError`` is.
+    The ``UnicodeEncodeError`` httpx raised arrives intact; rebuilding its
+    class from a message alone is impossible (the constructor takes five
+    arguments), which is why nothing is rebuilt.
     """
     fake = FakeBackendClient()
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(UnicodeEncodeError):
         await fake.complete(7, {"logs": {"stderr": "bad byte \ud800 here"}})
-    assert "result['logs']['stderr']" in str(excinfo.value)
-    assert "takes exactly 5 arguments" not in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, UnicodeEncodeError)
     assert fake.completed_tasks == []
 
 
 @pytest.mark.asyncio
 async def test_complete_rejects_self_referential_result_without_hanging():
-    """The path walk must not chase a cycle — every child of one fails."""
+    """A cycle is a ``ValueError`` from the encoder, and nothing walks it."""
     fake = FakeBackendClient()
     result: dict = {"planes": []}
     result["planes"].append(result)

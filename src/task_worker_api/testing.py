@@ -18,61 +18,6 @@ if TYPE_CHECKING:  # pragma: no cover
     import asyncio
 
 
-def _unencodable_path(result: object) -> str:
-    """Path of the innermost part of ``result`` that fails the encode check.
-
-    ``json`` names the offending *type* ("Object of type PosixPath is not
-    JSON serializable") but not where it sits, which in a nested handler
-    result — ``output_files``, per-frame metric dicts — is the only part the
-    author needs. Walk down while some child still fails the same check; the
-    last container that fails but has no failing child owns the problem (a
-    non-string dict key, say, fails at the dict itself).
-
-    ``seen`` guards a self-referential result: every child of a cycle fails
-    forever, so stop rather than descend into it.
-    """
-    path, value, seen = "result", result, {id(result)}
-    while True:
-        if isinstance(value, dict):
-            children, fmt = value.items(), "{}[{!r}]"
-        elif isinstance(value, (list, tuple)):
-            children, fmt = enumerate(value), "{}[{}]"
-        else:
-            return path
-        for key, child in children:
-            if id(child) in seen or _result_encode_exc(child) is None:
-                continue
-            path, value = fmt.format(path, key), child
-            seen.add(id(child))
-            break
-        else:
-            return path
-
-
-def _rejection(message: str, exc: BaseException) -> Exception:
-    """``exc``'s class rebuilt around ``message`` — or its nearest base that
-    a lone message constructs.
-
-    ``type(exc)(message)`` on its own is not safe. On httpx 0.28, which
-    encodes with ``ensure_ascii=False``, a result holding an unpaired
-    surrogate reaches ``.encode("utf-8")`` and raises
-    ``UnicodeEncodeError``, whose constructor demands five arguments, so
-    rebuilding it raised a bare ``TypeError`` ("function takes exactly 5
-    arguments") — losing the class, the path this message carries, and even
-    the ``raise ... from`` chaining, since the constructor blew up before
-    the ``raise``. Walking the MRO keeps the closest class that survives a
-    one-argument call (``UnicodeError``, still a ``ValueError``, for that
-    case); ``Exception`` is in every MRO and always does.
-    """
-    for cls in type(exc).__mro__:
-        if issubclass(cls, Exception):
-            try:
-                return cls(message)
-            except Exception:  # noqa: BLE001 — exotic constructor signature
-                continue
-    return Exception(message)  # pragma: no cover — Exception ends every MRO
-
-
 class FakeBackendClient:
     """Drop-in for ``BackendClient``. Keeps claim/complete/fail/progress
     payloads in memory; workers interact with it the same way they'd talk
@@ -199,11 +144,9 @@ class FakeBackendClient:
         never reaches the wire; ``Worker`` pre-checks with the same call and
         turns it into a ``fail()`` report rather than orphaning the task
         in_progress. A fake that accepted any dict let handler unit tests pass
-        on results production refuses, so it raises here instead — the class
-        the encoder raised (``TypeError``, or ``ValueError`` for a cycle)
-        where a message alone rebuilds it, else its nearest base that does
-        (see :func:`_rejection`) — with the offending path named and the
-        original kept as ``__cause__``.
+        on results production refuses, so the encoder's own exception is
+        re-raised here instead — the same class, message and traceback the
+        real client would surface, with no reconstruction to drift from it.
 
         What counts as unencodable is whatever the installed httpx says, not a
         fixed list: the declared ``httpx>=0.23`` spans the 0.28 tightening to
@@ -214,14 +157,7 @@ class FakeBackendClient:
         """
         exc = _result_encode_exc(result)
         if exc is not None:
-            raise _rejection(
-                f"task {task_id}: result is not JSON-serializable at "
-                f"{_unencodable_path(result)} — {exc}. "
-                "BackendClient.complete raises the same way while httpx builds "
-                "the request, so this result could never be sent; Worker would "
-                "report the task failed instead.",
-                exc,
-            ) from exc
+            raise exc
         self.completed_tasks.append({"task_id": task_id, "result": result})
 
     async def fail(self, task_id: int, error: str) -> None:

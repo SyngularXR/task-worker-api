@@ -482,10 +482,10 @@ real backend. Run it in normal `pytest`, no docker-compose needed.
 
 `complete` runs the same encodability check the real `BackendClient` does
 (httpx builds the request, which encodes the body and sends nothing), so a
-result carrying a `Path`, `datetime` or numpy scalar raises here — naming
-the path, e.g. `result['output_files'][0]['path']` — instead of passing a
-test and failing in production. Return plain JSON types from handlers:
-`str(path)`, `dt.isoformat()`, `float(np_value)`.
+result carrying a `Path`, `datetime` or numpy scalar raises here — the
+encoder's own exception, exactly as the real client surfaces it — instead of
+passing a test and failing in production. Return plain JSON types from
+handlers: `str(path)`, `dt.isoformat()`, `float(np_value)`.
 
 The check asks *your installed* httpx rather than restating its rules, so
 what counts as unencodable follows the version you pin. `httpx>=0.23` is a
