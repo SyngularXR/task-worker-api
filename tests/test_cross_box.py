@@ -612,7 +612,18 @@ async def test_upload_outputs_mode_rules(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-class _BoxIdFake(FakeBackendClient):
+class _ClosingFake(FakeBackendClient):
+    """Fake that records whether the worker closed it."""
+
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _BoxIdFake(_ClosingFake):
     def __init__(self, box_id):
         super().__init__()
         self._box_id = box_id
@@ -660,3 +671,29 @@ async def test_affinity_missing_sentinel_warns_only(make_worker, tmp_path, caplo
     with caplog.at_level(logging.WARNING):
         await worker._verify_home_affinity()
     assert any("no readable" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_run_forever_fatal_affinity_still_tears_down(make_worker, tmp_path):
+    """A fatal startup check must not skip the finally: the ProtocolError
+    surfaces alone, without a pending cleanup task, unclosed clients, or an
+    open payload logger."""
+    (tmp_path / ".box-id").write_text("box-A")
+    home = _BoxIdFake("box-B")
+    foreign = _ClosingFake()
+    worker = make_worker(
+        client=home,
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        shared_volume_path=str(tmp_path),
+        foreign_targets=[_foreign(foreign)],
+    )
+    logger_closed = []
+    worker._payload_logger.close = lambda: logger_closed.append(True)
+    before = asyncio.all_tasks()
+
+    with pytest.raises(ProtocolError, match="box-affinity check failed"):
+        await worker.run_forever()
+
+    assert asyncio.all_tasks() - before == set()   # cleanup task not left pending
+    assert home.closed and foreign.closed
+    assert logger_closed
