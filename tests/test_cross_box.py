@@ -10,6 +10,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+import httpx
 import pytest
 
 from task_worker_api import (
@@ -29,6 +30,7 @@ from task_worker_api.files import (
     upload_outputs,
 )
 from task_worker_api.testing import FakeBackendClient
+from task_worker_api.worker import _canonical_url
 
 
 def _mi_task(params: dict, task_id: int = 1) -> ClaimedTask:
@@ -118,29 +120,57 @@ def _target(url: str) -> ForeignTarget:
     )
 
 
-# Spellings httpx canonicalises to one backend: it lowercases scheme and host
-# and drops the scheme's default port, so each of these opens connections to
-# the same place as the plain ``http://<host>:5000/api/v1``.
-_SAME_BACKEND = pytest.mark.parametrize("spelling", [
-    "http://{h}:5000/api/v1/",       # trailing slash
-    "HTTP://{h}:5000/api/v1",        # upper-case scheme
-    "http://{H}:5000/api/v1",        # upper-case host
-    "HTTP://{H}:5000/api/v1/",       # all three at once
+# Pairs httpx resolves to one backend: it lower-cases scheme and host,
+# IDNA-encodes the host, drops the scheme's default port, resolves ``.``/``..``
+# segments, and never sends the fragment. Every pair below therefore opens
+# connections to a single place, so both identity guards must reject it.
+# ``test_canonical_url_matches_httpx`` pins these against httpx itself.
+_EQUIVALENT = pytest.mark.parametrize("canonical,equivalent", [
+    ("http://far:5000/api/v1", "http://far:5000/api/v1/"),        # trailing slash
+    ("http://far:5000/api/v1", "HTTP://far:5000/api/v1"),         # upper scheme
+    ("http://far:5000/api/v1", "http://FAR:5000/api/v1"),         # upper host
+    ("http://far:5000/api/v1", "HTTP://FAR:5000/api/v1/"),        # all at once
+    ("http://far/api/v1", "http://far:80/api/v1"),                # default port
+    ("https://far:443/api/v1", "HTTPS://Far/api/v1/"),            # ditto, https
+    ("http://far:5000/api/v1", "http://far:5000/a/../api/v1"),    # dot segments
+    ("http://far:5000/api/v1", "http://far:5000/api/./v1"),       # single dot
+    ("http://far:5000/api/v1", "http://far:5000/api/v1#frag"),    # fragment
+    ("http://fär:5000/api/v1", "http://FÄR:5000/api/v1"),         # unicode host
+    ("http://fär:5000/api/v1", "http://xn--fr-via:5000/api/v1"),  # unicode/IDNA
 ])
 
 
-@_SAME_BACKEND
-def test_worker_rejects_home_url_listed_as_foreign(make_worker, spelling):
+@_EQUIVALENT
+def test_canonical_url_matches_httpx(canonical, equivalent):
+    # The guards are only as good as their agreement with the library that
+    # does the connecting, so compare against httpx's own resolution of each
+    # pair rather than against a hand-written expected string. The one place
+    # we are deliberately more lenient than httpx is the trailing slash — a
+    # backend root spelled with or without it is the same box to an operator —
+    # so strip that from the path before comparing.
+    assert _canonical_url(canonical) == _canonical_url(equivalent)
+    left, right = httpx.URL(canonical), httpx.URL(equivalent)
+    assert (left.scheme, left.raw_host, left.raw_path.rstrip(b"/")) == (
+        right.scheme, right.raw_host, right.raw_path.rstrip(b"/"),
+    )
+
+
+@_EQUIVALENT
+def test_worker_rejects_home_url_listed_as_foreign(
+    make_worker, canonical, equivalent,
+):
     with pytest.raises(ProtocolError, match="home box"):
         make_worker(
             handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
-            backend_url="http://home:5000/api/v1",
-            foreign_targets=[_target(spelling.format(h="home", H="HOME"))],
+            backend_url=canonical,
+            foreign_targets=[_target(equivalent)],
         )
 
 
-@_SAME_BACKEND
-def test_worker_rejects_duplicate_foreign_url(make_worker, spelling):
+@_EQUIVALENT
+def test_worker_rejects_duplicate_foreign_url(
+    make_worker, canonical, equivalent,
+):
     # A copy-pasted .env.crossbox entry would otherwise build two clients
     # against one backend: double the claim traffic, double the round-robin
     # weight.
@@ -148,43 +178,30 @@ def test_worker_rejects_duplicate_foreign_url(make_worker, spelling):
         make_worker(
             handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
             backend_url="http://home:5000/api/v1",
-            foreign_targets=[
-                _target("http://far:5000/api/v1"),
-                _target(spelling.format(h="far", H="FAR")),
-            ],
-        )
-
-
-@pytest.mark.parametrize("home,foreign", [
-    # Default port implied vs. spelled out — one backend, both guards fire.
-    ("http://home/api/v1", "http://home:80/api/v1"),
-    ("https://home:443/api/v1", "HTTPS://Home/api/v1/"),
-])
-def test_worker_rejects_home_url_with_default_port_spelled_out(
-    make_worker, home, foreign,
-):
-    with pytest.raises(ProtocolError, match="home box"):
-        make_worker(
-            handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
-            backend_url=home,
-            foreign_targets=[_target(foreign)],
+            foreign_targets=[_target(canonical), _target(equivalent)],
         )
 
 
 def test_worker_accepts_distinct_backends_on_one_host(make_worker):
-    # Canonicalisation must not over-merge: same host, different port or
-    # scheme is a different backend and stays legal.
+    # Canonicalisation must not over-merge: a different port, scheme, path or
+    # IDNA host is a different backend and stays legal. The last two encode to
+    # xn--fr-via and xn--fr-xka — near-identical spellings, distinct hosts.
+    distinct = [
+        "http://far:5000/api/v1",
+        "http://far:5001/api/v1",
+        "https://far:5000/api/v1",
+        "http://far:5000/api/v2",
+        "http://far:5000/api/v1/sub",
+        "http://fär:5000/api/v1",
+        "http://für:5000/api/v1",
+    ]
     worker = make_worker(
         handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
         backend_url="http://home:5000/api/v1",
-        foreign_targets=[
-            _target("http://far:5000/api/v1"),
-            _target("http://far:5001/api/v1"),
-            _target("https://far:5000/api/v1"),
-            _target("http://far:5000/api/v2"),
-        ],
+        foreign_targets=[_target(u) for u in distinct],
     )
-    assert len(worker._foreign_targets) == 4
+    assert len(worker._foreign_targets) == len(distinct)
+    assert len({_canonical_url(u) for u in distinct}) == len(distinct)
 
 
 def test_worker_rejects_target_with_no_handled_types(make_worker):

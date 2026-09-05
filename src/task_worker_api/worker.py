@@ -153,28 +153,48 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 def _canonical_url(url: str) -> str:
     """Return *url* in the form two spellings of one backend share.
 
-    httpx lowercases scheme and host and treats the scheme's default port as
-    absent, so ``HTTP://FAR:80/api/v1/`` and ``http://far/api/v1`` open
-    connections to a single backend. Comparing raw (merely trailing-slash
-    stripped) strings would wave that pair past the home-box and duplicate
-    guards below and reinstate the double-polling they exist to stop. Input
-    that isn't a parseable absolute URL is returned trailing-slash stripped,
-    keeping the comparison exactly as strict as it was before.
+    "Same backend" has to mean "httpx dials the same address and sends the
+    same request target", so the canonical form is *derived from* ``httpx.URL``
+    rather than re-derived alongside it. httpx lower-cases the scheme,
+    lower-cases and IDNA-encodes the host, resolves ``.``/``..`` path segments,
+    and never puts the fragment on the wire — so ``http://far/a/../api/v1``,
+    ``http://far/api/v1#frag`` and ``http://FÄR``-style spellings all reach the
+    one place a plain ``http://far/api/v1`` does. Restating those rules by hand
+    is what previously let exactly those pairs past the home-box and duplicate
+    guards below, reinstating the double-polling they exist to stop.
+
+    Input httpx cannot parse, or that names no scheme and host, is returned
+    trailing-slash stripped, keeping the comparison exactly as strict as it was
+    before rather than collapsing unrelated junk together.
+
+    Verified identical across the supported ``httpx>=0.23`` range: 0.23.3 (what
+    the SynPusher backend pins) and 0.28 agree on every rule used here, despite
+    the URL-parser rewrite in 0.24. They differ only in how they *reject* a bad
+    port — 0.28 raises ``InvalidURL``, 0.23 yields an empty host — and both of
+    those land on the verbatim fallback below.
     """
     trimmed = url.rstrip("/")
     try:
-        parts = urllib.parse.urlsplit(trimmed)
-        host, port = parts.hostname, parts.port
-    except ValueError:  # unparseable port or IPv6 literal — compare verbatim
+        parsed = httpx.URL(trimmed)
+        scheme, port = parsed.scheme, parsed.port
+        # Both are ASCII once httpx has accepted the URL: the host is
+        # IDNA-encoded and the path percent-encoded. raw_path is the wire
+        # request target — dot segments resolved, query kept, fragment dropped.
+        host = parsed.raw_host.decode("ascii")
+        path = parsed.raw_path.decode("ascii")
+    except httpx.InvalidURL:  # bad port, un-encodable host — compare verbatim
         return trimmed
-    if not parts.scheme or not host:
+    if not scheme or not host:
         return trimmed
-    netloc = f"[{host}]" if ":" in host else host  # urlsplit strips IPv6 [ ]
-    if port is not None and port != _DEFAULT_PORTS.get(parts.scheme.lower()):
+    # 0.28 leaves an explicitly spelled default port on the URL when the scheme
+    # was upper-cased, but connects to the same address either way.
+    if port == _DEFAULT_PORTS.get(scheme):
+        port = None
+    netloc = f"[{host}]" if ":" in host else host  # httpx strips IPv6 [ ]
+    if port is not None:
         netloc = f"{netloc}:{port}"
-    return urllib.parse.urlunsplit(
-        (parts.scheme.lower(), netloc, parts.path, parts.query, parts.fragment)
-    )
+    # Strip again: resolving dot segments can reintroduce a trailing slash.
+    return f"{scheme}://{netloc}{path}".rstrip("/")
 
 
 @dataclass
