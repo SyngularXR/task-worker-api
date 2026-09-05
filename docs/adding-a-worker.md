@@ -482,10 +482,18 @@ real backend. Run it in normal `pytest`, no docker-compose needed.
 
 `complete` runs the same encodability check the real `BackendClient` does
 (httpx builds the request, which encodes the body and sends nothing), so a
-result carrying a `Path`, `datetime`, numpy scalar or NaN raises here —
-naming the path, e.g. `result['output_files'][0]['path']` — instead of
-passing a test and failing in production. Return plain JSON types from
-handlers: `str(path)`, `dt.isoformat()`, `float(np_value)`.
+result carrying a `Path`, `datetime` or numpy scalar raises here — naming
+the path, e.g. `result['output_files'][0]['path']` — instead of passing a
+test and failing in production. Return plain JSON types from handlers:
+`str(path)`, `dt.isoformat()`, `float(np_value)`.
+
+The check asks *your installed* httpx rather than restating its rules, so
+what counts as unencodable follows the version you pin. `httpx>=0.23` is a
+wide range and the boundary moved inside it: 0.28 encodes with
+`allow_nan=False, ensure_ascii=False`, so a NaN metric or an unpaired
+surrogate raises there, while 0.23 (which SynPusher still pins) writes a
+bare `NaN` literal and a `\ud800` escape and sends them. Pin httpx 0.28+ in
+a worker's dev extra if you want those caught in tests.
 
 ### Remote-mode (file transfer) tests
 

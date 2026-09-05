@@ -17,17 +17,26 @@
   rather than orphaning the task in_progress until the sweeper recomputes
   hours of GPU work. The fake accepted any dict, so every consumer repo's
   handler unit tests passed on results production rejects: a stray numpy
-  scalar, `Path`, `datetime` or NaN metric only surfaced on the box. The
-  fake now mirrors the class the encoder raised (`TypeError`, or `ValueError`
-  for NaN and cycles) with the path named, because json reports the offending
-  type but not where it sits; where a message alone cannot rebuild that class
-  — an unpaired surrogate raises `UnicodeEncodeError`, whose constructor takes
-  five arguments — its nearest base that can is raised instead (`UnicodeError`,
+  scalar, `Path` or `datetime` only surfaced on the box. The fake now mirrors
+  the class the encoder raised (`TypeError`, or `ValueError` for a cycle) with
+  the path named, because json reports the offending type but not where it
+  sits; where a message alone cannot rebuild that class — an unpaired
+  surrogate raises `UnicodeEncodeError`, whose constructor takes five
+  arguments — its nearest base that can is raised instead (`UnicodeError`,
   still a `ValueError`), with the original kept as `__cause__`. Test suites
   that were passing unencodable results will now fail — that is the signal;
   fix the handler to return JSON types (`str(path)`, `dt.isoformat()`,
   `float(np_value)`). Confined to test code: no runtime or wire behaviour
   changes.
+
+  The check asks the installed httpx instead of restating its rules, so the
+  set it rejects tracks your pin, and the declared `httpx>=0.23` straddles a
+  real boundary: 0.28 encodes with `allow_nan=False, ensure_ascii=False`, so a
+  NaN metric and an unpaired surrogate raise there, while 0.23 — which
+  SynPusher still pins — emits a bare `NaN` literal and a `\ud800` escape and
+  sends both. The SDK's own tests for those two cases skip when the installed
+  httpx encodes them, since matching the real client is the contract; pin
+  httpx 0.28+ to have them caught.
 - `Worker.run_forever` now runs its fatal startup check inside the guarded
   region. The box-affinity verification ran after the periodic payload-log
   cleanup task was created but before the `try`, so a mismatch — the

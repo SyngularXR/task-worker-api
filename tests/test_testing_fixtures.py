@@ -9,10 +9,29 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from task_worker_api.enums import TaskStatus, TaskType
 from task_worker_api.testing import FakeBackendClient
+from task_worker_api.worker import _result_encode_exc
+
+
+def _needs_rejection(value: object, what: str):
+    """Skip unless the *installed* httpx refuses to encode ``value``.
+
+    ``httpx>=0.23`` is deliberately loose — SynPusher still pins 0.23.3 — and
+    what counts as unencodable moved inside that range: 0.28 tightened
+    ``encode_json`` to ``allow_nan=False, ensure_ascii=False``, so NaN and
+    unpaired surrogates raise there and encode silently on 0.23 (as ``NaN``
+    and as a ``\\ud800`` escape). The fake mirrors whichever client is
+    installed, so probe that — pinning a version boundary here would just be
+    a second copy of httpx's history to keep in sync.
+    """
+    return pytest.mark.skipif(
+        _result_encode_exc(value) is None,
+        reason=f"httpx {httpx.__version__} encodes {what} rather than rejecting it",
+    )
 
 
 @pytest.mark.asyncio
@@ -86,10 +105,16 @@ async def test_complete_rejects_result_the_real_client_could_not_encode():
     assert fake.completed_tasks == []
 
 
+@_needs_rejection(float("nan"), "NaN")
 @pytest.mark.asyncio
 async def test_complete_rejects_nan_metric_naming_its_path():
-    """httpx 0.28 encodes with ``allow_nan=False`` — a NaN metric is a
-    ``ValueError``, not a ``TypeError``, and the fake mirrors the class."""
+    """On httpx 0.28 — which encodes with ``allow_nan=False`` — a NaN metric
+    is a ``ValueError``, not a ``TypeError``, and the fake mirrors the class.
+
+    Skipped on the older httpx the declared ``>=0.23`` range still allows,
+    where ``json.dumps`` writes a bare ``NaN`` literal and the real client
+    would put it on the wire too.
+    """
     fake = FakeBackendClient()
     with pytest.raises(ValueError) as excinfo:
         await fake.complete(7, {"metrics": {"psnr": float("nan")}})
@@ -106,12 +131,15 @@ async def test_complete_reports_the_container_when_no_child_is_at_fault():
     assert "at result['planes'] " in str(excinfo.value)
 
 
+@_needs_rejection("\ud800", "unpaired surrogates")
 @pytest.mark.asyncio
 async def test_complete_rejects_unpaired_surrogate_naming_its_path():
     """An unpaired surrogate fails in ``.encode("utf-8")``, not in ``json``.
 
-    httpx encodes with ``ensure_ascii=False``, so the surrogate reaches the
-    utf-8 step instead of being escaped. ``UnicodeEncodeError``'s constructor demands five arguments, so rebuilding
+    httpx 0.28 encodes with ``ensure_ascii=False``, so the surrogate reaches
+    the utf-8 step instead of being escaped — skipped on the older httpx the
+    declared ``>=0.23`` range still allows, which escapes it and sends it.
+    ``UnicodeEncodeError``'s constructor demands five arguments, so rebuilding
     the class from the message alone raised a bare ``TypeError`` ("function
     takes exactly 5 arguments") that named neither the offending path nor the
     real cause. The nearest base a message does construct is used instead —

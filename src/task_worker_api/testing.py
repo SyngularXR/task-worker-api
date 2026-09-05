@@ -53,8 +53,9 @@ def _rejection(message: str, exc: BaseException) -> Exception:
     """``exc``'s class rebuilt around ``message`` — or its nearest base that
     a lone message constructs.
 
-    ``type(exc)(message)`` on its own is not safe. A result holding an
-    unpaired surrogate reaches httpx's ``.encode("utf-8")`` and raises
+    ``type(exc)(message)`` on its own is not safe. On httpx 0.28, which
+    encodes with ``ensure_ascii=False``, a result holding an unpaired
+    surrogate reaches ``.encode("utf-8")`` and raises
     ``UnicodeEncodeError``, whose constructor demands five arguments, so
     rebuilding it raised a bare ``TypeError`` ("function takes exactly 5
     arguments") — losing the class, the path this message carries, and even
@@ -199,10 +200,17 @@ class FakeBackendClient:
         turns it into a ``fail()`` report rather than orphaning the task
         in_progress. A fake that accepted any dict let handler unit tests pass
         on results production refuses, so it raises here instead — the class
-        the encoder raised (``TypeError``, or ``ValueError`` for NaN and
-        cycles) where a message alone rebuilds it, else its nearest base that
-        does (see :func:`_rejection`) — with the offending path named and the
+        the encoder raised (``TypeError``, or ``ValueError`` for a cycle)
+        where a message alone rebuilds it, else its nearest base that does
+        (see :func:`_rejection`) — with the offending path named and the
         original kept as ``__cause__``.
+
+        What counts as unencodable is whatever the installed httpx says, not a
+        fixed list: the declared ``httpx>=0.23`` spans the 0.28 tightening to
+        ``allow_nan=False, ensure_ascii=False``, so NaN and unpaired
+        surrogates raise on 0.28 and encode fine on 0.23. Mirroring the real
+        client matters more than rejecting a fixed set — a check stricter than
+        the installed encoder would fail a result the backend would accept.
         """
         exc = _result_encode_exc(result)
         if exc is not None:
