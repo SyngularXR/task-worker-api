@@ -388,8 +388,8 @@ def _sweep_orphaned_workdirs(
             log.warning("workdir cleanup: could not remove %s: %s", task_dir, e)
 
 
-def _result_encode_error(result: object) -> Optional[str]:
-    """The error ``complete()`` would raise encoding ``result``, or ``None``.
+def _result_encode_exc(result: object) -> Optional[BaseException]:
+    """The exception ``complete()`` would raise encoding ``result``, or ``None``.
 
     Asks httpx itself — building a request encodes the body, and building one
     transmits nothing — rather than re-implementing its JSON encoding. The
@@ -397,14 +397,23 @@ def _result_encode_error(result: object) -> Optional[str]:
     supports (0.28 passes ``allow_nan=False``, so a NaN metric that older
     httpx would have put on the wire is now rejected), and a check stricter
     than the real encoder would fail a task the backend would have accepted.
+
+    ``FakeBackendClient.complete`` runs the same check, so a handler unit test
+    cannot pass a result the real client would refuse to send.
     """
     try:
         httpx.Request(
             "PUT", "http://encode-check.invalid/", json={"result": result},
         )
     except Exception as exc:  # noqa: BLE001
-        return f"{type(exc).__name__}: {exc}"
+        return exc
     return None
+
+
+def _result_encode_error(result: object) -> Optional[str]:
+    """:func:`_result_encode_exc` rendered as a log-ready string, or ``None``."""
+    exc = _result_encode_exc(result)
+    return None if exc is None else f"{type(exc).__name__}: {exc}"
 
 
 class Worker:

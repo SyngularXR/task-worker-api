@@ -7,6 +7,8 @@ filtering, progress/cancel semantics, and the async-context-manager surface.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from task_worker_api.enums import TaskStatus, TaskType
@@ -66,6 +68,52 @@ async def test_complete_captures_result():
     await fake.complete(42, {"planes": []})
     assert fake.completed_tasks == [{"task_id": 42, "result": {"planes": []}}]
     assert fake.failed_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_complete_rejects_result_the_real_client_could_not_encode():
+    """The fake must refuse what ``BackendClient.complete`` refuses.
+
+    Otherwise a handler unit test passes on a result production rejects
+    while httpx builds the request — the mismatch #56 had to paper over in
+    the worker. The offending path is named because json reports only the
+    type, and a real result is nested.
+    """
+    fake = FakeBackendClient()
+    with pytest.raises(TypeError) as excinfo:
+        await fake.complete(42, {"output_files": [{"path": Path("/tmp/a.ply")}]})
+    assert "result['output_files'][0]['path']" in str(excinfo.value)
+    assert fake.completed_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_complete_rejects_nan_metric_naming_its_path():
+    """httpx 0.28 encodes with ``allow_nan=False`` — a NaN metric is a
+    ``ValueError``, not a ``TypeError``, and the fake mirrors the class."""
+    fake = FakeBackendClient()
+    with pytest.raises(ValueError) as excinfo:
+        await fake.complete(7, {"metrics": {"psnr": float("nan")}})
+    assert "result['metrics']['psnr']" in str(excinfo.value)
+    assert fake.completed_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_complete_reports_the_container_when_no_child_is_at_fault():
+    """A non-string dict key fails at the dict itself, not at any child."""
+    fake = FakeBackendClient()
+    with pytest.raises(TypeError) as excinfo:
+        await fake.complete(7, {"planes": {(1, 2): "corner"}})
+    assert "at result['planes'] " in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_complete_rejects_self_referential_result_without_hanging():
+    """The path walk must not chase a cycle — every child of one fails."""
+    fake = FakeBackendClient()
+    result: dict = {"planes": []}
+    result["planes"].append(result)
+    with pytest.raises(ValueError):
+        await fake.complete(7, result)
 
 
 @pytest.mark.asyncio

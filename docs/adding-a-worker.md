@@ -480,6 +480,13 @@ This covers the full loop: schema validation, file staging, handler
 execution, completion reporting, heartbeat calls. No real HTTP, no
 real backend. Run it in normal `pytest`, no docker-compose needed.
 
+`complete` runs the same encodability check the real `BackendClient` does
+(httpx builds the request, which encodes the body and sends nothing), so a
+result carrying a `Path`, `datetime`, numpy scalar or NaN raises here —
+naming the path, e.g. `result['output_files'][0]['path']` — instead of
+passing a test and failing in production. Return plain JSON types from
+handlers: `str(path)`, `dt.isoformat()`, `float(np_value)`.
+
 ### Remote-mode (file transfer) tests
 
 The example above uses `input_path` (local mode). To test a handler

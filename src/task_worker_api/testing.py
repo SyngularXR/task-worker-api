@@ -12,9 +12,41 @@ from typing import Optional, TYPE_CHECKING
 from .context import ClaimedTask
 from .enums import TaskStatus, TaskType
 from .errors import TaskCancelled
+from .worker import _result_encode_exc
 
 if TYPE_CHECKING:  # pragma: no cover
     import asyncio
+
+
+def _unencodable_path(result: object) -> str:
+    """Path of the innermost part of ``result`` that fails the encode check.
+
+    ``json`` names the offending *type* ("Object of type PosixPath is not
+    JSON serializable") but not where it sits, which in a nested handler
+    result — ``output_files``, per-frame metric dicts — is the only part the
+    author needs. Walk down while some child still fails the same check; the
+    last container that fails but has no failing child owns the problem (a
+    non-string dict key, say, fails at the dict itself).
+
+    ``seen`` guards a self-referential result: every child of a cycle fails
+    forever, so stop rather than descend into it.
+    """
+    path, value, seen = "result", result, {id(result)}
+    while True:
+        if isinstance(value, dict):
+            children, fmt = value.items(), "{}[{!r}]"
+        elif isinstance(value, (list, tuple)):
+            children, fmt = enumerate(value), "{}[{}]"
+        else:
+            return path
+        for key, child in children:
+            if id(child) in seen or _result_encode_exc(child) is None:
+                continue
+            path, value = fmt.format(path, key), child
+            seen.add(id(child))
+            break
+        else:
+            return path
 
 
 class FakeBackendClient:
@@ -136,6 +168,26 @@ class FakeBackendClient:
         return await self.get_cancel_status(task_id)
 
     async def complete(self, task_id: int, result: dict) -> None:
+        """Capture a completion — after the real client's encodability check.
+
+        ``BackendClient.complete`` raises while httpx *builds* the request, so
+        a stray numpy scalar, ``Path`` or ``datetime`` in a handler's result
+        never reaches the wire; ``Worker`` pre-checks with the same call and
+        turns it into a ``fail()`` report rather than orphaning the task
+        in_progress. A fake that accepted any dict let handler unit tests pass
+        on results production refuses, so it raises here instead — the same
+        exception class json raised (``TypeError``, or ``ValueError`` for NaN
+        and cycles), with the offending path named.
+        """
+        exc = _result_encode_exc(result)
+        if exc is not None:
+            raise type(exc)(
+                f"task {task_id}: result is not JSON-serializable at "
+                f"{_unencodable_path(result)} — {exc}. "
+                "BackendClient.complete raises the same way while httpx builds "
+                "the request, so this result could never be sent; Worker would "
+                "report the task failed instead."
+            ) from exc
         self.completed_tasks.append({"task_id": task_id, "result": result})
 
     async def fail(self, task_id: int, error: str) -> None:

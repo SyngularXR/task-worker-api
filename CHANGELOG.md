@@ -9,6 +9,21 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `FakeBackendClient.complete` now runs the same encodability check as the
+  real `BackendClient.complete` and raises when a result could not be sent,
+  naming the offending path (`result['output_files'][0]['path']`). The real
+  call raises while httpx *builds* the request — nothing is transmitted —
+  which is why `Worker` pre-checks and converts it into a `fail()` report
+  rather than orphaning the task in_progress until the sweeper recomputes
+  hours of GPU work. The fake accepted any dict, so every consumer repo's
+  handler unit tests passed on results production rejects: a stray numpy
+  scalar, `Path`, `datetime` or NaN metric only surfaced on the box. The
+  fake now mirrors the class json raised (`TypeError`, or `ValueError` for
+  NaN and cycles) with the path named, because json reports the offending
+  type but not where it sits. Test suites that were passing unencodable
+  results will now fail — that is the signal; fix the handler to return JSON
+  types (`str(path)`, `dt.isoformat()`, `float(np_value)`). Confined to test
+  code: no runtime or wire behaviour changes.
 - `Worker.run_forever` now runs its fatal startup check inside the guarded
   region. The box-affinity verification ran after the periodic payload-log
   cleanup task was created but before the `try`, so a mismatch — the
