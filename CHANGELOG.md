@@ -9,6 +9,23 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `Worker.__init__` now rejects duplicate foreign target URLs in
+  `SYNPUSHER_TARGETS`, raising `ProtocolError` naming the repeated URL. A
+  copy-pasted entry in a box's `.env.crossbox` built two `BackendClient`s
+  against one backend, doubling that box's claim traffic and connection count
+  every poll cycle and weighting it twice in the round-robin sweep. The home
+  box was already rejected; a repeat is now equally visible — the container
+  crash-loops instead of quietly double-polling. Both that check and the
+  existing home-box check now compare URLs canonicalised by `httpx.URL`
+  itself — the same resolution the client uses to dial, rather than a
+  hand-written restatement of it — so lower-cased scheme and host, the
+  scheme's default port dropped, `.`/`..` path segments resolved, the fragment
+  ignored, and IDNA-encoded hosts folded together. `HTTP://FAR/api/v1`,
+  `http://far:80/api/v1/`, `http://far/a/../api/v1`, `http://far/api/v1#frag`
+  and `http://FÄR/api/v1` are now all recognised as the one backend they
+  actually reach, instead of slipping past as distinct targets. URLs httpx
+  cannot parse are still compared verbatim. No wire or `SYNPUSHER_TARGETS`
+  format change.
 - Foreign target polling in `Worker._claim` is now round-robin instead of
   fixed listed order. The sweep returns on the first successful claim, so with
   two or more boxes in `SYNPUSHER_TARGETS` a target with a standing backlog

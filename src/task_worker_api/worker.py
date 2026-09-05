@@ -145,6 +145,58 @@ def parse_synpusher_targets(raw: Optional[str]) -> list[ForeignTarget]:
     return targets
 
 
+#: Ports httpx omits from the connection key because they are implied by the
+#: scheme — two URLs differing only by one of these reach the same backend.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _canonical_url(url: str) -> str:
+    """Return *url* in the form two spellings of one backend share.
+
+    "Same backend" has to mean "httpx dials the same address and sends the
+    same request target", so the canonical form is *derived from* ``httpx.URL``
+    rather than re-derived alongside it. httpx lower-cases the scheme,
+    lower-cases and IDNA-encodes the host, resolves ``.``/``..`` path segments,
+    and never puts the fragment on the wire — so ``http://far/a/../api/v1``,
+    ``http://far/api/v1#frag`` and ``http://FÄR``-style spellings all reach the
+    one place a plain ``http://far/api/v1`` does. Restating those rules by hand
+    is what previously let exactly those pairs past the home-box and duplicate
+    guards below, reinstating the double-polling they exist to stop.
+
+    Input httpx cannot parse, or that names no scheme and host, is returned
+    trailing-slash stripped, keeping the comparison exactly as strict as it was
+    before rather than collapsing unrelated junk together.
+
+    Verified identical across the supported ``httpx>=0.23`` range: 0.23.3 (what
+    the SynPusher backend pins) and 0.28 agree on every rule used here, despite
+    the URL-parser rewrite in 0.24. They differ only in how they *reject* a bad
+    port — 0.28 raises ``InvalidURL``, 0.23 yields an empty host — and both of
+    those land on the verbatim fallback below.
+    """
+    trimmed = url.rstrip("/")
+    try:
+        parsed = httpx.URL(trimmed)
+        scheme, port = parsed.scheme, parsed.port
+        # Both are ASCII once httpx has accepted the URL: the host is
+        # IDNA-encoded and the path percent-encoded. raw_path is the wire
+        # request target — dot segments resolved, query kept, fragment dropped.
+        host = parsed.raw_host.decode("ascii")
+        path = parsed.raw_path.decode("ascii")
+    except httpx.InvalidURL:  # bad port, un-encodable host — compare verbatim
+        return trimmed
+    if not scheme or not host:
+        return trimmed
+    # 0.28 leaves an explicitly spelled default port on the URL when the scheme
+    # was upper-cased, but connects to the same address either way.
+    if port == _DEFAULT_PORTS.get(scheme):
+        port = None
+    netloc = f"[{host}]" if ":" in host else host  # httpx strips IPv6 [ ]
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    # Strip again: resolving dot segments can reintroduce a trailing slash.
+    return f"{scheme}://{netloc}{path}".rstrip("/")
+
+
 @dataclass
 class _Target:
     """Runtime view of one pollable box (home or foreign)."""
@@ -523,8 +575,8 @@ class Worker:
         # skipped — they don't make real HTTP calls, so URL provenance is moot.
         client_base_url = getattr(self._client, "base_url", None)
         if client_base_url is not None:
-            client_norm = str(client_base_url).rstrip("/")
-            worker_norm = self.backend_url.rstrip("/")
+            client_norm = _canonical_url(str(client_base_url))
+            worker_norm = _canonical_url(self.backend_url)
             if not (
                 client_norm == worker_norm
                 or worker_norm.startswith(client_norm + "/")
@@ -555,15 +607,25 @@ class Worker:
         self._foreign_targets: list[_Target] = []
         #: Rotating start index into ``_foreign_targets`` (see ``_claim``).
         self._foreign_cursor = 0
-        home_norm = self.backend_url.rstrip("/")
-        for spec in specs:
-            spec_url = (spec.url or "").rstrip("/")
+        home_norm = _canonical_url(self.backend_url)
+        seen_urls: set[str] = set()
+        for idx, spec in enumerate(specs):
+            spec_url = _canonical_url(spec.url or "")
             if spec_url and spec_url == home_norm:
                 raise ProtocolError(
                     f"SYNPUSHER_TARGETS lists the home box ({spec.url!r}); "
                     "foreign targets are additive — remove the home URL from "
                     "the list."
                 )
+            if spec_url and spec_url in seen_urls:
+                raise ProtocolError(
+                    f"SYNPUSHER_TARGETS entry {idx} repeats target URL "
+                    f"{spec.url!r}. Each foreign target must be a distinct "
+                    "backend — a repeat doubles that box's claim traffic and "
+                    "weights it twice in the round-robin; remove the "
+                    "duplicate."
+                )
+            seen_urls.add(spec_url)
             usable = [t for t in spec.task_types if t in self.handlers]
             dropped = [t.value for t in spec.task_types if t not in self.handlers]
             if dropped:
