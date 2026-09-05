@@ -15,8 +15,11 @@
   against one backend, doubling that box's claim traffic and connection count
   every poll cycle and weighting it twice in the round-robin sweep. The home
   box was already rejected; a repeat is now equally visible — the container
-  crash-loops instead of quietly double-polling. No wire or
-  `SYNPUSHER_TARGETS` format change.
+  crash-loops instead of quietly double-polling. Both that check and the
+  existing home-box check now compare URLs canonicalised the way httpx
+  resolves them (lower-cased scheme and host, the scheme's default port
+  dropped), so `HTTP://FAR/api/v1` and `http://far:80/api/v1/` no longer slip
+  past as distinct backends. No wire or `SYNPUSHER_TARGETS` format change.
 - Foreign target polling in `Worker._claim` is now round-robin instead of
   fixed listed order. The sweep returns on the first successful claim, so with
   two or more boxes in `SYNPUSHER_TARGETS` a target with a standing backlog

@@ -145,6 +145,38 @@ def parse_synpusher_targets(raw: Optional[str]) -> list[ForeignTarget]:
     return targets
 
 
+#: Ports httpx omits from the connection key because they are implied by the
+#: scheme — two URLs differing only by one of these reach the same backend.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _canonical_url(url: str) -> str:
+    """Return *url* in the form two spellings of one backend share.
+
+    httpx lowercases scheme and host and treats the scheme's default port as
+    absent, so ``HTTP://FAR:80/api/v1/`` and ``http://far/api/v1`` open
+    connections to a single backend. Comparing raw (merely trailing-slash
+    stripped) strings would wave that pair past the home-box and duplicate
+    guards below and reinstate the double-polling they exist to stop. Input
+    that isn't a parseable absolute URL is returned trailing-slash stripped,
+    keeping the comparison exactly as strict as it was before.
+    """
+    trimmed = url.rstrip("/")
+    try:
+        parts = urllib.parse.urlsplit(trimmed)
+        host, port = parts.hostname, parts.port
+    except ValueError:  # unparseable port or IPv6 literal — compare verbatim
+        return trimmed
+    if not parts.scheme or not host:
+        return trimmed
+    netloc = f"[{host}]" if ":" in host else host  # urlsplit strips IPv6 [ ]
+    if port is not None and port != _DEFAULT_PORTS.get(parts.scheme.lower()):
+        netloc = f"{netloc}:{port}"
+    return urllib.parse.urlunsplit(
+        (parts.scheme.lower(), netloc, parts.path, parts.query, parts.fragment)
+    )
+
+
 @dataclass
 class _Target:
     """Runtime view of one pollable box (home or foreign)."""
@@ -523,8 +555,8 @@ class Worker:
         # skipped — they don't make real HTTP calls, so URL provenance is moot.
         client_base_url = getattr(self._client, "base_url", None)
         if client_base_url is not None:
-            client_norm = str(client_base_url).rstrip("/")
-            worker_norm = self.backend_url.rstrip("/")
+            client_norm = _canonical_url(str(client_base_url))
+            worker_norm = _canonical_url(self.backend_url)
             if not (
                 client_norm == worker_norm
                 or worker_norm.startswith(client_norm + "/")
@@ -555,10 +587,10 @@ class Worker:
         self._foreign_targets: list[_Target] = []
         #: Rotating start index into ``_foreign_targets`` (see ``_claim``).
         self._foreign_cursor = 0
-        home_norm = self.backend_url.rstrip("/")
+        home_norm = _canonical_url(self.backend_url)
         seen_urls: set[str] = set()
         for idx, spec in enumerate(specs):
-            spec_url = (spec.url or "").rstrip("/")
+            spec_url = _canonical_url(spec.url or "")
             if spec_url and spec_url == home_norm:
                 raise ProtocolError(
                     f"SYNPUSHER_TARGETS lists the home box ({spec.url!r}); "

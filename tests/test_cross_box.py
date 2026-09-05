@@ -109,21 +109,38 @@ def test_parse_targets_malformed_fail_fast(raw):
 # ---------------------------------------------------------------------------
 
 
-def test_worker_rejects_home_url_listed_as_foreign(make_worker):
+def _target(url: str) -> ForeignTarget:
+    return ForeignTarget(
+        url=url,
+        api_key="k",
+        task_types=[TaskType.MODEL_INITIALIZING],
+        client=FakeBackendClient(),
+    )
+
+
+# Spellings httpx canonicalises to one backend: it lowercases scheme and host
+# and drops the scheme's default port, so each of these opens connections to
+# the same place as the plain ``http://<host>:5000/api/v1``.
+_SAME_BACKEND = pytest.mark.parametrize("spelling", [
+    "http://{h}:5000/api/v1/",       # trailing slash
+    "HTTP://{h}:5000/api/v1",        # upper-case scheme
+    "http://{H}:5000/api/v1",        # upper-case host
+    "HTTP://{H}:5000/api/v1/",       # all three at once
+])
+
+
+@_SAME_BACKEND
+def test_worker_rejects_home_url_listed_as_foreign(make_worker, spelling):
     with pytest.raises(ProtocolError, match="home box"):
         make_worker(
             handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
             backend_url="http://home:5000/api/v1",
-            foreign_targets=[ForeignTarget(
-                url="http://home:5000/api/v1/",
-                api_key="k",
-                task_types=[TaskType.MODEL_INITIALIZING],
-                client=FakeBackendClient(),
-            )],
+            foreign_targets=[_target(spelling.format(h="home", H="HOME"))],
         )
 
 
-def test_worker_rejects_duplicate_foreign_url(make_worker):
+@_SAME_BACKEND
+def test_worker_rejects_duplicate_foreign_url(make_worker, spelling):
     # A copy-pasted .env.crossbox entry would otherwise build two clients
     # against one backend: double the claim traffic, double the round-robin
     # weight.
@@ -132,20 +149,42 @@ def test_worker_rejects_duplicate_foreign_url(make_worker):
             handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
             backend_url="http://home:5000/api/v1",
             foreign_targets=[
-                ForeignTarget(
-                    url="http://far:5000/api/v1",
-                    api_key="k",
-                    task_types=[TaskType.MODEL_INITIALIZING],
-                    client=FakeBackendClient(),
-                ),
-                ForeignTarget(
-                    url="http://far:5000/api/v1/",  # trailing slash only
-                    api_key="k",
-                    task_types=[TaskType.MODEL_INITIALIZING],
-                    client=FakeBackendClient(),
-                ),
+                _target("http://far:5000/api/v1"),
+                _target(spelling.format(h="far", H="FAR")),
             ],
         )
+
+
+@pytest.mark.parametrize("home,foreign", [
+    # Default port implied vs. spelled out — one backend, both guards fire.
+    ("http://home/api/v1", "http://home:80/api/v1"),
+    ("https://home:443/api/v1", "HTTPS://Home/api/v1/"),
+])
+def test_worker_rejects_home_url_with_default_port_spelled_out(
+    make_worker, home, foreign,
+):
+    with pytest.raises(ProtocolError, match="home box"):
+        make_worker(
+            handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+            backend_url=home,
+            foreign_targets=[_target(foreign)],
+        )
+
+
+def test_worker_accepts_distinct_backends_on_one_host(make_worker):
+    # Canonicalisation must not over-merge: same host, different port or
+    # scheme is a different backend and stays legal.
+    worker = make_worker(
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        backend_url="http://home:5000/api/v1",
+        foreign_targets=[
+            _target("http://far:5000/api/v1"),
+            _target("http://far:5001/api/v1"),
+            _target("https://far:5000/api/v1"),
+            _target("http://far:5000/api/v2"),
+        ],
+    )
+    assert len(worker._foreign_targets) == 4
 
 
 def test_worker_rejects_target_with_no_handled_types(make_worker):
