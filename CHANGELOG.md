@@ -18,12 +18,16 @@
   hours of GPU work. The fake accepted any dict, so every consumer repo's
   handler unit tests passed on results production rejects: a stray numpy
   scalar, `Path`, `datetime` or NaN metric only surfaced on the box. The
-  fake now mirrors the class json raised (`TypeError`, or `ValueError` for
-  NaN and cycles) with the path named, because json reports the offending
-  type but not where it sits. Test suites that were passing unencodable
-  results will now fail — that is the signal; fix the handler to return JSON
-  types (`str(path)`, `dt.isoformat()`, `float(np_value)`). Confined to test
-  code: no runtime or wire behaviour changes.
+  fake now mirrors the class the encoder raised (`TypeError`, or `ValueError`
+  for NaN and cycles) with the path named, because json reports the offending
+  type but not where it sits; where a message alone cannot rebuild that class
+  — an unpaired surrogate raises `UnicodeEncodeError`, whose constructor takes
+  five arguments — its nearest base that can is raised instead (`UnicodeError`,
+  still a `ValueError`), with the original kept as `__cause__`. Test suites
+  that were passing unencodable results will now fail — that is the signal;
+  fix the handler to return JSON types (`str(path)`, `dt.isoformat()`,
+  `float(np_value)`). Confined to test code: no runtime or wire behaviour
+  changes.
 - `Worker.run_forever` now runs its fatal startup check inside the guarded
   region. The box-affinity verification ran after the periodic payload-log
   cleanup task was created but before the `try`, so a mismatch — the

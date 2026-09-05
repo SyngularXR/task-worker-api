@@ -49,6 +49,29 @@ def _unencodable_path(result: object) -> str:
             return path
 
 
+def _rejection(message: str, exc: BaseException) -> Exception:
+    """``exc``'s class rebuilt around ``message`` — or its nearest base that
+    a lone message constructs.
+
+    ``type(exc)(message)`` on its own is not safe. A result holding an
+    unpaired surrogate reaches httpx's ``.encode("utf-8")`` and raises
+    ``UnicodeEncodeError``, whose constructor demands five arguments, so
+    rebuilding it raised a bare ``TypeError`` ("function takes exactly 5
+    arguments") — losing the class, the path this message carries, and even
+    the ``raise ... from`` chaining, since the constructor blew up before
+    the ``raise``. Walking the MRO keeps the closest class that survives a
+    one-argument call (``UnicodeError``, still a ``ValueError``, for that
+    case); ``Exception`` is in every MRO and always does.
+    """
+    for cls in type(exc).__mro__:
+        if issubclass(cls, Exception):
+            try:
+                return cls(message)
+            except Exception:  # noqa: BLE001 — exotic constructor signature
+                continue
+    return Exception(message)  # pragma: no cover — Exception ends every MRO
+
+
 class FakeBackendClient:
     """Drop-in for ``BackendClient``. Keeps claim/complete/fail/progress
     payloads in memory; workers interact with it the same way they'd talk
@@ -175,18 +198,21 @@ class FakeBackendClient:
         never reaches the wire; ``Worker`` pre-checks with the same call and
         turns it into a ``fail()`` report rather than orphaning the task
         in_progress. A fake that accepted any dict let handler unit tests pass
-        on results production refuses, so it raises here instead — the same
-        exception class json raised (``TypeError``, or ``ValueError`` for NaN
-        and cycles), with the offending path named.
+        on results production refuses, so it raises here instead — the class
+        the encoder raised (``TypeError``, or ``ValueError`` for NaN and
+        cycles) where a message alone rebuilds it, else its nearest base that
+        does (see :func:`_rejection`) — with the offending path named and the
+        original kept as ``__cause__``.
         """
         exc = _result_encode_exc(result)
         if exc is not None:
-            raise type(exc)(
+            raise _rejection(
                 f"task {task_id}: result is not JSON-serializable at "
                 f"{_unencodable_path(result)} — {exc}. "
                 "BackendClient.complete raises the same way while httpx builds "
                 "the request, so this result could never be sent; Worker would "
-                "report the task failed instead."
+                "report the task failed instead.",
+                exc,
             ) from exc
         self.completed_tasks.append({"task_id": task_id, "result": result})
 

@@ -107,6 +107,26 @@ async def test_complete_reports_the_container_when_no_child_is_at_fault():
 
 
 @pytest.mark.asyncio
+async def test_complete_rejects_unpaired_surrogate_naming_its_path():
+    """An unpaired surrogate fails in ``.encode("utf-8")``, not in ``json``.
+
+    httpx encodes with ``ensure_ascii=False``, so the surrogate reaches the
+    utf-8 step instead of being escaped. ``UnicodeEncodeError``'s constructor demands five arguments, so rebuilding
+    the class from the message alone raised a bare ``TypeError`` ("function
+    takes exactly 5 arguments") that named neither the offending path nor the
+    real cause. The nearest base a message does construct is used instead —
+    still a ``ValueError``, as any ``UnicodeError`` is.
+    """
+    fake = FakeBackendClient()
+    with pytest.raises(ValueError) as excinfo:
+        await fake.complete(7, {"logs": {"stderr": "bad byte \ud800 here"}})
+    assert "result['logs']['stderr']" in str(excinfo.value)
+    assert "takes exactly 5 arguments" not in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, UnicodeEncodeError)
+    assert fake.completed_tasks == []
+
+
+@pytest.mark.asyncio
 async def test_complete_rejects_self_referential_result_without_hanging():
     """The path walk must not chase a cycle — every child of one fails."""
     fake = FakeBackendClient()
