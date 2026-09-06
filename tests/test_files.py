@@ -961,6 +961,60 @@ async def test_upload_outputs_local_aborts_on_mid_copy_cancel(
 
 
 @pytest.mark.asyncio
+async def test_upload_outputs_local_staging_dir_removed_on_cancelled_caller(
+    tmp_path, monkeypatch,
+):
+    """The staging-dir cleanup must survive the *caller* being cancelled.
+
+    A worker shutdown (``run_hybrid`` cancelling the worker task) or a
+    watchdog unwind during publishing raises ``asyncio.CancelledError``,
+    which is not an ``Exception`` — the cleanup used to miss it and leave the
+    GB-scale artifacts already copied in ``temp/<task_id>`` forever, since the
+    backend only sweeps staging dirs for tasks it recorded complete.
+    """
+    import asyncio
+    from task_worker_api import files as files_mod
+
+    monkeypatch.setattr(files_mod, "_COPY_CHUNK_BYTES", 4)
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "first.ply").write_bytes(b"x" * 8)
+    (out_dir / "second.ply").write_bytes(b"y" * 4000)  # 1000 chunks to cancel in
+
+    # Cancel during the *second* copy, so the staging dir holds one complete
+    # file plus a partial one — exactly the orphan shape being fixed.
+    real_copy = files_mod._copyfile_async
+    second_started = asyncio.Event()
+
+    async def copy_signalling_second(src, dest, **kwargs):
+        if dest.name == "second.ply":
+            second_started.set()
+        return await real_copy(src, dest, **kwargs)
+
+    monkeypatch.setattr(files_mod, "_copyfile_async", copy_signalling_second)
+
+    task = _claimed(64, params={"input_path": "/ignored"})
+    uploading = asyncio.create_task(
+        upload_outputs(
+            task, FakeBackendClient(), _file_ctx(out_dir),
+            output_files={"first": "first.ply", "second": "second.ply"},
+            shared_volume_path=str(shared),
+        )
+    )
+    await asyncio.wait_for(second_started.wait(), timeout=5)
+    uploading.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await uploading
+
+    assert not (shared / "temp" / "64").exists(), (
+        "staging dir must be removed when the caller is cancelled mid-publish"
+    )
+
+
+@pytest.mark.asyncio
 async def test_local_multi_chunk_copies_are_faithful_without_cancel_event(
     tmp_path, monkeypatch,
 ):

@@ -882,6 +882,18 @@
   flight. Both now run via `asyncio.to_thread` with identical semantics:
   `ignore_errors=True` is preserved, so neither call raises, and the workdir /
   staging dir is removed exactly as before.
+- `upload_outputs`' partial-publish cleanup now survives caller cancellation.
+  Both handlers caught `Exception`, and `asyncio.CancelledError` is not one, so
+  a worker shutdown (`run_hybrid` cancelling the worker task) or a task
+  watchdog unwinding a run *during output publishing* skipped the cleanup
+  entirely: the local-mode staging dir `<shared volume>/temp/<task_id>` was
+  left holding the GB-scale artifacts already copied. The backend only sweeps
+  staging dirs for tasks it recorded as complete, so that orphan is permanent
+  and accumulates on the shared volume. Both handlers now catch
+  `BaseException` and re-raise unchanged — the same contract, and the same
+  reasoning, as `files._copyfile_async` and `BackendClient.download_file`.
+  Which exceptions propagate is unchanged; remote mode still only logs its
+  partial-upload WARNING (there is no backend delete-output route).
 
 ## v0.12.0 — 2026-07-17
 
