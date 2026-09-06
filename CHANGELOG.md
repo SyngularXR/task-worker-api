@@ -35,6 +35,26 @@
   sends both. The SDK's own tests for those two cases skip when the installed
   httpx encodes them, since matching the real client is the contract; pin
   httpx 0.28+ to have them caught.
+- `BackendClient.__init__` now validates its four HTTP deadline knobs —
+  `timeout_s`, `file_timeout_s`, `cancel_timeout_s`, `lifecycle_timeout_s` —
+  raising `ValueError` naming the knob instead of handing the value straight
+  to `httpx.Timeout`. Each degenerate value defeated the deadline it
+  configured, silently at construction: `NaN` becomes an anyio deadline whose
+  every comparison is False, so the request never times out — the same
+  unbounded hang `_per_request_timeout` documents for a literal `None`,
+  reached through a different door; `inf` disables the deadline outright; and
+  a negative or zero value puts it in the past, so *every* request fails
+  instantly — cancel polls always fail (`CancelGuard` blind for the whole
+  task) and lifecycle writes always fail (terminal report lost, task orphaned
+  `in_progress`). Consumers build these values from the environment, so a
+  typo'd `.env` entry was a live path to a wedged or orphaned task. `None`
+  remains legal for `file_timeout_s`/`cancel_timeout_s`/`lifecycle_timeout_s`
+  where it is documented as "fall back to the client's own timeout";
+  `timeout_s` is that client default and has nothing to fall back to. No
+  default changed, and the checks run before the owned `httpx.AsyncClient` is
+  built so a rejected config leaks no connection pool. The `Worker` forwards
+  these knobs into both its home and foreign clients, so the client-side check
+  covers both.
 - `Worker.run_forever` now runs its fatal startup check inside the guarded
   region. The box-affinity verification ran after the periodic payload-log
   cleanup task was created but before the `try`, so a mismatch — the
