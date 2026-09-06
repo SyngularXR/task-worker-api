@@ -59,11 +59,25 @@ HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
 # within a minute.
 _DEFAULT_CLAIM_BACKOFF_MAX_S = _DEFAULT_BACKOFF_MAX_S
 
+# A full day is well beyond the fleet's longest configured task timeout (the
+# 3-hour cinematic_baking job), so a quiet tree this old cannot be a healthy
+# attempt. Operators can raise this floor for unusually slow local storage.
+_DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S = 24 * 60 * 60
+_TASK_WORKDIR_RE = re.compile(r"task_\d+")
+
 #: Cap on how many poll cycles a connect-failing foreign target is skipped.
 #: 32 cycles at the default 5s poll interval ≈ 2.7 min between attempts —
 #: enough to stop a dead target from consuming a retry burst every cycle,
 #: short enough that a recovered box is picked back up within minutes.
 _FOREIGN_BACKOFF_MAX_CYCLES = 32
+
+#: Exponent ceiling for that backoff. ``min()`` already clamps the *result*,
+#: but not the exponentiation: ``failures`` keeps incrementing against a
+#: permanently dead box, so ``2 ** failures`` builds a wider throwaway integer
+#: every cycle for a worker left running for days. ``bit_length()`` is the
+#: first exponent whose power exceeds the ceiling, so clamping there keeps the
+#: arithmetic O(1) with no change to any skip value.
+_FOREIGN_BACKOFF_MAX_EXP = _FOREIGN_BACKOFF_MAX_CYCLES.bit_length()
 
 #: Bare fleet-default worker ids (``blender-worker-1``). Fine on a single
 #: box; ambiguous the moment two boxes' fleets poll the same target — the
@@ -131,6 +145,58 @@ def parse_synpusher_targets(raw: Optional[str]) -> list[ForeignTarget]:
     return targets
 
 
+#: Ports httpx omits from the connection key because they are implied by the
+#: scheme — two URLs differing only by one of these reach the same backend.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _canonical_url(url: str) -> str:
+    """Return *url* in the form two spellings of one backend share.
+
+    "Same backend" has to mean "httpx dials the same address and sends the
+    same request target", so the canonical form is *derived from* ``httpx.URL``
+    rather than re-derived alongside it. httpx lower-cases the scheme,
+    lower-cases and IDNA-encodes the host, resolves ``.``/``..`` path segments,
+    and never puts the fragment on the wire — so ``http://far/a/../api/v1``,
+    ``http://far/api/v1#frag`` and ``http://FÄR``-style spellings all reach the
+    one place a plain ``http://far/api/v1`` does. Restating those rules by hand
+    is what previously let exactly those pairs past the home-box and duplicate
+    guards below, reinstating the double-polling they exist to stop.
+
+    Input httpx cannot parse, or that names no scheme and host, is returned
+    trailing-slash stripped, keeping the comparison exactly as strict as it was
+    before rather than collapsing unrelated junk together.
+
+    Verified identical across the supported ``httpx>=0.23`` range: 0.23.3 (what
+    the SynPusher backend pins) and 0.28 agree on every rule used here, despite
+    the URL-parser rewrite in 0.24. They differ only in how they *reject* a bad
+    port — 0.28 raises ``InvalidURL``, 0.23 yields an empty host — and both of
+    those land on the verbatim fallback below.
+    """
+    trimmed = url.rstrip("/")
+    try:
+        parsed = httpx.URL(trimmed)
+        scheme, port = parsed.scheme, parsed.port
+        # Both are ASCII once httpx has accepted the URL: the host is
+        # IDNA-encoded and the path percent-encoded. raw_path is the wire
+        # request target — dot segments resolved, query kept, fragment dropped.
+        host = parsed.raw_host.decode("ascii")
+        path = parsed.raw_path.decode("ascii")
+    except httpx.InvalidURL:  # bad port, un-encodable host — compare verbatim
+        return trimmed
+    if not scheme or not host:
+        return trimmed
+    # 0.28 leaves an explicitly spelled default port on the URL when the scheme
+    # was upper-cased, but connects to the same address either way.
+    if port == _DEFAULT_PORTS.get(scheme):
+        port = None
+    netloc = f"[{host}]" if ":" in host else host  # httpx strips IPv6 [ ]
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    # Strip again: resolving dot segments can reintroduce a trailing slash.
+    return f"{scheme}://{netloc}{path}".rstrip("/")
+
+
 @dataclass
 class _Target:
     """Runtime view of one pollable box (home or foreign)."""
@@ -177,6 +243,24 @@ def _positive_finite_s(name: str, value: float) -> float:
         raise ValueError(
             f"{name} must be a finite positive number of seconds "
             f"(got {value!r})"
+        )
+    return float(value)
+
+
+def _finite_task_timeout_s(name: str, value: float) -> float:
+    """Validate a task-timeout value, or raise ``ValueError``.
+
+    Unlike the pacing knobs, ``<= 0`` is legal here — it is the documented
+    "no timeout" escape hatch for a known-unbounded task type. Non-finite
+    values defeat the timeout silently instead of loudly: ``NaN`` fails
+    ``_run_one``'s ``timeout_s > 0`` check, so the watchdog is never started
+    and a wedged handler runs unbounded with no log line saying why; ``inf``
+    starts a watchdog whose deadline never arrives — the same unbounded run,
+    one thread more expensive.
+    """
+    if not math.isfinite(value):
+        raise ValueError(
+            f"{name} must be a finite number of seconds (got {value!r})"
         )
     return float(value)
 
@@ -257,8 +341,55 @@ def _clear_workdir(task_dir: Path) -> None:
         )
 
 
-def _result_encode_error(result: object) -> Optional[str]:
-    """The error ``complete()`` would raise encoding ``result``, or ``None``.
+def _newest_tree_mtime(path: Path) -> float:
+    """Return the newest mtime in ``path`` without following symlinks."""
+    newest = path.stat(follow_symlinks=False).st_mtime
+    pending = [path]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                newest = max(
+                    newest,
+                    entry.stat(follow_symlinks=False).st_mtime,
+                )
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+    return newest
+
+
+def _sweep_orphaned_workdirs(
+    work_dir: Path,
+    active_task_dir: Optional[Path],
+    min_age_s: float,
+) -> None:
+    """Best-effort removal of old SDK-owned task dirs. Runs in a thread."""
+    cutoff = time.time() - min_age_s
+    try:
+        candidates = list(work_dir.iterdir())
+    except Exception as e:  # noqa: BLE001 — cleanup must never stop polling
+        log.warning("workdir cleanup: could not scan %s: %s", work_dir, e)
+        return
+
+    for task_dir in candidates:
+        if not _TASK_WORKDIR_RE.fullmatch(task_dir.name):
+            continue
+        try:
+            if (
+                task_dir == active_task_dir
+                or task_dir.is_symlink()
+                or not task_dir.is_dir()
+            ):
+                continue
+            if _newest_tree_mtime(task_dir) >= cutoff:
+                continue
+            shutil.rmtree(task_dir)
+            log.info("workdir cleanup: removed orphaned %s", task_dir)
+        except Exception as e:  # noqa: BLE001 — cleanup must never stop polling
+            log.warning("workdir cleanup: could not remove %s: %s", task_dir, e)
+
+
+def _result_encode_exc(result: object) -> Optional[BaseException]:
+    """The exception ``complete()`` would raise encoding ``result``, or ``None``.
 
     Asks httpx itself — building a request encodes the body, and building one
     transmits nothing — rather than re-implementing its JSON encoding. The
@@ -266,14 +397,23 @@ def _result_encode_error(result: object) -> Optional[str]:
     supports (0.28 passes ``allow_nan=False``, so a NaN metric that older
     httpx would have put on the wire is now rejected), and a check stricter
     than the real encoder would fail a task the backend would have accepted.
+
+    ``FakeBackendClient.complete`` runs the same check, so a handler unit test
+    cannot pass a result the real client would refuse to send.
     """
     try:
         httpx.Request(
             "PUT", "http://encode-check.invalid/", json={"result": result},
         )
     except Exception as exc:  # noqa: BLE001
-        return f"{type(exc).__name__}: {exc}"
+        return exc
     return None
+
+
+def _result_encode_error(result: object) -> Optional[str]:
+    """:func:`_result_encode_exc` rendered as a log-ready string, or ``None``."""
+    exc = _result_encode_exc(result)
+    return None if exc is None else f"{type(exc).__name__}: {exc}"
 
 
 class Worker:
@@ -349,14 +489,41 @@ class Worker:
         self.cancel_poll_interval_s = _positive_finite_s(
             "cancel_poll_interval_s", cancel_poll_interval_s,
         )
-        self.task_timeout_s = task_timeout_s
-        self.task_timeouts = task_timeouts or {}
+        self.task_timeout_s = _finite_task_timeout_s(
+            "task_timeout_s", task_timeout_s,
+        )
+        self.task_timeouts = {
+            t: _finite_task_timeout_s(f"task_timeouts[{t}]", v)
+            for t, v in (task_timeouts or {}).items()
+        }
         self.timeout_grace_s = _positive_finite_s(
             "timeout_grace_s", timeout_grace_s,
         )
         self._on_hard_exit = on_hard_exit or (lambda: os._exit(75))
         self._timeout_env = parse_timeouts_env(os.environ.get("WORKER_TASK_TIMEOUTS"))
         self._watchdog_factory = _watchdog_factory
+        self._active_task_dir: Optional[Path] = None
+        self._workdir_cleanup_lock = asyncio.Lock()
+        workdir_age_raw = os.environ.get(
+            "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
+            str(_DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S),
+        )
+        try:
+            self._workdir_cleanup_min_age_s = float(workdir_age_raw)
+            if (
+                not math.isfinite(self._workdir_cleanup_min_age_s)
+                or self._workdir_cleanup_min_age_s <= 0
+            ):
+                raise ValueError
+        except (ValueError, TypeError):
+            log.warning(
+                "workdir cleanup: WORKER_WORKDIR_CLEANUP_MIN_AGE_S=%r is "
+                "invalid; falling back to %d seconds",
+                workdir_age_raw, _DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S,
+            )
+            self._workdir_cleanup_min_age_s = float(
+                _DEFAULT_WORKDIR_CLEANUP_MIN_AGE_S
+            )
 
         self._payload_logger = self._build_payload_logger()
 
@@ -417,8 +584,8 @@ class Worker:
         # skipped — they don't make real HTTP calls, so URL provenance is moot.
         client_base_url = getattr(self._client, "base_url", None)
         if client_base_url is not None:
-            client_norm = str(client_base_url).rstrip("/")
-            worker_norm = self.backend_url.rstrip("/")
+            client_norm = _canonical_url(str(client_base_url))
+            worker_norm = _canonical_url(self.backend_url)
             if not (
                 client_norm == worker_norm
                 or worker_norm.startswith(client_norm + "/")
@@ -447,15 +614,27 @@ class Worker:
             else parse_synpusher_targets(os.environ.get("SYNPUSHER_TARGETS"))
         )
         self._foreign_targets: list[_Target] = []
-        home_norm = self.backend_url.rstrip("/")
-        for spec in specs:
-            spec_url = (spec.url or "").rstrip("/")
+        #: Rotating start index into ``_foreign_targets`` (see ``_claim``).
+        self._foreign_cursor = 0
+        home_norm = _canonical_url(self.backend_url)
+        seen_urls: set[str] = set()
+        for idx, spec in enumerate(specs):
+            spec_url = _canonical_url(spec.url or "")
             if spec_url and spec_url == home_norm:
                 raise ProtocolError(
                     f"SYNPUSHER_TARGETS lists the home box ({spec.url!r}); "
                     "foreign targets are additive — remove the home URL from "
                     "the list."
                 )
+            if spec_url and spec_url in seen_urls:
+                raise ProtocolError(
+                    f"SYNPUSHER_TARGETS entry {idx} repeats target URL "
+                    f"{spec.url!r}. Each foreign target must be a distinct "
+                    "backend — a repeat doubles that box's claim traffic and "
+                    "weights it twice in the round-robin; remove the "
+                    "duplicate."
+                )
+            seen_urls.add(spec_url)
             usable = [t for t in spec.task_types if t in self.handlers]
             dropped = [t.value for t in spec.task_types if t not in self.handlers]
             if dropped:
@@ -591,24 +770,39 @@ class Worker:
                 self.shared_volume_path,
                 os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
             )
-        self._payload_logger.cleanup_old_files()
+        await self._run_cleanup()
 
-        cleanup_interval_s = float(
-            os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
-        )
+        cleanup_raw = os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
+        try:
+            cleanup_interval_s = float(cleanup_raw)
+            if not math.isfinite(cleanup_interval_s) or cleanup_interval_s <= 0:
+                raise ValueError(
+                    f"cleanup interval must be a finite positive number of "
+                    f"seconds, got {cleanup_interval_s}"
+                )
+        except (ValueError, TypeError):
+            log.warning(
+                "payload_log: WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S=%r is "
+                "invalid; falling back to 3600 seconds",
+                cleanup_raw,
+            )
+            cleanup_interval_s = 3600.0
         cleanup_task = asyncio.create_task(
             self._periodic_cleanup_loop(cleanup_interval_s)
         )
 
-        if self._foreign_targets:
-            log.info(
-                "cross-box mode: %d foreign target(s): %s",
-                len(self._foreign_targets),
-                ", ".join(t.label for t in self._foreign_targets),
-            )
-            await self._verify_home_affinity()
-
+        # Startup checks belong inside the try: a fatal one (box affinity)
+        # must still run the finally, or its ProtocolError surfaces buried in
+        # "Task was destroyed but it is pending" and unclosed-socket noise.
         try:
+            if self._foreign_targets:
+                log.info(
+                    "cross-box mode: %d foreign target(s): %s",
+                    len(self._foreign_targets),
+                    ", ".join(t.label for t in self._foreign_targets),
+                )
+                await self._verify_home_affinity()
+
             while not self._stop.is_set():
                 claimed = await self._claim()
                 if claimed is None:
@@ -720,9 +914,23 @@ class Worker:
                 await asyncio.sleep(interval_s)
                 if self._stop.is_set():
                     return
-                self._payload_logger.cleanup_old_files()
+                await self._run_cleanup()
         except asyncio.CancelledError:
             raise
+
+    async def _run_cleanup(self) -> None:
+        """Run all worker-local retention off the event loop."""
+        await asyncio.to_thread(self._payload_logger.cleanup_old_files)
+        # Serializing only the sweep against task activation closes the race
+        # where an old path is selected, then reclaimed and recreated for a
+        # new attempt before rmtree starts. Waiting here never blocks the loop.
+        async with self._workdir_cleanup_lock:
+            await asyncio.to_thread(
+                _sweep_orphaned_workdirs,
+                self.work_dir,
+                self._active_task_dir,
+                self._workdir_cleanup_min_age_s,
+            )
 
     async def run_one(self) -> bool:
         """Process exactly one claim cycle. Returns True iff a task ran.
@@ -787,21 +995,42 @@ class Worker:
 
         Home gets first refusal every cycle — "help only when idle" falls out
         of the loop structure, since a worker only polls at all when it has no
-        task. Foreign targets are polled in listed order; one that fails to
-        connect is skipped for exponentially more cycles (capped) so a dead
-        target can't starve the ones after it or consume a retry burst every
-        cycle. Home failures keep driving the existing global idle-wait
-        escalation; foreign failures never touch it.
+        task. Foreign targets are then swept in round-robin order: the sweep
+        returns on the first successful claim, so a fixed order lets one
+        target with a standing backlog claim every cycle and the targets
+        after it are never polled at all — not merely deprioritised.
+        Advancing the start index one step per cycle gives every target first
+        pick every ``len(targets)`` cycles. One that fails to connect is
+        skipped for exponentially more cycles (capped) so a dead target can't
+        starve the ones after it or consume a retry burst every cycle. That
+        backoff is charged per poll cycle, before the sweep, rather than when
+        the sweep happens to reach the target: the sweep returns on the first
+        successful claim, so a target sitting behind a backlogged one is never
+        reached, and an in-sweep decrement would stall its counter — an
+        N-cycle backoff would take up to ``N * len(targets)`` cycles to
+        expire, scaling the ceiling with target count. Home failures keep
+        driving the existing global idle-wait escalation; foreign failures
+        never touch it.
         """
         claimed = await self._claim_home()
         if claimed is not None:
             return claimed, self._home_target
-        for tgt in self._foreign_targets:
-            if self._stop.is_set():
-                return None
+        targets = self._foreign_targets
+        if not targets:
+            return None
+        start = self._foreign_cursor
+        # Modulo on store, not on read: the cursor must stay small for the
+        # same reason the backoff exponent does.
+        self._foreign_cursor = (start + 1) % len(targets)
+        due = []
+        for tgt in targets[start:] + targets[:start]:
             if tgt.skip_cycles > 0:
                 tgt.skip_cycles -= 1
-                continue
+            else:
+                due.append(tgt)
+        for tgt in due:
+            if self._stop.is_set():
+                return None
             try:
                 foreign_claim = await tgt.client.claim_next(
                     tgt.task_types, worker_id=self.worker_id,
@@ -809,7 +1038,8 @@ class Worker:
             except Exception as e:  # noqa: BLE001
                 tgt.failures += 1
                 tgt.skip_cycles = min(
-                    2 ** tgt.failures, _FOREIGN_BACKOFF_MAX_CYCLES,
+                    2 ** min(tgt.failures, _FOREIGN_BACKOFF_MAX_EXP),
+                    _FOREIGN_BACKOFF_MAX_CYCLES,
                 )
                 log.warning(
                     "foreign claim failed against %s (%d consecutive; "
@@ -961,6 +1191,11 @@ class Worker:
             # block below always calls progress.stop(), so a failure in
             # prepare_inputs still tears the heartbeat down cleanly.
             await progress.start_heartbeat()
+
+            # A periodic sweep may already be removing this old path. Wait for
+            # it off-loop, then mark the path active before staging any files.
+            async with self._workdir_cleanup_lock:
+                self._active_task_dir = task_dir
 
             # Each attempt starts from a clean workdir. The finally block
             # below removes ``task_dir`` after every attempt, but a mid-task
@@ -1177,7 +1412,14 @@ class Worker:
             # delete — in hybrid mode that stalls the FastAPI app, and in any
             # mode it delays the next claim. ``ignore_errors=True`` keeps this
             # non-raising, so the semantics are unchanged.
-            await asyncio.to_thread(shutil.rmtree, task_dir, ignore_errors=True)
+            try:
+                await asyncio.to_thread(
+                    shutil.rmtree, task_dir, ignore_errors=True,
+                )
+            finally:
+                # This assignment must not await: cancellation during cleanup
+                # must not leave a dead task protected from future sweeps.
+                self._active_task_dir = None
 
 
 async def run_hybrid(

@@ -276,6 +276,47 @@ def _per_request_timeout(seconds: Optional[float]):
     return httpx.USE_CLIENT_DEFAULT if seconds is None else httpx.Timeout(seconds)
 
 
+def _validate_timeout_s(
+    name: str, value: Optional[float], *, allow_none: bool,
+) -> None:
+    """Validate one HTTP deadline knob, or raise ``ValueError``.
+
+    Every one of these is handed straight to ``httpx.Timeout``, which accepts
+    any float and turns each degenerate value into a different silent failure
+    — silent at construction, and only visible once the deadline it was meant
+    to impose is the thing standing between the worker and a wedged backend.
+    Consumers build them from the environment, so a typo'd value is a live
+    path, not a hypothetical:
+
+    * **NaN** becomes an anyio deadline of NaN, and every comparison against
+      NaN is False — so the deadline never fires and the request hangs
+      unbounded. That is exactly the hang ``_per_request_timeout``'s docstring
+      documents for a literal ``None``, reached through a different door: a
+      cancel poll that never returns leaves ``CancelGuard`` blind for the rest
+      of the task, a lifecycle write that never returns wedges the polling
+      loop while the sweeper reclaims the task.
+    * **inf** disables the deadline outright — the same unbounded request,
+      spelled as a number.
+    * **Negative** puts the deadline in the past, so *every* request fails
+      instantly: cancel polls always fail (the guard is blind again, this time
+      loudly), and lifecycle writes always fail — the terminal complete/fail
+      report is lost and the task is orphaned ``in_progress``.
+    * **0** is that same instant failure spelled as zero; unlike
+      ``retry_backoff_s=0`` there is nothing a caller can mean by it.
+
+    ``None`` is legal only where it is documented as the fall-back-to-the-
+    client's-own-timeout opt-out (file/cancel/lifecycle); ``timeout_s`` is the
+    client default itself and has nothing to fall back to.
+    """
+    if value is None and allow_none:
+        return
+    if value is None or not (math.isfinite(value) and value > 0):
+        hint = "; pass None to inherit the client's own timeout." if allow_none else ""
+        raise ValueError(
+            f"{name} must be a finite number > 0 (got {value!r}){hint}"
+        )
+
+
 async def _cancel_and_drain(task: "asyncio.Future") -> None:
     """Cancel ``task`` and wait for it to actually stop.
 
@@ -494,6 +535,15 @@ class BackendClient:
         # backend recovers. Default on; tests that assert on exact delays pass
         # retry_jitter=False.
         self.retry_jitter = retry_jitter
+        # All four HTTP deadlines are validated here, before the owned
+        # AsyncClient below exists: raising after constructing it would leak
+        # an unclosed client (and its connection pool) on every bad config.
+        _validate_timeout_s("timeout_s", timeout_s, allow_none=False)
+        _validate_timeout_s("file_timeout_s", file_timeout_s, allow_none=True)
+        _validate_timeout_s("cancel_timeout_s", cancel_timeout_s, allow_none=True)
+        _validate_timeout_s(
+            "lifecycle_timeout_s", lifecycle_timeout_s, allow_none=True,
+        )
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url,

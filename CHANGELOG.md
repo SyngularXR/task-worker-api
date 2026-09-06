@@ -9,6 +9,118 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `FakeBackendClient.complete` now runs the same encodability check as the
+  real `BackendClient.complete` and re-raises the encoder's own exception when
+  a result could not be sent. The real call raises while httpx *builds* the
+  request — nothing is transmitted — which is why `Worker` pre-checks and
+  converts it into a `fail()` report rather than orphaning the task
+  in_progress until the sweeper recomputes hours of GPU work. The fake
+  accepted any dict, so every consumer repo's handler unit tests passed on
+  results production rejects: a stray numpy scalar, `Path` or `datetime` only
+  surfaced on the box. The exception is passed through untouched — same class,
+  message and traceback as production (`TypeError` for a `Path`, `ValueError`
+  for a cycle, `UnicodeEncodeError` for an unpaired surrogate) — rather than
+  rebuilt, which cannot drift from the real client and cannot fail on a value
+  that is itself hostile to being formatted. Test suites
+  that were passing unencodable results will now fail — that is the signal;
+  fix the handler to return JSON types (`str(path)`, `dt.isoformat()`,
+  `float(np_value)`). Confined to test code: no runtime or wire behaviour
+  changes.
+
+  The check asks the installed httpx instead of restating its rules, so the
+  set it rejects tracks your pin, and the declared `httpx>=0.23` straddles a
+  real boundary: 0.28 encodes with `allow_nan=False, ensure_ascii=False`, so a
+  NaN metric and an unpaired surrogate raise there, while 0.23 — which
+  SynPusher still pins — emits a bare `NaN` literal and a `\ud800` escape and
+  sends both. The SDK's own tests for those two cases skip when the installed
+  httpx encodes them, since matching the real client is the contract; pin
+  httpx 0.28+ to have them caught.
+- `BackendClient.__init__` now validates its four HTTP deadline knobs —
+  `timeout_s`, `file_timeout_s`, `cancel_timeout_s`, `lifecycle_timeout_s` —
+  raising `ValueError` naming the knob instead of handing the value straight
+  to `httpx.Timeout`. Each degenerate value defeated the deadline it
+  configured, silently at construction: `NaN` becomes an anyio deadline whose
+  every comparison is False, so the request never times out — the same
+  unbounded hang `_per_request_timeout` documents for a literal `None`,
+  reached through a different door; `inf` disables the deadline outright; and
+  a negative or zero value puts it in the past, so *every* request fails
+  instantly — cancel polls always fail (`CancelGuard` blind for the whole
+  task) and lifecycle writes always fail (terminal report lost, task orphaned
+  `in_progress`). Consumers build these values from the environment, so a
+  typo'd `.env` entry was a live path to a wedged or orphaned task. `None`
+  remains legal for `file_timeout_s`/`cancel_timeout_s`/`lifecycle_timeout_s`
+  where it is documented as "fall back to the client's own timeout";
+  `timeout_s` is that client default and has nothing to fall back to. No
+  default changed, and the checks run before the owned `httpx.AsyncClient` is
+  built so a rejected config leaks no connection pool. The `Worker` forwards
+  these knobs into both its home and foreign clients, so the client-side check
+  covers both.
+- `Worker.run_forever` now runs its fatal startup check inside the guarded
+  region. The box-affinity verification ran after the periodic payload-log
+  cleanup task was created but before the `try`, so a mismatch — the
+  carefully-worded diagnostic for a typo'd `SYNPUSHER_URL` that would
+  otherwise route trusted shared-volume paths at a foreign box — escaped with
+  that task still pending, the home and every foreign client unclosed, and the
+  payload logger never closed. The operator saw "Task was destroyed but it is
+  pending" plus unclosed-socket warnings stacked on the one message that
+  mattered. The existing `finally` now does the teardown it was written for.
+- `Worker.__init__` now rejects duplicate foreign target URLs in
+  `SYNPUSHER_TARGETS`, raising `ProtocolError` naming the repeated URL. A
+  copy-pasted entry in a box's `.env.crossbox` built two `BackendClient`s
+  against one backend, doubling that box's claim traffic and connection count
+  every poll cycle and weighting it twice in the round-robin sweep. The home
+  box was already rejected; a repeat is now equally visible — the container
+  crash-loops instead of quietly double-polling. Both that check and the
+  existing home-box check now compare URLs canonicalised by `httpx.URL`
+  itself — the same resolution the client uses to dial, rather than a
+  hand-written restatement of it — so lower-cased scheme and host, the
+  scheme's default port dropped, `.`/`..` path segments resolved, the fragment
+  ignored, and IDNA-encoded hosts folded together. `HTTP://FAR/api/v1`,
+  `http://far:80/api/v1/`, `http://far/a/../api/v1`, `http://far/api/v1#frag`
+  and `http://FÄR/api/v1` are now all recognised as the one backend they
+  actually reach, instead of slipping past as distinct targets. URLs httpx
+  cannot parse are still compared verbatim. No wire or `SYNPUSHER_TARGETS`
+  format change.
+- Foreign target polling in `Worker._claim` is now round-robin instead of
+  fixed listed order. The sweep returns on the first successful claim, so with
+  two or more boxes in `SYNPUSHER_TARGETS` a target with a standing backlog
+  claimed every cycle and the targets after it were never polled at all — not
+  merely deprioritised. The start index now advances one step per cycle, so
+  each target gets first pick every `len(targets)` cycles, and home keeps its
+  first refusal every cycle. Per-target backoff is now charged once per poll
+  cycle rather than when the sweep reaches the target — since the sweep stops
+  at the first claim, a target behind a backlogged one is never reached, and
+  its counter would otherwise stall and stretch an N-cycle backoff to as much
+  as `N * len(targets)` cycles. The backoff exponent is also bounded:
+  `failures` increments forever against a permanently dead box, so
+  `2 ** failures` built an ever-wider throwaway integer every cycle even
+  though the result was always clamped to the 32-cycle ceiling. Worker-local
+  and additive — no wire or
+  `SYNPUSHER_TARGETS` format change.
+- `Worker` now reclaims orphaned `task_<id>` scratch directories at startup
+  and on the existing periodic cleanup timer. A process killed mid-task cannot
+  run its normal `finally` cleanup, so GB-scale staging trees previously
+  accumulated until operators removed them. Cleanup is deliberately narrow:
+  only directories directly under the configured work root whose entire tree
+  is older than 24 hours are removed; symlinks, active paths, newer trees, and
+  other names are left alone. The age floor is configurable with
+  `WORKER_WORKDIR_CLEANUP_MIN_AGE_S`. Active-path tracking is process-local, so
+  scaled replicas that share a work root must keep the floor at least as long
+  as their longest task duration.
+- Non-finite task timeouts are now rejected instead of silently disabling the
+  per-task watchdog. `WORKER_TASK_TIMEOUTS='gs_build=nan'` parsed cleanly
+  (`float('nan')` succeeds), `resolve_task_timeout` returned `NaN`, and
+  `_run_one`'s `timeout_s > 0` gate is `False` for `NaN` — so the watchdog was
+  never started and a wedged handler ran unbounded with no log line saying
+  why, on exactly the task types operators bother to configure timeouts for;
+  `inf` reached `TaskWatchdog` with a deadline that never arrives, for the
+  same effect. `parse_timeouts_env` now skips non-finite entries with the same
+  WARNING it already emits for malformed ones (so the documented default
+  applies instead), and the `Worker` constructor rejects non-finite
+  `task_timeout_s` / `task_timeouts` values with a `ValueError`, like its
+  pacing knobs. `<= 0` remains the documented "no timeout" escape hatch, and
+  ints keep working — only a consumer already passing a broken value sees the
+  new `ValueError`.
 - `Worker` now validates its remaining pacing knobs — `heartbeat_interval_s`,
   `cancel_poll_interval_s` and `timeout_grace_s` — through the same
   finite-and-positive guard that already covered `poll_interval_s` and

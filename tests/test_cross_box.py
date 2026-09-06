@@ -10,6 +10,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+import httpx
 import pytest
 
 from task_worker_api import (
@@ -29,6 +30,7 @@ from task_worker_api.files import (
     upload_outputs,
 )
 from task_worker_api.testing import FakeBackendClient
+from task_worker_api.worker import _canonical_url
 
 
 def _mi_task(params: dict, task_id: int = 1) -> ClaimedTask:
@@ -109,18 +111,97 @@ def test_parse_targets_malformed_fail_fast(raw):
 # ---------------------------------------------------------------------------
 
 
-def test_worker_rejects_home_url_listed_as_foreign(make_worker):
+def _target(url: str) -> ForeignTarget:
+    return ForeignTarget(
+        url=url,
+        api_key="k",
+        task_types=[TaskType.MODEL_INITIALIZING],
+        client=FakeBackendClient(),
+    )
+
+
+# Pairs httpx resolves to one backend: it lower-cases scheme and host,
+# IDNA-encodes the host, drops the scheme's default port, resolves ``.``/``..``
+# segments, and never sends the fragment. Every pair below therefore opens
+# connections to a single place, so both identity guards must reject it.
+# ``test_canonical_url_matches_httpx`` pins these against httpx itself.
+_EQUIVALENT = pytest.mark.parametrize("canonical,equivalent", [
+    ("http://far:5000/api/v1", "http://far:5000/api/v1/"),        # trailing slash
+    ("http://far:5000/api/v1", "HTTP://far:5000/api/v1"),         # upper scheme
+    ("http://far:5000/api/v1", "http://FAR:5000/api/v1"),         # upper host
+    ("http://far:5000/api/v1", "HTTP://FAR:5000/api/v1/"),        # all at once
+    ("http://far/api/v1", "http://far:80/api/v1"),                # default port
+    ("https://far:443/api/v1", "HTTPS://Far/api/v1/"),            # ditto, https
+    ("http://far:5000/api/v1", "http://far:5000/a/../api/v1"),    # dot segments
+    ("http://far:5000/api/v1", "http://far:5000/api/./v1"),       # single dot
+    ("http://far:5000/api/v1", "http://far:5000/api/v1#frag"),    # fragment
+    ("http://fär:5000/api/v1", "http://FÄR:5000/api/v1"),         # unicode host
+    ("http://fär:5000/api/v1", "http://xn--fr-via:5000/api/v1"),  # unicode/IDNA
+])
+
+
+@_EQUIVALENT
+def test_canonical_url_matches_httpx(canonical, equivalent):
+    # The guards are only as good as their agreement with the library that
+    # does the connecting, so compare against httpx's own resolution of each
+    # pair rather than against a hand-written expected string. The one place
+    # we are deliberately more lenient than httpx is the trailing slash — a
+    # backend root spelled with or without it is the same box to an operator —
+    # so strip that from the path before comparing.
+    assert _canonical_url(canonical) == _canonical_url(equivalent)
+    left, right = httpx.URL(canonical), httpx.URL(equivalent)
+    assert (left.scheme, left.raw_host, left.raw_path.rstrip(b"/")) == (
+        right.scheme, right.raw_host, right.raw_path.rstrip(b"/"),
+    )
+
+
+@_EQUIVALENT
+def test_worker_rejects_home_url_listed_as_foreign(
+    make_worker, canonical, equivalent,
+):
     with pytest.raises(ProtocolError, match="home box"):
         make_worker(
             handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
-            backend_url="http://home:5000/api/v1",
-            foreign_targets=[ForeignTarget(
-                url="http://home:5000/api/v1/",
-                api_key="k",
-                task_types=[TaskType.MODEL_INITIALIZING],
-                client=FakeBackendClient(),
-            )],
+            backend_url=canonical,
+            foreign_targets=[_target(equivalent)],
         )
+
+
+@_EQUIVALENT
+def test_worker_rejects_duplicate_foreign_url(
+    make_worker, canonical, equivalent,
+):
+    # A copy-pasted .env.crossbox entry would otherwise build two clients
+    # against one backend: double the claim traffic, double the round-robin
+    # weight.
+    with pytest.raises(ProtocolError, match="repeats target URL"):
+        make_worker(
+            handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+            backend_url="http://home:5000/api/v1",
+            foreign_targets=[_target(canonical), _target(equivalent)],
+        )
+
+
+def test_worker_accepts_distinct_backends_on_one_host(make_worker):
+    # Canonicalisation must not over-merge: a different port, scheme, path or
+    # IDNA host is a different backend and stays legal. The last two encode to
+    # xn--fr-via and xn--fr-xka — near-identical spellings, distinct hosts.
+    distinct = [
+        "http://far:5000/api/v1",
+        "http://far:5001/api/v1",
+        "https://far:5000/api/v1",
+        "http://far:5000/api/v2",
+        "http://far:5000/api/v1/sub",
+        "http://fär:5000/api/v1",
+        "http://für:5000/api/v1",
+    ]
+    worker = make_worker(
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        backend_url="http://home:5000/api/v1",
+        foreign_targets=[_target(u) for u in distinct],
+    )
+    assert len(worker._foreign_targets) == len(distinct)
+    assert len({_canonical_url(u) for u in distinct}) == len(distinct)
 
 
 def test_worker_rejects_target_with_no_handled_types(make_worker):
@@ -232,6 +313,108 @@ async def test_dead_foreign_target_backs_off_and_recovers(make_worker):
     # Cycle 4: backoff expired — dead is retried.
     await worker.run_one()
     assert record.count("dead") == 2
+
+
+class _BusyFake(_RecordingFake):
+    """A target with a standing backlog: every poll yields a task."""
+
+    async def claim_next(self, task_types, worker_id):
+        self._record.append(self._label)
+        return _mi_task({"job_id": "j", "base_name": "x",
+                         "input_files": {"x.stl": "x.stl"}})
+
+
+@pytest.mark.asyncio
+async def test_backlogged_foreign_target_does_not_starve_the_next(make_worker):
+    """Round-robin: a target that claims every cycle must not monopolise the
+    sweep. With a fixed order, ``quiet`` would never be polled at all."""
+    record: list[str] = []
+    home = _RecordingFake("home", record)
+    busy = _BusyFake("busy", record)
+    quiet = _RecordingFake("quiet", record)
+
+    worker = make_worker(
+        client=home,
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        foreign_targets=[
+            ForeignTarget(url="http://busy/api/v1", api_key="k1",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=busy),
+            ForeignTarget(url="http://quiet/api/v1", api_key="k2",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=quiet),
+        ],
+    )
+    for _ in range(4):
+        assert await worker._claim() is not None  # busy always has work
+
+    assert record == [
+        "home", "busy",           # cycle 1: starts at index 0
+        "home", "quiet", "busy",  # cycle 2: quiet gets first pick
+        "home", "busy",           # cycle 3: back to index 0
+        "home", "quiet", "busy",  # cycle 4
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backoff_advances_behind_a_backlogged_target(make_worker):
+    """Backoff is charged per poll cycle, not per target reached. ``busy``
+    claims every cycle and the sweep returns on the first claim, so ``dead``
+    is only reached on the cycles the rotation puts it first — its counter
+    must still advance on the cycles it isn't reached, or a recovered box
+    waits ``len(targets)`` times its backoff and the ceiling scales with
+    target count."""
+    record: list[str] = []
+    home = _RecordingFake("home", record)
+    dead = _DeadFake("dead", record)
+    busy = _BusyFake("busy", record)
+
+    worker = make_worker(
+        client=home,
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        foreign_targets=[
+            ForeignTarget(url="http://dead/api/v1", api_key="k1",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=dead),
+            ForeignTarget(url="http://busy/api/v1", api_key="k2",
+                          task_types=[TaskType.MODEL_INITIALIZING], client=busy),
+        ],
+    )
+    tgt = worker._foreign_targets[0]
+    # Cycle 1: dead raises → 2-cycle backoff; busy claims and ends the sweep.
+    assert await worker._claim() is not None
+    assert record == ["home", "dead", "busy"]
+    assert tgt.skip_cycles == 2
+    # Cycle 2 starts at busy, which claims before dead is ever reached — the
+    # counter must advance anyway. Same on cycle 3.
+    assert await worker._claim() is not None
+    assert tgt.skip_cycles == 1
+    assert await worker._claim() is not None
+    assert tgt.skip_cycles == 0  # due again, on schedule
+    assert record.count("dead") == 1
+    # Cycle 4 starts at busy again, so the retry lands on cycle 5, the next
+    # cycle the rotation gives dead first pick. Decrementing in-sweep instead
+    # stalled the counter every other cycle and pushed this out to cycle 7.
+    assert await worker._claim() is not None
+    assert record.count("dead") == 1
+    assert await worker._claim() is not None
+    assert record.count("dead") == 2
+
+
+@pytest.mark.asyncio
+async def test_foreign_backoff_exponent_stays_bounded(make_worker):
+    """A worker left running for days against a dead box keeps a small
+    exponent — the skip is the ceiling either way, the arithmetic isn't."""
+    record: list[str] = []
+    dead = _DeadFake("dead", record)
+    worker = make_worker(
+        client=_RecordingFake("home", record),
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        foreign_targets=[_foreign(dead)],
+    )
+    tgt = worker._foreign_targets[0]
+    tgt.failures = 100_000
+
+    assert await worker._claim() is None
+    assert tgt.failures == 100_001
+    assert tgt.skip_cycles == 32  # _FOREIGN_BACKOFF_MAX_CYCLES, as before
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +612,18 @@ async def test_upload_outputs_mode_rules(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-class _BoxIdFake(FakeBackendClient):
+class _ClosingFake(FakeBackendClient):
+    """Fake that records whether the worker closed it."""
+
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _BoxIdFake(_ClosingFake):
     def __init__(self, box_id):
         super().__init__()
         self._box_id = box_id
@@ -477,3 +671,29 @@ async def test_affinity_missing_sentinel_warns_only(make_worker, tmp_path, caplo
     with caplog.at_level(logging.WARNING):
         await worker._verify_home_affinity()
     assert any("no readable" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_run_forever_fatal_affinity_still_tears_down(make_worker, tmp_path):
+    """A fatal startup check must not skip the finally: the ProtocolError
+    surfaces alone, without a pending cleanup task, unclosed clients, or an
+    open payload logger."""
+    (tmp_path / ".box-id").write_text("box-A")
+    home = _BoxIdFake("box-B")
+    foreign = _ClosingFake()
+    worker = make_worker(
+        client=home,
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        shared_volume_path=str(tmp_path),
+        foreign_targets=[_foreign(foreign)],
+    )
+    logger_closed = []
+    worker._payload_logger.close = lambda: logger_closed.append(True)
+    before = asyncio.all_tasks()
+
+    with pytest.raises(ProtocolError, match="box-affinity check failed"):
+        await worker.run_forever()
+
+    assert asyncio.all_tasks() - before == set()   # cleanup task not left pending
+    assert home.closed and foreign.closed
+    assert logger_closed

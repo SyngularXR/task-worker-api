@@ -591,7 +591,14 @@ async def upload_outputs(
             raise
         return manifest
 
-    return {
+    manifest = {
         key: str(src)
         for key, (_, src) in output_sources.items()
     }
+    log.warning(
+        "task %s: local output paths %s will be deleted with the task "
+        "workdir; SHARED_VOLUME_PATH is not configured or wired to "
+        "Worker(shared_volume_path=...)",
+        task.id, list(manifest.values()),
+    )
+    return manifest
