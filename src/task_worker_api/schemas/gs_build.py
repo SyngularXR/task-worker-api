@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from ._base import TaskParamsBase
 from .spatial_reconstruction import SpatialReconstructionParams
@@ -73,3 +73,11 @@ class SpatialGsBuildParams(SpatialReconstructionParams):
     iterations: Optional[int] = Field(default=None, gt=0)
     max_image_size: Optional[int] = Field(default=None, gt=0)
     max_splats: Optional[int] = Field(default=None, gt=0)
+    input_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    input_manifest_sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def require_pinned_input_pair(self):
+        if (self.input_id is None) != (self.input_manifest_sha256 is None):
+            raise ValueError("input_id and input_manifest_sha256 must be supplied together")
+        return self

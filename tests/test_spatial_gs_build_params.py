@@ -28,6 +28,14 @@ def test_spatial_gs_build_schema_registered_and_roundtrips():
     assert SpatialGsBuildParams.model_validate(_payload()).iterations == 5_000
 
 
+def test_video_input_requires_id_and_manifest_checksum_together():
+    pinned = {**_payload(), "input_id": "a" * 64, "input_manifest_sha256": "b" * 64}
+    assert SpatialGsBuildParams.model_validate(pinned).input_id == "a" * 64
+    for missing in ("input_id", "input_manifest_sha256"):
+        with pytest.raises(ValidationError):
+            SpatialGsBuildParams.model_validate({key: value for key, value in pinned.items() if key != missing})
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
