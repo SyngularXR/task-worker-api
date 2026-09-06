@@ -12,6 +12,7 @@ from typing import Optional, TYPE_CHECKING
 from .context import ClaimedTask
 from .enums import TaskStatus, TaskType
 from .errors import TaskCancelled
+from .worker import _result_encode_exc
 
 if TYPE_CHECKING:  # pragma: no cover
     import asyncio
@@ -136,6 +137,27 @@ class FakeBackendClient:
         return await self.get_cancel_status(task_id)
 
     async def complete(self, task_id: int, result: dict) -> None:
+        """Capture a completion — after the real client's encodability check.
+
+        ``BackendClient.complete`` raises while httpx *builds* the request, so
+        a stray numpy scalar, ``Path`` or ``datetime`` in a handler's result
+        never reaches the wire; ``Worker`` pre-checks with the same call and
+        turns it into a ``fail()`` report rather than orphaning the task
+        in_progress. A fake that accepted any dict let handler unit tests pass
+        on results production refuses, so the encoder's own exception is
+        re-raised here instead — the same class, message and traceback the
+        real client would surface, with no reconstruction to drift from it.
+
+        What counts as unencodable is whatever the installed httpx says, not a
+        fixed list: the declared ``httpx>=0.23`` spans the 0.28 tightening to
+        ``allow_nan=False, ensure_ascii=False``, so NaN and unpaired
+        surrogates raise on 0.28 and encode fine on 0.23. Mirroring the real
+        client matters more than rejecting a fixed set — a check stricter than
+        the installed encoder would fail a result the backend would accept.
+        """
+        exc = _result_encode_exc(result)
+        if exc is not None:
+            raise exc
         self.completed_tasks.append({"task_id": task_id, "result": result})
 
     async def fail(self, task_id: int, error: str) -> None:

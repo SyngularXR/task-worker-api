@@ -9,6 +9,32 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `FakeBackendClient.complete` now runs the same encodability check as the
+  real `BackendClient.complete` and re-raises the encoder's own exception when
+  a result could not be sent. The real call raises while httpx *builds* the
+  request — nothing is transmitted — which is why `Worker` pre-checks and
+  converts it into a `fail()` report rather than orphaning the task
+  in_progress until the sweeper recomputes hours of GPU work. The fake
+  accepted any dict, so every consumer repo's handler unit tests passed on
+  results production rejects: a stray numpy scalar, `Path` or `datetime` only
+  surfaced on the box. The exception is passed through untouched — same class,
+  message and traceback as production (`TypeError` for a `Path`, `ValueError`
+  for a cycle, `UnicodeEncodeError` for an unpaired surrogate) — rather than
+  rebuilt, which cannot drift from the real client and cannot fail on a value
+  that is itself hostile to being formatted. Test suites
+  that were passing unencodable results will now fail — that is the signal;
+  fix the handler to return JSON types (`str(path)`, `dt.isoformat()`,
+  `float(np_value)`). Confined to test code: no runtime or wire behaviour
+  changes.
+
+  The check asks the installed httpx instead of restating its rules, so the
+  set it rejects tracks your pin, and the declared `httpx>=0.23` straddles a
+  real boundary: 0.28 encodes with `allow_nan=False, ensure_ascii=False`, so a
+  NaN metric and an unpaired surrogate raise there, while 0.23 — which
+  SynPusher still pins — emits a bare `NaN` literal and a `\ud800` escape and
+  sends both. The SDK's own tests for those two cases skip when the installed
+  httpx encodes them, since matching the real client is the contract; pin
+  httpx 0.28+ to have them caught.
 - `BackendClient.__init__` now validates its four HTTP deadline knobs —
   `timeout_s`, `file_timeout_s`, `cancel_timeout_s`, `lifecycle_timeout_s` —
   raising `ValueError` naming the knob instead of handing the value straight
