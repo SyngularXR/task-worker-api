@@ -261,6 +261,8 @@ export interface SpatialGsBuildParams {
   iterations?: number;
   max_image_size?: number;
   max_splats?: number;
+  input_id?: string;
+  input_manifest_sha256?: string;
 }
 
 
