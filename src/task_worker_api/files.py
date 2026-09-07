@@ -193,9 +193,12 @@ async def _mkdirs_async(*paths: Path) -> None:
     forward that second cancel to ``making`` and hand us back a "finished"
     future while its thread was still creating the directory.
 
-    A mkdir that *failed* still raises its own error, cancel or no cancel:
-    the caller's error handling for an unwritable volume must not depend on
-    whether a cancel happened to land during the syscall.
+    A cancel still wins over a mkdir that *failed* during it. Re-raising the
+    filesystem error instead would swallow the cancellation: ``_run_one``
+    catches ``PermissionError`` as an ordinary task failure and ``run_forever``
+    goes back to polling, leaving whoever cancelled us — ``run_hybrid``, the
+    watchdog — waiting on a worker that never stops. The uncancelled path
+    still reports the real error, which is where an unwritable volume shows up.
     """
     def _make() -> None:
         for path in paths:
@@ -210,11 +213,10 @@ async def _mkdirs_async(*paths: Path) -> None:
                 await asyncio.wait({making})
             except asyncio.CancelledError:
                 pass
-        # ``result()``, not ``exception()``: a mkdir that failed for a real
-        # filesystem reason (permissions, ENOSPC) must keep propagating as
-        # that error even when a cancel raced it — swallowing it here would
-        # report a full or unwritable volume as a plain cancellation.
-        making.result()
+        # ``exception()``, not ``result()``: retrieved so a failed mkdir does
+        # not surface as "Future exception was never retrieved", but dropped
+        # so the cancellation is what propagates.
+        making.exception()
         raise
 
 

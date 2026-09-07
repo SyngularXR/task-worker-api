@@ -1350,15 +1350,16 @@ async def test_staging_mkdir_completes_before_cancellation_propagates(
 
 
 @pytest.mark.asyncio
-async def test_staging_mkdir_failure_survives_a_racing_cancel(
+async def test_staging_mkdir_failure_does_not_mask_a_racing_cancel(
     tmp_path, monkeypatch,
 ):
-    """A mkdir that fails must report *its* error, even if a cancel raced it.
+    """A cancel must still propagate as a cancel when the mkdir also failed.
 
-    The drain has to retrieve the thread's result anyway; retrieving it as
-    ``exception()`` would discard a ``PermissionError`` (or ENOSPC) and hand
-    the caller a bare cancellation instead — an unwritable shared volume
-    misreported as "the task was cancelled".
+    The drain retrieves the thread's result, but must not re-raise it: a
+    ``PermissionError`` escaping here is caught by ``_run_one`` as an ordinary
+    task failure, so ``run_forever`` resumes polling and whoever cancelled the
+    worker (``run_hybrid``, the watchdog) waits on it forever. The uncancelled
+    path still raises the filesystem error — see the test below.
     """
     import asyncio
     import threading
@@ -1379,8 +1380,28 @@ async def test_staging_mkdir_failure_survives_a_racing_cancel(
     task.cancel()
     await asyncio.sleep(0)
     release.set()
-    with pytest.raises(PermissionError):
+    with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_staging_mkdir_failure_propagates_without_a_cancel(
+    tmp_path, monkeypatch,
+):
+    """Without a cancel, a failed mkdir reports its own error unchanged.
+
+    The cancel path drops it deliberately; this is the path an unwritable or
+    full shared volume actually takes, and it must stay a ``PermissionError``.
+    """
+    from task_worker_api import files as files_mod
+
+    def failing_mkdir(self, *args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    with pytest.raises(PermissionError):
+        await files_mod._mkdirs_async(tmp_path / "temp")
 
 
 @pytest.mark.asyncio
