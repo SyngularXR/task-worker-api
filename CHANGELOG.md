@@ -22,6 +22,18 @@
   successful poll resets the streak, keeping a transient blip at DEBUG.
   Mirrors the existing `ProgressReporter` heartbeat escalation. Logging only:
   poll cadence, the legacy-client fallback and cancel semantics are unchanged.
+- `prepare_inputs` and `upload_outputs` now run their last inline filesystem
+  calls off the event loop: the `in/`+`out/` mkdir pair and the `input_path`
+  `is_file` probe, and the output-source `resolve`/`lstat` walk plus the
+  staging-dir mkdir. Every other blocking call on this path was already
+  offloaded (`_copyfile_async`, download writes, the failure `rmtree`, the
+  workdir sweep); these stragglers still hit a network-mounted shared volume
+  inline, where one stalled syscall freezes the heartbeat and the
+  `CancelGuard` poll — the window the backend's stale-task sweeper reads as
+  abandonment. The mkdirs are shielded and awaited to completion before a
+  cancellation propagates, so an unwinding task cannot leave a worker thread
+  creating an orphan staging dir behind its own cleanup. No change to error
+  types, ordering, or the published manifest.
 - `FakeBackendClient.complete` now runs the same encodability check as the
   real `BackendClient.complete` and re-raises the encoder's own exception when
   a result could not be sent. The real call raises while httpx *builds* the
