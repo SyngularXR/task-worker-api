@@ -492,7 +492,13 @@ async def upload_outputs(
     outputs from the failed attempt would otherwise be orphans the
     backend's completed-task sweeper never reaches (it only sweeps staging
     dirs / accepts output manifests for tasks it recorded as complete).
-    Mirrors the ``BackendClient.download_file`` partial-file cleanup.
+    Mirrors the ``BackendClient.download_file`` partial-file cleanup —
+    including catching ``BaseException`` rather than ``Exception``, since
+    ``asyncio.CancelledError`` is not an ``Exception``: a worker shutdown
+    (``run_hybrid`` cancelling the worker task) or a watchdog unwind during
+    publishing would otherwise leave the GB-scale artifacts already copied
+    sitting in the staging dir forever. Both cleanups re-raise unchanged, so
+    which exceptions propagate is unaffected.
 
     Every filename in ``output_files`` must be a plain basename; one that
     isn't fails the task with a :class:`ProtocolError` naming its key. The
@@ -540,7 +546,7 @@ async def upload_outputs(
                     ),
                 )
                 uploaded.append(filename)
-        except Exception:
+        except BaseException:
             if uploaded:
                 log.warning(
                     "upload_outputs for task %s failed after publishing %d "
@@ -574,7 +580,7 @@ async def upload_outputs(
                     ),
                 )
                 manifest[key] = str(dest)
-        except Exception:
+        except BaseException:
             # A copy failed partway through — the staging dir holds a
             # subset of the outputs. Remove the whole staging dir so a
             # retried task starts clean and no orphaned partial artifacts
