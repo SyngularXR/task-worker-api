@@ -185,6 +185,13 @@ async def _mkdirs_async(*paths: Path) -> None:
     cancelled, so an unwinding task could race a directory into existence
     *after* its own cleanup ran, leaving an orphan staging dir on the shared
     volume that the backend's completed-task sweeper never reaches.
+
+    The drain survives *repeated* cancellation — shutdown landing on top of a
+    task timeout delivers a second ``cancel()``, and the mkdir thread itself
+    is not interruptible either way. So the drain loops, and waits with
+    :func:`asyncio.wait`, which observes without cancelling: ``gather`` would
+    forward that second cancel to ``making`` and hand us back a "finished"
+    future while its thread was still creating the directory.
     """
     def _make() -> None:
         for path in paths:
@@ -194,7 +201,12 @@ async def _mkdirs_async(*paths: Path) -> None:
     try:
         await asyncio.shield(making)
     except asyncio.CancelledError:
-        await asyncio.gather(making, return_exceptions=True)
+        while not making.done():
+            try:
+                await asyncio.wait({making})
+            except asyncio.CancelledError:
+                pass
+        making.exception()  # retrieved; an unwinding caller cannot act on it
         raise
 
 

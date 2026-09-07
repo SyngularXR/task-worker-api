@@ -1300,24 +1300,52 @@ async def test_staging_path_probes_run_off_the_event_loop(
     assert (shared / "temp" / "84" / "a.stl").read_bytes() == b"out"
 
 
+@pytest.mark.parametrize("cancels", [1, 3])
 @pytest.mark.asyncio
 async def test_staging_mkdir_completes_before_cancellation_propagates(
-    tmp_path,
+    tmp_path, monkeypatch, cancels,
 ):
     """A cancel racing the off-loop mkdir must not leave a worker thread
-    creating the staging dir after the task has unwound."""
+    creating the staging dir after the task has unwound.
+
+    ``cancels=3`` is the shutdown-on-top-of-timeout case: the extra
+    ``cancel()`` calls land while the drain is already waiting. They can
+    interrupt only that wait — the mkdir thread is not interruptible either
+    way — so the task still must not unwind until the dir is really there.
+    """
     import asyncio
+    import threading
     from task_worker_api import files as files_mod
+
+    # Pin the race open instead of racing the clock: the mkdir thread parks
+    # inside the syscall until the test releases it.
+    entered, release = threading.Event(), threading.Event()
+    real_mkdir = Path.mkdir
+
+    def blocking_mkdir(self, *args, **kwargs):
+        entered.set()
+        assert release.wait(5), "mkdir was never released"
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", blocking_mkdir)
 
     target = tmp_path / "temp" / "99"
     task = asyncio.ensure_future(files_mod._mkdirs_async(target))
-    await asyncio.sleep(0)
-    task.cancel()
+    assert await asyncio.to_thread(entered.wait, 5), "mkdir never started"
+
+    for _ in range(cancels):
+        task.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert not task.done(), "unwound while the mkdir thread was still running"
+
+    release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # The dir is either created before the cancel propagates or not at all —
-    # never created afterwards, behind the caller's back.
+    # Created before the cancel propagated — never afterwards, behind the
+    # back of a caller that has already run its cleanup.
     assert target.exists()
 
 
