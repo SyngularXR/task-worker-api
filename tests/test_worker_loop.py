@@ -877,19 +877,24 @@ async def test_cancel_guard_during_upload_no_false_cancel(
 
 
 class _CancelGuardPropagationClient(FakeBackendClient):
-    """FakeBackendClient that marks the task cancelled after the first
-    cancel-status poll, but whose report_progress (heartbeat) never
-    reports cancelled. This isolates the CancelGuard → ProgressReporter
-    link: if is_cancelled flips, it must be via the guard's event, not
-    the heartbeat."""
+    """FakeBackendClient that marks the task cancelled once the handler is
+    running, but whose report_progress (heartbeat) never reports cancelled.
+    This isolates the CancelGuard → ProgressReporter link: if is_cancelled
+    flips, it must be via the guard's event, not the heartbeat.
+
+    The cancel waits for ``handler_running`` because the guard starts before
+    prepare_inputs: a cancel reported while inputs are still staging aborts
+    prepare_inputs by design (that is the point of starting the guard early),
+    so the handler under test would never run."""
 
     def __init__(self) -> None:
         super().__init__()
         self._cancel_poll_count = 0
+        self.handler_running = asyncio.Event()
 
     async def get_cancel_status(self, task_id: int) -> dict:
         self._cancel_poll_count += 1
-        if self._cancel_poll_count >= 1:
+        if self.handler_running.is_set():
             self.cancelled_task_ids.add(task_id)
         return await super().get_cancel_status(task_id)
 
@@ -926,6 +931,7 @@ async def test_cancel_guard_propagates_to_progress_is_cancelled(
         # Poll is_cancelled in a tight loop (simulating a cooperative
         # handler between blocking ops). The CancelGuard polls at 0.01s;
         # it should flip is_cancelled well before this loop exhausts.
+        client.handler_running.set()
         for _ in range(100):
             if ctx.progress.is_cancelled:
                 saw_cancelled.set()

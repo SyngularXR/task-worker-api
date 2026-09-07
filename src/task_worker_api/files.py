@@ -172,6 +172,54 @@ def _require_output_sources(
     return sources
 
 
+async def _mkdirs_async(*paths: Path) -> None:
+    """``mkdir(parents=True, exist_ok=True)`` for each path, off the loop.
+
+    One dispatch for the whole group: on a network-mounted shared volume a
+    single ``mkdir`` can stall for seconds, and inline that freezes the
+    heartbeat and the ``CancelGuard`` poll — the exact window the backend's
+    stale-task sweeper reads as abandonment.
+
+    Shielded, and awaited to completion before a cancellation propagates: a
+    bare ``to_thread`` leaves the worker thread running after the await is
+    cancelled, so an unwinding task could race a directory into existence
+    *after* its own cleanup ran, leaving an orphan staging dir on the shared
+    volume that the backend's completed-task sweeper never reaches.
+
+    The drain survives *repeated* cancellation — shutdown landing on top of a
+    task timeout delivers a second ``cancel()``, and the mkdir thread itself
+    is not interruptible either way. So the drain loops, and waits with
+    :func:`asyncio.wait`, which observes without cancelling: ``gather`` would
+    forward that second cancel to ``making`` and hand us back a "finished"
+    future while its thread was still creating the directory.
+
+    A cancel still wins over a mkdir that *failed* during it. Re-raising the
+    filesystem error instead would swallow the cancellation: ``_run_one``
+    catches ``PermissionError`` as an ordinary task failure and ``run_forever``
+    goes back to polling, leaving whoever cancelled us — ``run_hybrid``, the
+    watchdog — waiting on a worker that never stops. The uncancelled path
+    still reports the real error, which is where an unwritable volume shows up.
+    """
+    def _make() -> None:
+        for path in paths:
+            path.mkdir(parents=True, exist_ok=True)
+
+    making = asyncio.ensure_future(asyncio.to_thread(_make))
+    try:
+        await asyncio.shield(making)
+    except asyncio.CancelledError:
+        while not making.done():
+            try:
+                await asyncio.wait({making})
+            except asyncio.CancelledError:
+                pass
+        # ``exception()``, not ``result()``: retrieved so a failed mkdir does
+        # not surface as "Future exception was never retrieved", but dropped
+        # so the cancellation is what propagates.
+        making.exception()
+        raise
+
+
 async def _copyfile_async(
     src: Path,
     dest: Path,
@@ -379,8 +427,7 @@ async def prepare_inputs(
     """
     in_dir = work_dir / "in"
     out_dir = work_dir / "out"
-    in_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    await _mkdirs_async(in_dir, out_dir)
 
     params = task.params or {}
     input_path = params.get("input_path")
@@ -396,7 +443,7 @@ async def prepare_inputs(
 
     if input_path:
         src = Path(input_path)
-        if not src.is_file():
+        if not await asyncio.to_thread(src.is_file):
             raise FileNotFoundError(f"input_path not accessible: {src}")
         dest = in_dir / src.name
         await _copyfile_async(
@@ -498,7 +545,9 @@ async def upload_outputs(
     (``run_hybrid`` cancelling the worker task) or a watchdog unwind during
     publishing would otherwise leave the GB-scale artifacts already copied
     sitting in the staging dir forever. Both cleanups re-raise unchanged, so
-    which exceptions propagate is unaffected.
+    which exceptions propagate is unaffected. In local mode the cleanup
+    covers the staging ``mkdir`` too, so a cancel that lands on it leaves no
+    empty orphan dir behind.
 
     Every filename in ``output_files`` must be a plain basename; one that
     isn't fails the task with a :class:`ProtocolError` naming its key. The
@@ -510,8 +559,11 @@ async def upload_outputs(
     safe_output_files = _require_safe_filenames(
         output_files, field="output_files",
     )
-    output_sources = _require_output_sources(
-        file_ctx.output_dir, safe_output_files,
+    # The whole walk (one ``resolve`` + ``lstat`` per declared output) goes
+    # off-loop in a single dispatch: it stats the handler's output dir on the
+    # same shared volume the copies below use.
+    output_sources = await asyncio.to_thread(
+        _require_output_sources, file_ctx.output_dir, safe_output_files,
     )
 
     # Publish over HTTP when the task was claimed from a foreign box, or when
@@ -564,9 +616,16 @@ async def upload_outputs(
         # mirror has an obvious place to rmdir once it has moved the
         # artifacts to their permanent home.
         dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
-        dest_dir.mkdir(parents=True, exist_ok=True)
         manifest: dict[str, str] = {}
         try:
+            # Inside the cleanup ``try``, not ahead of it: ``_mkdirs_async``
+            # drains its worker thread before letting a cancel propagate, so
+            # the dir really exists by the time we unwind. Created ahead of
+            # the ``try``, a cancel landing on that mkdir would skip the
+            # ``rmtree`` below and strand an empty staging dir on the shared
+            # volume — an orphan the backend's completed-task sweeper never
+            # reaches, since it only sweeps dirs for tasks recorded complete.
+            await _mkdirs_async(dest_dir)
             for key, (filename, src) in output_sources.items():
                 if cancelled is not None and cancelled.is_set():
                     raise TaskCancelled(
@@ -582,7 +641,8 @@ async def upload_outputs(
                 manifest[key] = str(dest)
         except BaseException:
             # A copy failed partway through — the staging dir holds a
-            # subset of the outputs. Remove the whole staging dir so a
+            # subset of the outputs — or a cancel landed on the mkdir
+            # itself, leaving it empty. Remove the whole staging dir so a
             # retried task starts clean and no orphaned partial artifacts
             # confuse the backend's sweep. The backend only sweeps staging
             # dirs for tasks it recorded as complete; a failed task's dir
