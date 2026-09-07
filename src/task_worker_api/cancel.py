@@ -125,8 +125,6 @@ async def CancelGuard(
         while not cancelled.is_set():
             try:
                 resp = await poll_status(task_id)
-                failures = 0
-                warn_at = _POLL_WARN_THRESHOLD
                 if resp.get("cancelled"):
                     cancelled.set()
                     if on_cancel is not None:
@@ -138,6 +136,12 @@ async def CancelGuard(
                                 task_id, e,
                             )
                     return
+                # Reset only once the response actually parsed: a backend
+                # stuck returning a malformed 200 (``[]``, a bare string)
+                # blinds the guard exactly like a connection error, so it
+                # must escalate rather than reset the streak every tick.
+                failures = 0
+                warn_at = _POLL_WARN_THRESHOLD
             except Exception as e:  # noqa: BLE001
                 failures += 1
                 if failures >= warn_at:

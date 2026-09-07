@@ -326,3 +326,14 @@ async def test_poll_failure_counter_resets_on_success(caplog):
     )
 
     assert [r.levelname for r in records] == ["DEBUG"] * 4
+
+
+@pytest.mark.asyncio
+async def test_warns_on_sustained_malformed_response(caplog):
+    """A backend stuck on a malformed 200 (``[]`` instead of the status
+    object) blinds the guard just like a connection error, so the streak
+    must survive the successful HTTP call and escalate."""
+    records = await _run_script([[], [], []], caplog)
+
+    assert [r.levelname for r in records] == ["DEBUG", "DEBUG", "WARNING"]
+    assert "3 consecutive failures" in records[-1].message
