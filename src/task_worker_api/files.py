@@ -535,7 +535,9 @@ async def upload_outputs(
     (``run_hybrid`` cancelling the worker task) or a watchdog unwind during
     publishing would otherwise leave the GB-scale artifacts already copied
     sitting in the staging dir forever. Both cleanups re-raise unchanged, so
-    which exceptions propagate is unaffected.
+    which exceptions propagate is unaffected. In local mode the cleanup
+    covers the staging ``mkdir`` too, so a cancel that lands on it leaves no
+    empty orphan dir behind.
 
     Every filename in ``output_files`` must be a plain basename; one that
     isn't fails the task with a :class:`ProtocolError` naming its key. The
@@ -604,9 +606,16 @@ async def upload_outputs(
         # mirror has an obvious place to rmdir once it has moved the
         # artifacts to their permanent home.
         dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
-        await _mkdirs_async(dest_dir)
         manifest: dict[str, str] = {}
         try:
+            # Inside the cleanup ``try``, not ahead of it: ``_mkdirs_async``
+            # drains its worker thread before letting a cancel propagate, so
+            # the dir really exists by the time we unwind. Created ahead of
+            # the ``try``, a cancel landing on that mkdir would skip the
+            # ``rmtree`` below and strand an empty staging dir on the shared
+            # volume — an orphan the backend's completed-task sweeper never
+            # reaches, since it only sweeps dirs for tasks recorded complete.
+            await _mkdirs_async(dest_dir)
             for key, (filename, src) in output_sources.items():
                 if cancelled is not None and cancelled.is_set():
                     raise TaskCancelled(
@@ -622,7 +631,8 @@ async def upload_outputs(
                 manifest[key] = str(dest)
         except BaseException:
             # A copy failed partway through — the staging dir holds a
-            # subset of the outputs. Remove the whole staging dir so a
+            # subset of the outputs — or a cancel landed on the mkdir
+            # itself, leaving it empty. Remove the whole staging dir so a
             # retried task starts clean and no orphaned partial artifacts
             # confuse the backend's sweep. The backend only sweeps staging
             # dirs for tasks it recorded as complete; a failed task's dir

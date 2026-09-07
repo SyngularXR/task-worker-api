@@ -1349,6 +1349,60 @@ async def test_staging_mkdir_completes_before_cancellation_propagates(
     assert target.exists()
 
 
+@pytest.mark.asyncio
+async def test_staging_mkdir_cancel_leaves_no_orphan_staging_dir(
+    tmp_path, monkeypatch,
+):
+    """A cancel landing on the staging mkdir must still clean the dir up.
+
+    ``_mkdirs_async`` guarantees the dir exists once the cancel propagates,
+    which is exactly why the mkdir has to sit *inside* ``upload_outputs``'
+    cleanup ``try``: ahead of it, the unwind skips the ``rmtree`` and strands
+    an empty ``temp/{task_id}/`` on the shared volume that the backend's
+    completed-task sweeper never reaches.
+    """
+    import asyncio
+    import threading
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"out")
+
+    # Park only the staging mkdir, so the race is pinned open rather than
+    # raced against the clock; every other mkdir runs normally.
+    dest_dir = shared / "temp" / "99"
+    entered, release = threading.Event(), threading.Event()
+    real_mkdir = Path.mkdir
+
+    def blocking_mkdir(self, *args, **kwargs):
+        if self == dest_dir:
+            entered.set()
+            assert release.wait(5), "mkdir was never released"
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", blocking_mkdir)
+
+    publishing = asyncio.ensure_future(upload_outputs(
+        _claimed(99, params={"input_path": "/ignored"}),
+        FakeBackendClient(), _file_ctx(out_dir),
+        output_files={"a": "a.stl"},
+        shared_volume_path=str(shared),
+    ))
+    assert await asyncio.to_thread(entered.wait, 5), (
+        "staging mkdir never started"
+    )
+
+    publishing.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await publishing
+
+    assert not dest_dir.exists(), (
+        "cancel during the staging mkdir left an orphan staging dir"
+    )
+
+
 # ---------------------------------------------------------------------------#
 # Path-traversal guard — ``input_files`` / ``output_files`` names are joined
 # into per-task sandbox dirs, so an unchecked name escaped them entirely:
