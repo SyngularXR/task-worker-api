@@ -1350,6 +1350,40 @@ async def test_staging_mkdir_completes_before_cancellation_propagates(
 
 
 @pytest.mark.asyncio
+async def test_staging_mkdir_failure_survives_a_racing_cancel(
+    tmp_path, monkeypatch,
+):
+    """A mkdir that fails must report *its* error, even if a cancel raced it.
+
+    The drain has to retrieve the thread's result anyway; retrieving it as
+    ``exception()`` would discard a ``PermissionError`` (or ENOSPC) and hand
+    the caller a bare cancellation instead — an unwritable shared volume
+    misreported as "the task was cancelled".
+    """
+    import asyncio
+    import threading
+    from task_worker_api import files as files_mod
+
+    entered, release = threading.Event(), threading.Event()
+
+    def failing_mkdir(self, *args, **kwargs):
+        entered.set()
+        assert release.wait(5), "mkdir was never released"
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    task = asyncio.ensure_future(files_mod._mkdirs_async(tmp_path / "temp"))
+    assert await asyncio.to_thread(entered.wait, 5), "mkdir never started"
+
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(PermissionError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_staging_mkdir_cancel_leaves_no_orphan_staging_dir(
     tmp_path, monkeypatch,
 ):

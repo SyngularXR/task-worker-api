@@ -192,6 +192,10 @@ async def _mkdirs_async(*paths: Path) -> None:
     :func:`asyncio.wait`, which observes without cancelling: ``gather`` would
     forward that second cancel to ``making`` and hand us back a "finished"
     future while its thread was still creating the directory.
+
+    A mkdir that *failed* still raises its own error, cancel or no cancel:
+    the caller's error handling for an unwritable volume must not depend on
+    whether a cancel happened to land during the syscall.
     """
     def _make() -> None:
         for path in paths:
@@ -206,7 +210,11 @@ async def _mkdirs_async(*paths: Path) -> None:
                 await asyncio.wait({making})
             except asyncio.CancelledError:
                 pass
-        making.exception()  # retrieved; an unwinding caller cannot act on it
+        # ``result()``, not ``exception()``: a mkdir that failed for a real
+        # filesystem reason (permissions, ENOSPC) must keep propagating as
+        # that error even when a cancel raced it — swallowing it here would
+        # report a full or unwritable volume as a plain cancellation.
+        making.result()
         raise
 
 
