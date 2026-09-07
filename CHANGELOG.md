@@ -9,6 +9,16 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- A task interrupted by worker shutdown now reports a diagnosable terminal
+  reason instead of `unknown`. `asyncio.CancelledError` is a `BaseException`,
+  so none of `_run_one`'s handlers caught it and the `finally` reported the
+  seeded placeholder — and `run_hybrid` cancels the worker task whenever the
+  app side exits, so *every* task interrupted by a deploy (uvicorn shutdown,
+  container stop) landed on the backend, and in the UI, with `unknown` as its
+  failure reason. Cancellation now sets `worker task cancelled while
+  processing` and re-raises, and the placeholder is reworded to name the path
+  it actually represents (an exit through a `BaseException` nothing catches).
+  No change to whether a terminal report is sent, or to the status on the wire.
 - `prepare_inputs` and `upload_outputs` now run their last inline filesystem
   calls off the event loop: the `in/`+`out/` mkdir pair and the `input_path`
   `is_file` probe, and the output-source `resolve`/`lstat` walk plus the

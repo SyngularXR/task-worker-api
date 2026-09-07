@@ -1338,3 +1338,39 @@ async def test_heartbeat_stopped_when_worker_cancelled_mid_report(
     assert len(client.progress_events) == settled, (
         "heartbeat leaked past a cancelled terminal report"
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_worker_reports_shutdown_reason(
+    make_worker, fake_client, tmp_path,
+):
+    """A task killed by cancelling the worker task (run_hybrid on uvicorn
+    exit / container stop) must land terminal with a reason that names it,
+    not the seeded placeholder."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    fake_client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    in_handler = asyncio.Event()
+
+    async def handler(ctx, params):
+        in_handler.set()
+        await asyncio.sleep(60)
+        return {}  # pragma: no cover — cancelled first
+
+    worker = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+    )
+    run = asyncio.create_task(worker.run_one())
+    await asyncio.wait_for(in_handler.wait(), timeout=5)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    assert fake_client.completed_tasks == []
+    assert len(fake_client.failed_tasks) == 1
+    error = fake_client.failed_tasks[0]["error"]
+    assert error == "worker task cancelled while processing", error
