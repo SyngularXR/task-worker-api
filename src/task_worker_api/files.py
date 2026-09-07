@@ -172,6 +172,32 @@ def _require_output_sources(
     return sources
 
 
+async def _mkdirs_async(*paths: Path) -> None:
+    """``mkdir(parents=True, exist_ok=True)`` for each path, off the loop.
+
+    One dispatch for the whole group: on a network-mounted shared volume a
+    single ``mkdir`` can stall for seconds, and inline that freezes the
+    heartbeat and the ``CancelGuard`` poll — the exact window the backend's
+    stale-task sweeper reads as abandonment.
+
+    Shielded, and awaited to completion before a cancellation propagates: a
+    bare ``to_thread`` leaves the worker thread running after the await is
+    cancelled, so an unwinding task could race a directory into existence
+    *after* its own cleanup ran, leaving an orphan staging dir on the shared
+    volume that the backend's completed-task sweeper never reaches.
+    """
+    def _make() -> None:
+        for path in paths:
+            path.mkdir(parents=True, exist_ok=True)
+
+    making = asyncio.ensure_future(asyncio.to_thread(_make))
+    try:
+        await asyncio.shield(making)
+    except asyncio.CancelledError:
+        await asyncio.gather(making, return_exceptions=True)
+        raise
+
+
 async def _copyfile_async(
     src: Path,
     dest: Path,
@@ -379,8 +405,7 @@ async def prepare_inputs(
     """
     in_dir = work_dir / "in"
     out_dir = work_dir / "out"
-    in_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    await _mkdirs_async(in_dir, out_dir)
 
     params = task.params or {}
     input_path = params.get("input_path")
@@ -396,7 +421,7 @@ async def prepare_inputs(
 
     if input_path:
         src = Path(input_path)
-        if not src.is_file():
+        if not await asyncio.to_thread(src.is_file):
             raise FileNotFoundError(f"input_path not accessible: {src}")
         dest = in_dir / src.name
         await _copyfile_async(
@@ -510,8 +535,11 @@ async def upload_outputs(
     safe_output_files = _require_safe_filenames(
         output_files, field="output_files",
     )
-    output_sources = _require_output_sources(
-        file_ctx.output_dir, safe_output_files,
+    # The whole walk (one ``resolve`` + ``lstat`` per declared output) goes
+    # off-loop in a single dispatch: it stats the handler's output dir on the
+    # same shared volume the copies below use.
+    output_sources = await asyncio.to_thread(
+        _require_output_sources, file_ctx.output_dir, safe_output_files,
     )
 
     # Publish over HTTP when the task was claimed from a foreign box, or when
@@ -564,7 +592,7 @@ async def upload_outputs(
         # mirror has an obvious place to rmdir once it has moved the
         # artifacts to their permanent home.
         dest_dir = Path(shared_volume_path) / "temp" / str(task.id)
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        await _mkdirs_async(dest_dir)
         manifest: dict[str, str] = {}
         try:
             for key, (filename, src) in output_sources.items():

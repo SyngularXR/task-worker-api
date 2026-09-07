@@ -1247,6 +1247,81 @@ async def test_local_mode_staging_cleanup_runs_off_the_event_loop(
 
 
 # ---------------------------------------------------------------------------#
+# The staging/publish path's remaining probes run off the event loop.
+#
+# ``prepare_inputs``' in/out mkdir pair and ``input_path`` is_file probe, and
+# ``upload_outputs``' output-source resolve/lstat walk and staging-dir mkdir,
+# all hit the network-mounted shared volume. Inline, one stalled syscall
+# freezes the heartbeat and the CancelGuard poll — the window the backend's
+# stale-task sweeper reads as abandonment.
+# ---------------------------------------------------------------------------#
+
+
+@pytest.mark.asyncio
+async def test_staging_path_probes_run_off_the_event_loop(
+    tmp_path, monkeypatch,
+):
+    """mkdir / is_file / lstat must all run in a worker thread, with the
+    published manifest unchanged."""
+    import threading
+    from task_worker_api import files as files_mod
+
+    loop_thread = threading.current_thread()
+    seen: list[tuple[str, threading.Thread]] = []
+
+    def spy(name, real):
+        def wrapper(self, *args, **kwargs):
+            seen.append((name, threading.current_thread()))
+            return real(self, *args, **kwargs)
+        return wrapper
+
+    shared = tmp_path / "shared"
+    src = shared / "in.stl"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"mesh")
+
+    monkeypatch.setattr(Path, "mkdir", spy("mkdir", Path.mkdir))
+    monkeypatch.setattr(Path, "is_file", spy("is_file", Path.is_file))
+    monkeypatch.setattr(Path, "lstat", spy("lstat", Path.lstat))
+
+    task = _claimed(84, params={"input_path": str(src)})
+    ctx = await prepare_inputs(task, FakeBackendClient(), tmp_path / "work")
+    (ctx.output_dir / "a.stl").write_bytes(b"out")
+    manifest = await upload_outputs(
+        task, FakeBackendClient(), ctx,
+        output_files={"a": "a.stl"},
+        shared_volume_path=str(shared),
+    )
+
+    assert {name for name, _ in seen} == {"mkdir", "is_file", "lstat"}
+    on_loop = sorted({name for name, thread in seen if thread is loop_thread})
+    assert not on_loop, f"ran on the event loop thread: {on_loop}"
+    assert manifest == {"a": str(shared / "temp" / "84" / "a.stl")}
+    assert (shared / "temp" / "84" / "a.stl").read_bytes() == b"out"
+
+
+@pytest.mark.asyncio
+async def test_staging_mkdir_completes_before_cancellation_propagates(
+    tmp_path,
+):
+    """A cancel racing the off-loop mkdir must not leave a worker thread
+    creating the staging dir after the task has unwound."""
+    import asyncio
+    from task_worker_api import files as files_mod
+
+    target = tmp_path / "temp" / "99"
+    task = asyncio.ensure_future(files_mod._mkdirs_async(target))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The dir is either created before the cancel propagates or not at all —
+    # never created afterwards, behind the caller's back.
+    assert target.exists()
+
+
+# ---------------------------------------------------------------------------#
 # Path-traversal guard — ``input_files`` / ``output_files`` names are joined
 # into per-task sandbox dirs, so an unchecked name escaped them entirely:
 # ``in_dir / "../../x"`` writes onto the worker host, ``out_dir /
