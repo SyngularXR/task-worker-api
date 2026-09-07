@@ -9,6 +9,19 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `CancelGuard` now escalates a sustained cancel-poll failure from DEBUG to
+  WARNING. Every poll exception was swallowed at DEBUG forever, so a
+  permanently failing poll — a rotated API key (401), a 404 after the sweeper
+  reclaimed the task, a drifted base URL — left the guard blind for the whole
+  task with nothing above DEBUG saying why: the `cancelled` event never set,
+  `on_cancel` never terminated the Blender/colmap subprocess, and the
+  download/upload cancel aborts never fired, so a cancelled 3-hour cinematic
+  bake ran to completion. Three consecutive failures now log a WARNING naming
+  the task and the streak, and each doubling after that (3, 6, 12, ...) logs
+  again, so a long task gets escalation without a WARNING every 2s. Any
+  successful poll resets the streak, keeping a transient blip at DEBUG.
+  Mirrors the existing `ProgressReporter` heartbeat escalation. Logging only:
+  poll cadence, the legacy-client fallback and cancel semantics are unchanged.
 - `FakeBackendClient.complete` now runs the same encodability check as the
   real `BackendClient.complete` and re-raises the encoder's own exception when
   a result could not be sent. The real call raises while httpx *builds* the

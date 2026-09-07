@@ -32,6 +32,16 @@ log = logging.getLogger(__name__)
 #: of every task the worker runs.
 _warned_legacy_cancel_client = False
 
+#: Consecutive failed cancel polls before the per-tick DEBUG line escalates to
+#: WARNING. A single blip during a long task is noise; a *sustained* failure
+#: (rotated API key, 404 after the sweeper reclaimed the task, drifted base
+#: URL) means the guard is blind for the rest of the task — the ``cancelled``
+#: event never sets, ``on_cancel`` never terminates the subprocess, and the
+#: file-transfer aborts never fire. Mirrors ``ProgressReporter``'s heartbeat
+#: escalation; not a ``Worker`` knob because there is nothing to tune per
+#: deployment.
+_POLL_WARN_THRESHOLD = 3
+
 
 def _cancel_status_poller(client: "BackendClient"):
     """``client.poll_cancel_status`` if it has one, else ``get_cancel_status``.
@@ -107,9 +117,16 @@ async def CancelGuard(
     poll_status = _cancel_status_poller(client)
 
     async def _poll():
+        failures = 0
+        # Escalate at 3 consecutive failures, then at each doubling (3, 6,
+        # 12, ...) — a 3-hour task polling every 2s would otherwise emit a
+        # WARNING every tick once the backend goes bad.
+        warn_at = _POLL_WARN_THRESHOLD
         while not cancelled.is_set():
             try:
                 resp = await poll_status(task_id)
+                failures = 0
+                warn_at = _POLL_WARN_THRESHOLD
                 if resp.get("cancelled"):
                     cancelled.set()
                     if on_cancel is not None:
@@ -122,10 +139,20 @@ async def CancelGuard(
                             )
                     return
             except Exception as e:  # noqa: BLE001
-                log.debug(
-                    "cancel poll failed for task %s: %s",
-                    task_id, e,
-                )
+                failures += 1
+                if failures >= warn_at:
+                    warn_at = failures * 2
+                    log.warning(
+                        "cancel poll failed for task %s (%d consecutive "
+                        "failures) — a cancel will go undetected until "
+                        "polling recovers: %s",
+                        task_id, failures, e,
+                    )
+                else:
+                    log.debug(
+                        "cancel poll failed for task %s: %s",
+                        task_id, e,
+                    )
             try:
                 await asyncio.sleep(poll_interval_s)
             except asyncio.CancelledError:
