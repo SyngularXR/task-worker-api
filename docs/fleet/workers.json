@@ -48,7 +48,7 @@
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility",
-      "notes": "Hybrid mode runs --workers 1 because one process owns the GPU model cache. Spatial reconstruction stays fail-closed until the v0.14.0 wheel is published and the BM03 Gate 0B profile passes."
+      "notes": "Hybrid mode runs --workers 1 because one process owns the GPU model cache. Local/development spatial capture uses SPATIAL_CAPTURE_DA3_CONFIG=/app/configs/spatial_capture_quick_roi.yaml with profile da3-large-quick-roi-5-1260, process_res=1260, and five views per task/window. Backend and worker profiles must match; production remains disabled until its profile is validated."
     },
     {
       "id": "blender-worker",
