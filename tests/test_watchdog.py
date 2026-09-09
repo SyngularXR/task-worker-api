@@ -228,6 +228,28 @@ def test_sync_fail_exception_does_not_block_hard_exit(caplog):
     assert any("sync_fail failed" in r.message for r in caplog.records)
 
 
+def test_hung_failure_report_cannot_prevent_hard_exit():
+    entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+
+    def hung_report(error):
+        entered.set()
+        release.wait()
+
+    wd = TaskWatchdog(
+        timeout_s=0.01, grace_s=0.02, guard=TerminalGuard(),
+        sync_fail=hung_report, on_hard_exit=exited.set,
+        children_before=set(), list_descendants_fn=lambda pid: set(),
+        kill_fn=lambda procs, sig: None, tick_s=0.005,
+    )
+    try:
+        wd.start()
+        assert entered.wait(1), "watchdog never reached its failure report"
+        assert exited.wait(1), "a hung report prevented worker termination"
+    finally:
+        release.set()
+        wd._thread.join(timeout=2)
+
+
 # ----- _read_stat / list_descendants / kill_procs unit tests ----------------
 #
 # These exercise the /proc parsing logic without a real Linux process tree,

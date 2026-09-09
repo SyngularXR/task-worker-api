@@ -33,7 +33,7 @@ def generated_ts(gen_module) -> str:
 def test_gs4d_build_in_task_params_by_type(generated_ts):
     """Both gs_build and gs4d_build must appear in the dispatch map."""
     assert "'gs_build': GsBuildParams;" in generated_ts
-    assert "'gs4d_build': GsBuildParams;" in generated_ts
+    assert "'gs4d_build': Gs4dBuildParams;" in generated_ts
 
 
 def test_no_duplicate_interface_for_alias(generated_ts):

@@ -48,7 +48,7 @@
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility",
-      "notes": "Hybrid mode runs --workers 1 because one process owns the GPU model cache. Local/development spatial capture uses SPATIAL_CAPTURE_DA3_CONFIG=/app/configs/spatial_capture_quick_roi.yaml with profile da3-large-quick-roi-5-1260, process_res=1260, and five views per task/window. Backend and worker profiles must match; production remains disabled until its profile is validated."
+      "notes": "Hybrid mode runs --workers 1 because one process owns the GPU model cache. Local/development spatial capture uses SPATIAL_CAPTURE_DA3_CONFIG=/app/configs/spatial_capture_quick_roi.yaml with profile da3-large-quick-roi-5-1260, process_res=1260, and five views per task/window. Backend and worker profiles must match; production remains disabled until its profile is validated. Basic admission is deployed on localhost and S4 with SDK dev35 and the documented host overlay: frozen inputs, owned uploads and verified cleanup. Further measurements use normal workloads."
     },
     {
       "id": "blender-worker",
@@ -88,7 +88,7 @@
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility,graphics",
-      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; Blender-CLI keeps compatible local schema extensions until the v0.12.0 wheel is pinned. QRemeshify is an optional GPL-3.0-or-later external runtime mounted read-only; it is not bundled in the MIT worker image."
+      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; Blender-CLI keeps compatible local schema extensions until the v0.12.0 wheel is pinned. QRemeshify is an optional GPL-3.0-or-later external runtime mounted read-only; it is not bundled in the MIT worker image. Basic admission is deployed on localhost and S4 with SDK dev35 and the documented host overlay: frozen inputs, owned uploads and verified cleanup. Further measurements use normal workloads."
     },
     {
       "id": "assetbundle-builder-worker",
@@ -155,7 +155,7 @@
       "scaling": "horizontal",
       "scaling_command": "docker compose up --scale colmap-splat-worker=N",
       "gpu": "compute,utility",
-      "notes": "Per-process payload-log filenames (PID + 8-char boot id) ensure scaled replicas with one shared WORKER_ID don't corrupt JSONL via interleaved appends."
+      "notes": "Per-process payload-log filenames (PID + 8-char boot id) ensure scaled replicas with one shared WORKER_ID don't corrupt JSONL via interleaved appends. Basic admission is deployed on localhost and S4 with SDK dev35 and the documented host overlay: frozen inputs, owned uploads and verified cleanup. Further measurements use normal workloads."
     }
   ],
   "deployment": {

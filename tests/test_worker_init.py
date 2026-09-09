@@ -27,12 +27,11 @@ async def _noop_handler(ctx, params):  # pragma: no cover — never invoked
 
 
 def test_worker_init_rejects_handler_without_registered_schema(make_worker, noop_handler):
-    """RENDER and APPLE_ML_GS are deferred per schemas/__init__.py — a Worker
-    that registers a handler for one of them must fail at construction."""
+    """APPLE_ML_GS has no schema yet and must fail at construction."""
     with pytest.raises(ProtocolError) as exc_info:
-        make_worker(handlers={TaskType.RENDER: noop_handler})
+        make_worker(handlers={TaskType.APPLE_ML_GS: noop_handler})
     assert "no schema registered" in str(exc_info.value)
-    assert TaskType.RENDER.value in str(exc_info.value)
+    assert TaskType.APPLE_ML_GS.value in str(exc_info.value)
 
 
 def test_worker_init_accepts_handlers_with_registered_schemas(make_worker):

@@ -14,6 +14,7 @@ Two modes of use:
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import math
@@ -21,7 +22,9 @@ import os
 import random
 import re
 import shutil
+import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.parse
@@ -47,6 +50,57 @@ from .watchdog import TaskWatchdog, TerminalGuard, list_descendants
 log = logging.getLogger(__name__)
 
 HandlerFn = Callable[[TaskContext, TaskParamsBase], Awaitable[dict]]
+
+
+async def _cuda_cleanup_with_timeout(timeout_s: float) -> bool:
+    """Evict unused allocator storage; live tensors require process termination.
+
+    Never import/initialize CUDA for CPU workers. Every CUDA call runs in a daemon
+    thread: a wedged driver cannot block the event loop or interpreter shutdown.
+    This is a worker health check, not supervisor proof that a GPU is released.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return True
+    done = threading.Event()
+    clean = False
+
+    def cleanup():
+        nonlocal clean
+        try:
+            if not torch.cuda.is_initialized():
+                clean = True
+                return
+            gc.collect()
+            for device in range(torch.cuda.device_count()):
+                with torch.cuda.device(device):
+                    torch.cuda.synchronize(device)
+            # cuBLAS workspaces survive empty_cache even after every tensor dies.
+            # Synchronize all devices before clearing the process-wide pool.
+            torch._C._cuda_clearCublasWorkspaces()
+            for device in range(torch.cuda.device_count()):
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+                    allocated = torch.cuda.memory_allocated(device)
+                    reserved = torch.cuda.memory_reserved(device)
+                    if allocated or reserved:
+                        log.warning("CUDA cleanup retained storage on device %s: allocated=%s reserved=%s bytes",
+                                    device, allocated, reserved)
+                        return
+            clean = True
+        except Exception:
+            log.exception("CUDA cleanup failed; worker must exit before another claim")
+        finally:
+            done.set()
+
+    deadline = time.monotonic() + timeout_s
+    threading.Thread(target=cleanup, name="cuda-cleanup", daemon=True).start()
+    while not done.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.05, remaining))
+    return clean
 
 # Default ceiling for the escalated idle wait between poll cycles after
 # consecutive claim failures. ``BackendClient._retry`` already backs off
@@ -467,6 +521,7 @@ class Worker:
         self.api_key = api_key
         self.worker_id = worker_id
         self.handlers = handlers
+        self._admission_journal = None
         self.work_dir = Path(
             work_dir or os.environ.get("WORKER_WORKDIR") or tempfile.gettempdir()
         )
@@ -500,6 +555,7 @@ class Worker:
             "timeout_grace_s", timeout_grace_s,
         )
         self._on_hard_exit = on_hard_exit or (lambda: os._exit(75))
+        self._cleanup_failed = False
         self._timeout_env = parse_timeouts_env(os.environ.get("WORKER_TASK_TIMEOUTS"))
         self._watchdog_factory = _watchdog_factory
         self._active_task_dir: Optional[Path] = None
@@ -944,6 +1000,62 @@ class Worker:
         await self._run_one(task, target)
         return True
 
+    async def run_admitted_attempt(self, claim, journal, read_report):
+        """Execute one supervised v2 claim; leave journal/artifacts for reconciliation.
+
+        The supervisor supplies the assigned process/device scope and later proves
+        cleanup. This entry point never polls legacy routes or claims another task.
+        """
+        from .resource_execution import AttemptLease
+        from .resources import ClaimResult
+        from .files import prepare_admitted_inputs, _require_safe_filenames, _require_output_sources
+
+        if self._foreign_targets or os.environ.get("SYNPUSHER_TARGETS", "").strip():
+            raise ProtocolError("admitted workers cannot serve foreign authorities")
+        if self._cleanup_failed or (self._admission_journal is not None and self._admission_journal.pending() is not None):
+            raise ProtocolError("previous attempt requires supervisor reconciliation")
+        pending = journal.pending()
+        if not pending or not pending[1] or not pending[1]["claim"] or ClaimResult.model_validate(pending[1]["claim"]) != claim:
+            raise ProtocolError("execution requires the durable admitted claim")
+        self._admission_journal = journal
+        client = self._home_target.client
+        async with AttemptLease(client, journal, claim, grace_s=self.timeout_grace_s,
+                                on_hard_exit=self._on_hard_exit) as lease:
+            try:
+                try:
+                    task = ClaimedTask.from_claim(claim)
+                    params = TASK_PARAMS_SCHEMAS[task.task_type](**task.params)
+                    handler = self.handlers[task.task_type]
+                    files = await prepare_admitted_inputs(claim, client, self.work_dir)
+                    await lease.start(await read_report(), claim.input_digest)
+                    result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease), params)
+                    result = result or {}
+                    if _result_encode_error(result) is not None:
+                        raise ProtocolError("handler result cannot be encoded")
+                    names = _require_safe_filenames(result.get("output_files") or {}, field="output_files")
+                    for filename, source in _require_output_sources(files.output_dir, names).values():
+                        await client.resource_upload(claim, filename, source)
+                except Exception as exc:
+                    # Only pre-publication failure selects fail. Once a terminal
+                    # request is transmitted, its durable operation alone is replayed.
+                    from .resources import is_out_of_memory
+
+                    await client.resource_operation(journal, "fail", {"error": f"{type(exc).__name__}: {exc}",
+                        "failure_kind": "out_of_memory" if is_out_of_memory(exc) else "error"})
+                    raise
+                await client.resource_operation(journal, "complete", {"result": result})
+            finally:
+                try:
+                    clean = await _cuda_cleanup_with_timeout(self.timeout_grace_s)
+                except BaseException:
+                    self._cleanup_failed = True
+                    self._on_hard_exit()
+                    raise
+                if not clean:
+                    self._cleanup_failed = True
+                    self._on_hard_exit()
+                    raise ProtocolError("CUDA cleanup unverified; process restart required")
+
     # ----- internals ----------------------------------------------
 
     def _claim_wait_s(self) -> float:
@@ -1012,6 +1124,10 @@ class Worker:
         driving the existing global idle-wait escalation; foreign failures
         never touch it.
         """
+        if self._cleanup_failed:
+            raise ProtocolError("CUDA cleanup unverified; process restart required")
+        if self._admission_journal is not None:
+            raise ProtocolError("admitted workers cannot poll legacy claims")
         claimed = await self._claim_home()
         if claimed is not None:
             return claimed, self._home_target
@@ -1078,6 +1194,24 @@ class Worker:
         return claimed
 
     async def _run_one(self, task: ClaimedTask, target: _Target) -> None:
+        try:
+            await self._execute_one(task, target)
+        finally:
+            try:
+                clean = await _cuda_cleanup_with_timeout(self.timeout_grace_s)
+            except BaseException:
+                self._cleanup_failed = True
+                self._stop.set()
+                self._on_hard_exit()
+                raise
+            if not clean:
+                self._cleanup_failed = True
+                self._stop.set()
+                log.error("task %s: CUDA cleanup unverified; terminating worker", task.id)
+                self._on_hard_exit()
+                raise ProtocolError("CUDA cleanup unverified; process restart required")
+
+    async def _execute_one(self, task: ClaimedTask, target: _Target) -> None:
         """Heartbeat → stage inputs → run handler → publish.
 
         Every backend interaction for this task — heartbeat, cancel poll,

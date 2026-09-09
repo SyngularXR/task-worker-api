@@ -14,9 +14,18 @@ export type TaskType =
   | 'detect_cut_planes'
   | 'cinematic_baking'
   | 'deploy_case'
+  | 'prepare_deploy'
   | 'generate_synthetic'
   | 'finalize_synthetic'
   | 'finalize_segment'
+  | 'finalize_spatial'
+  | 'finalize_gs'
+  | 'finalize_render'
+  | 'finalize_gs4d'
+  | 'finalize_model'
+  | 'finalize_cinematic'
+  | 'finalize_deploy'
+  | 'finalize_deploy_prep'
   | 'spatial_recon'
   | 'spatial_gs_build'
 ;
@@ -31,9 +40,18 @@ export const TaskType = {
   DETECT_CUT_PLANES: 'detect_cut_planes' as const,
   CINEMATIC_BAKING: 'cinematic_baking' as const,
   DEPLOY_CASE: 'deploy_case' as const,
+  PREPARE_DEPLOY: 'prepare_deploy' as const,
   GENERATE_SYNTHETIC: 'generate_synthetic' as const,
   FINALIZE_SYNTHETIC: 'finalize_synthetic' as const,
   FINALIZE_SEGMENTATION: 'finalize_segment' as const,
+  FINALIZE_SPATIAL: 'finalize_spatial' as const,
+  FINALIZE_GS: 'finalize_gs' as const,
+  FINALIZE_RENDER: 'finalize_render' as const,
+  FINALIZE_GS4D: 'finalize_gs4d' as const,
+  FINALIZE_MODEL: 'finalize_model' as const,
+  FINALIZE_CINEMATIC: 'finalize_cinematic' as const,
+  FINALIZE_DEPLOY: 'finalize_deploy' as const,
+  FINALIZE_DEPLOY_PREPARATION: 'finalize_deploy_prep' as const,
   SPATIAL_RECONSTRUCTION: 'spatial_recon' as const,
   SPATIAL_GS_BUILD: 'spatial_gs_build' as const,
 } as const;
@@ -82,6 +100,21 @@ export interface TaskEnvelope {
 
 // Task param schemas ---------------------------------------
 
+export interface RenderParams {
+  config_path: string;
+  job_id: string;
+  config_hash: string;
+  colmap_only?: boolean;
+  resume?: boolean;
+  dry_render?: number;
+  chain_gs?: boolean;
+  gs_quality?: string;
+  gs_iterations?: number;
+  gs_max_splats?: number;
+  gs_sh_degree?: number;
+  gs_dense_init?: boolean;
+}
+
 /**
  * Input for the Blender worker's detect_cut_planes handler.
  */
@@ -108,6 +141,15 @@ export interface ModelInitializingParams {
   base_name: string;
   /** Remote-worker inputs: {filename: filename}, served via GET /tasks/{id}/files/{filename}. Emitted alongside input_path when the producing box enables cross-box files; home workers keep the zero-copy input_path, foreign workers use only this. */
   input_files?: Record<string, string>;
+  convex_hull_target_faces?: number;
+  convex_hull_margin?: number;
+  convex_hull_smooth_iterations?: number;
+  preview_max_triangles?: number;
+  remove_interior?: boolean;
+  preview_remesher?: 'auto' | 'qremeshify' | 'none';
+  qremeshify_scale_factor?: number;
+  qremeshify_time_limit?: number;
+  yup?: boolean;
 }
 
 /**
@@ -122,10 +164,13 @@ export interface CinematicBakingParams {
   base_name: string;
   /** Remote-worker inputs: {filename: filename}, served via GET /tasks/{id}/files/{filename}. Emitted alongside input_path when the producing box enables cross-box files; home workers keep the zero-copy input_path, foreign workers use only this. */
   input_files?: Record<string, string>;
+  yup?: boolean;
   /** Optional worker material registry id. Omit for the deployment's Current/default material. */
   material_id?: string;
   /** Optional Bioform Pattern Scale override; requires material_id and must be supported by that material. */
   pattern_scale?: number;
+  /** Optional Bioform displacement cap in millimetres. */
+  max_displacement_mm?: number;
 }
 
 /**
@@ -156,6 +201,16 @@ export interface GsBuildParams {
   strategy?: string;
   /** Run COLMAP dense MVS for splat init (adds 5–30 min). */
   dense_init?: boolean;
+}
+
+/**
+ * Backend phase preparation/publication; training uses GS_BUILD tasks.
+ */
+export interface Gs4dBuildParams {
+  stage: 'render' | 'finalize';
+  /** Zero preserves every captured camera. */
+  n_cameras?: number;
+  n_phases?: number;
 }
 
 /**
@@ -214,8 +269,21 @@ export interface SegmentationParams {
  * Input for the assetbundle-builder worker's deploy_case handler.
  */
 export interface DeployCaseParams {
-  content_path: string;
+  content_path?: string;
+  snapshot_path?: string;
+  output_path?: string;
+  case_guid?: string;
+  deploy_hash?: string;
   build_target?: string;
+  platform?: string;
+  schema_version?: number;
+}
+
+/**
+ * Assemble the immutable recipe staged by the backend admission service.
+ */
+export interface PrepareDeployParams {
+  recipe_path?: string;
 }
 
 /**
@@ -268,13 +336,15 @@ export interface SpatialGsBuildParams {
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
+  'render': RenderParams;
   'detect_cut_planes': DetectCutPlanesParams;
   'model_initializing': ModelInitializingParams;
   'cinematic_baking': CinematicBakingParams;
   'gs_build': GsBuildParams;
-  'gs4d_build': GsBuildParams;
+  'gs4d_build': Gs4dBuildParams;
   'segmentation': SegmentationParams;
   'deploy_case': DeployCaseParams;
+  'prepare_deploy': PrepareDeployParams;
   'generate_synthetic': GenerateSyntheticParams;
   'spatial_recon': SpatialReconstructionParams;
   'spatial_gs_build': SpatialGsBuildParams;

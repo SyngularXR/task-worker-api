@@ -10,17 +10,19 @@ from __future__ import annotations
 from ..enums import TaskType
 from ._base import TaskParamsBase
 from .cinematic_baking import CinematicBakingParams
-from .deploy_case import DeployCaseParams
+from .deploy_case import DeployCaseParams, PrepareDeployParams
 from .detect_cut_planes import DetectCutPlanesParams
 from .generate_synthetic import GenerateSyntheticParams
 from .gs_build import GsBuildParams, Gs4dBuildParams, SpatialGsBuildParams
 from .model_initializing import ModelInitializingParams
 from .segmentation import SegmentationParams
+from .render import RenderParams
 from .spatial_reconstruction import SpatialReconstructionParams
 
-# render + apple_ml_gs land in a future release once the handler shapes
+# apple_ml_gs lands in a future release once the handler shape
 # are audited (see design spec Appendix A).
 TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
+    TaskType.RENDER: RenderParams,
     TaskType.DETECT_CUT_PLANES: DetectCutPlanesParams,
     TaskType.MODEL_INITIALIZING: ModelInitializingParams,
     TaskType.CINEMATIC_BAKING: CinematicBakingParams,
@@ -28,6 +30,7 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
     TaskType.GS4D_BUILD: Gs4dBuildParams,
     TaskType.SEGMENTATION: SegmentationParams,
     TaskType.DEPLOY_CASE: DeployCaseParams,
+    TaskType.PREPARE_DEPLOY: PrepareDeployParams,
     TaskType.GENERATE_SYNTHETIC: GenerateSyntheticParams,
     TaskType.SPATIAL_RECONSTRUCTION: SpatialReconstructionParams,
     TaskType.SPATIAL_GS_BUILD: SpatialGsBuildParams,
@@ -38,9 +41,11 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
 
 __all__ = [
     "TaskParamsBase",
+    "RenderParams",
     "TASK_PARAMS_SCHEMAS",
     "CinematicBakingParams",
     "DeployCaseParams",
+    "PrepareDeployParams",
     "DetectCutPlanesParams",
     "GenerateSyntheticParams",
     "ModelInitializingParams",

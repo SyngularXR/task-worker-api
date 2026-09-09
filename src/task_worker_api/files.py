@@ -134,11 +134,42 @@ def _require_safe_filenames(
     return safe
 
 
+def _canonical_output_path(path: Path) -> Path:
+    """Resolve existing outputs without requiring AppContainer drive-map access."""
+    if os.name != 'nt':
+        return path.resolve(strict=True)
+    import ctypes
+    from ctypes import wintypes as w
+
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p, w.DWORD, w.DWORD, w.HANDLE]
+    kernel.CreateFileW.restype = w.HANDLE
+    kernel.GetFinalPathNameByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD]
+    kernel.GetFinalPathNameByHandleW.restype = w.DWORD
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    kernel.CloseHandle.restype = w.BOOL
+    handle = kernel.CreateFileW(str(path), 0, 7, None, 3, 0x02000000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        # VOLUME_NAME_NT, with FILE_NAME_NORMALIZED (not FILE_NAME_OPENED):
+        # resolve reparse targets, but do not query the inaccessible DOS map.
+        size = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 2)
+        if not size:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if size >= len(buffer):
+            raise OSError('Canonical output path exceeds Windows path limit')
+        return Path(buffer.value)
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def _require_output_sources(
     output_dir: Path, output_files: dict[str, str],
 ) -> dict[str, tuple[str, Path]]:
     """Reject unsafe existing output sources without following symlinks."""
-    root = output_dir.resolve(strict=True)
+    root = _canonical_output_path(output_dir)
     sources: dict[str, tuple[str, Path]] = {}
     for key, filename in output_files.items():
         src = output_dir / filename
@@ -155,7 +186,7 @@ def _require_output_sources(
         elif not stat.S_ISREG(source_stat.st_mode):
             problem = "must be a regular file"
         else:
-            resolved = src.resolve(strict=True)
+            resolved = _canonical_output_path(src)
             try:
                 resolved.relative_to(root)
             except ValueError:
@@ -393,6 +424,40 @@ def _require_foreign_capable(task: ClaimedTask) -> None:
             "task type was granted to a cross-box key without being "
             "remote-capable."
         )
+
+
+async def prepare_admitted_inputs(claim, client: "BackendClient", work_root: Path) -> FileContext:
+    """Stage a fresh attempt exclusively from its immutable backend manifest."""
+    from .resources import input_snapshot_digest
+
+    if input_snapshot_digest(claim.task) != claim.input_digest:
+        raise ProtocolError("input manifest differs from admitted digest")
+    names = _require_safe_filenames({key: item.filename for key, item in claim.task.inputs.items()}, field="inputs")
+    if len(set(names.values())) != len(names):
+        raise ProtocolError("duplicate input filenames")
+    destinations = set()
+    for key, artifact in claim.task.inputs.items():
+        parts = artifact.path.split("/")
+        for part in parts:
+            _require_safe_filename(part, field="input path", key=key)
+        alias = artifact.path.lower()
+        if alias in destinations:
+            raise ProtocolError("duplicate input paths")
+        destinations.add(alias)
+    directory = work_root / str(claim.ownership.attempt_id)
+    # Existing attempts require supervisor reconciliation, never destructive reuse.
+    await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=False)
+    inputs, outputs = directory / "in", directory / "out"
+    await asyncio.to_thread(inputs.mkdir)
+    await asyncio.to_thread(outputs.mkdir)
+    paths = {}
+    for key, artifact in claim.task.inputs.items():
+        destination = inputs.joinpath(*artifact.path.split("/"))
+        await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
+        await client.resource_download(claim, artifact, destination)
+        paths[key] = destination
+    primary = paths.get("mesh", next(iter(paths.values()), inputs))
+    return FileContext(input_dir=inputs, output_dir=outputs, primary_path=primary, all_paths=paths)
 
 
 async def prepare_inputs(
