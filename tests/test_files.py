@@ -189,8 +189,8 @@ async def test_local_mode_no_staging_dir_when_shared_volume_unset(
     assert len(warnings) == 1
     warning = warnings[0].getMessage()
     assert "task 13" in warning
-    assert str(out_dir / "a.stl") in warning
-    assert str(out_dir / "b.stl") in warning
+    assert repr(str(out_dir / "a.stl")) in warning
+    assert repr(str(out_dir / "b.stl")) in warning
     assert "SHARED_VOLUME_PATH" in warning
     assert "Worker(shared_volume_path=...)" in warning
     # No staging dir created anywhere.

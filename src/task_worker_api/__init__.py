@@ -3,6 +3,8 @@
 v0.2.0 adds the runtime: BackendClient, Worker, CancelGuard, ProgressReporter,
 file transfer, hybrid-mode runner, and testing fixtures.
 """
+from importlib.metadata import version as _installed_version
+
 from .cancel import CancelGuard
 from .client import BackendClient
 from .context import ClaimedTask, FileContext, TaskContext
@@ -18,7 +20,7 @@ from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
 from .worker import ForeignTarget, Worker, parse_synpusher_targets, run_hybrid
 
-__version__ = "0.18.0"
+__version__ = _installed_version("task-worker-api")
 
 __all__ = [
     "__version__",

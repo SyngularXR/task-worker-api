@@ -5,7 +5,7 @@ services/backend/src/utils/extra_model_registry.py:_build_cb_params.
 """
 from __future__ import annotations
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictStr, model_validator
 
 from ._base import TaskParamsBase
 
@@ -25,7 +25,8 @@ class CinematicBakingParams(TaskParamsBase):
             "keep the zero-copy input_path, foreign workers use only this."
         ),
     )
-    material_id: str | None = Field(
+    yup: bool = True
+    material_id: StrictStr | None = Field(
         default=None,
         min_length=1,
         max_length=64,
@@ -46,8 +47,16 @@ class CinematicBakingParams(TaskParamsBase):
         ),
     )
 
+    max_displacement_mm: float | None = Field(
+        default=None, ge=0.0, le=5.0, allow_inf_nan=False,
+        description="Optional Bioform displacement cap in millimetres.",
+    )
+
     @model_validator(mode="after")
     def validate_material_options(self) -> "CinematicBakingParams":
-        if self.pattern_scale is not None and self.material_id is None:
-            raise ValueError("pattern_scale requires material_id")
+        for name in ("pattern_scale", "max_displacement_mm"):
+            if getattr(self, name) is not None and (
+                self.material_id is None or self.material_id.casefold() == "current"
+            ):
+                raise ValueError(f"{name} requires a Bioform material_id (not 'Current')")
         return self

@@ -15,6 +15,7 @@ from .enums import TaskStatus, TaskType
 
 if TYPE_CHECKING:  # pragma: no cover — avoids circular import at runtime
     from .progress import ProgressReporter
+    from .resources import ClaimResult
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,15 @@ class ClaimedTask:
     status: TaskStatus       # enum, never raw int
     params: dict             # raw dict; validation happens in Worker.run_forever
     worker_id: Optional[str] = None
+
+    @classmethod
+    def from_claim(cls, claim: "ClaimResult") -> "ClaimedTask":
+        """Build the handler input from the immutable admitted payload."""
+        return cls(
+            id=claim.task.id, task_type=TaskType(claim.task.task_type),
+            case_id=claim.task.case_id, item_key=claim.task.item_key,
+            status=TaskStatus.CLAIMED, params=claim.task.params,
+        )
 
     @classmethod
     def from_dict(cls, data: dict) -> "ClaimedTask":
