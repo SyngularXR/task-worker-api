@@ -35,7 +35,16 @@
   create, and `_retry` holds the failed attempt's exception (and with it the
   suspended generator's frame) to re-raise, so the handle would otherwise
   survive the whole retry loop — one leaked descriptor per failed attempt on
-  exactly the multi-GB uploads most likely to be retried.
+  exactly the multi-GB uploads most likely to be retried. Waiting out a
+  blocking disk call on the cancel path is now itself uncancellable:
+  `asyncio.shield` defers only the *first* cancellation, so a worker shutdown
+  landing on top of a user cancel — while `open`/`read`/`close` was still
+  blocked in its thread — abandoned that thread mid-flight and unwound before
+  it produced a handle, so the cleanup that closes a just-opened descriptor
+  never ran, and an error raised by the abandoned call could mask the
+  cancellation being reported. Both drains re-shield until the thread has
+  genuinely finished, which covers `download_file`'s writes on the same
+  helper.
 - A task interrupted by worker shutdown now reports a diagnosable terminal
   reason instead of `unknown`. `asyncio.CancelledError` is a `BaseException`,
   so none of `_run_one`'s handlers caught it and the `finally` reported the

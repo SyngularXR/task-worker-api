@@ -328,6 +328,36 @@ def _validate_timeout_s(
         )
 
 
+async def _drain_ignoring_cancel(task: "asyncio.Future") -> None:
+    """Wait for ``task`` to actually finish, however often *we* are cancelled.
+
+    ``asyncio.shield`` only defers the *first* cancellation: once it has
+    raised, a bare ``await task`` is cancellable again, so a second
+    ``cancel()`` — a worker shutdown landing on top of a user cancel, or
+    :func:`_cancel_and_drain` on top of either — abandons the thread
+    mid-flight. Re-shielding until the task is genuinely done rides out every
+    extra cancel.
+
+    The extra ``CancelledError`` itself is dropped, so a caller that must
+    still report cancellation raises on its own afterwards
+    (:func:`_to_thread_complete` re-raises; :func:`_await_unless_cancelled`
+    raises :class:`TaskCancelled`). Deferring the cancel by a drain is the
+    point: an abandoned drain is what leaves a thread writing into a handle
+    the caller has already unwound past.
+
+    Whatever the task raises is discarded here, matching
+    :func:`_cancel_and_drain` — we are already unwinding, and a failing
+    ``close()`` must not mask the reason why.
+    """
+    import asyncio
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            pass
+
+
 async def _cancel_and_drain(task: "asyncio.Future") -> None:
     """Cancel ``task`` and wait for it to actually stop.
 
@@ -340,25 +370,37 @@ async def _cancel_and_drain(task: "asyncio.Future") -> None:
     supposed to stop. Whatever the task raises on the way out (the
     ``CancelledError`` we asked for, or a transport error from the severed
     connection) is discarded — it must not mask the reason we are unwinding.
+
+    The wait itself rides out cancellation of *us* via
+    :func:`_drain_ignoring_cancel`: a bare ``await task`` here would abandon
+    the drain the moment a second cancel landed (worker shutdown on top of a
+    user cancel), which is precisely the detached-and-still-reading state
+    this function exists to prevent.
     """
     task.cancel()
-    try:
-        await task
-    except BaseException:
-        pass
+    await _drain_ignoring_cancel(task)
 
 
 async def _to_thread_complete(func, /, *args, cancel_cleanup=None):
-    """Do not let task cancellation race a blocking thread operation."""
+    """Do not let task cancellation race a blocking thread operation.
+
+    On the cancel path the thread is drained — and ``cancel_cleanup`` run on
+    whatever it produced — through :func:`_drain_ignoring_cancel`, so a
+    repeated cancel cannot orphan the handle ``open`` was in the middle of
+    returning. ``cancel_cleanup`` is skipped when the call failed, since
+    there is then no result to clean up.
+    """
     import asyncio
 
     task = asyncio.create_task(asyncio.to_thread(func, *args))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        result = await task
-        if cancel_cleanup is not None:
-            await asyncio.to_thread(cancel_cleanup, result)
+        await _drain_ignoring_cancel(task)
+        if cancel_cleanup is not None and not task.cancelled() and task.exception() is None:
+            await _drain_ignoring_cancel(
+                asyncio.create_task(asyncio.to_thread(cancel_cleanup, task.result()))
+            )
         raise
 
 

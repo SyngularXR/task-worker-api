@@ -942,6 +942,105 @@ async def test_upload_file_closes_source_when_cancelled_mid_read(
     assert state["file"].closed_calls >= 1, "cancelled upload leaked the handle"
 
 
+@pytest.mark.parametrize("stall_at", ["open", "read", "close"])
+@pytest.mark.asyncio
+async def test_upload_file_closes_source_when_cancelled_twice(
+    tmp_path, monkeypatch, stall_at,
+):
+    """A *second* cancel landing mid-drain must not orphan the handle.
+
+    ``asyncio.shield`` in ``_to_thread_complete`` only defers the *first*
+    cancellation; the drain behind it used to be a bare ``await``, and so was
+    cancellable all over again. A worker shutdown landing on top of the
+    user's cancel — while ``open``/``read``/``close`` is still blocked in its
+    thread — therefore abandoned that thread mid-flight and unwound before it
+    produced a result, so the ``cancel_cleanup`` that closes a just-opened
+    handle never ran. Zero ``close()`` calls, one leaked descriptor per
+    cancelled upload, on exactly the slow storage where a blocking call sits
+    still long enough for two cancels to land on it.
+
+    Both cancels are real: ``cancelled`` is the ``CancelGuard`` poll seeing
+    the user's cancel, and ``task.cancel()`` is the worker shutting down on
+    top of it. ``upload_file`` reports the user's cancel (``TaskCancelled``)
+    — but only after the handle is actually closed, which is the point.
+    """
+    import threading
+
+    from task_worker_api import client as client_mod
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"y" * (2 * _UPLOAD_CHUNK_BYTES))
+
+    entered = threading.Event()   # set from the worker thread, in the stall
+    release = threading.Event()   # let the stalled call finally return
+    handles: list = []
+    real_open = open
+
+    def _stall(where):
+        if where == stall_at:
+            entered.set()
+            assert release.wait(10), f"test never released the blocked {where}"
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+            self.closed_calls = 0
+            handles.append(self)
+
+        def read(self, n=-1):
+            _stall("read")
+            return self._f.read(n)
+
+        def close(self):
+            _stall("close")
+            self.closed_calls += 1
+            return self._f.close()
+
+    def _spy_open(path, mode, *a, **kw):
+        # Stall *before* the real open, so cancelling here races the handle
+        # into existence: the caller has no reference to close yet.
+        _stall("open")
+        return _SpyFile(real_open(path, mode, *a, **kw))
+
+    monkeypatch.setattr(client_mod, "open", _spy_open, raising=False)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        await asyncio.sleep(30)
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    cancelled = asyncio.Event()
+    task = asyncio.create_task(
+        client.upload_file(9, "output.ply", src, cancelled=cancelled)
+    )
+
+    for _ in range(500):            # wait for the thread to reach the stall
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set(), f"upload never blocked in {stall_at}"
+
+    cancelled.set()                 # cancel 1: the user, via CancelGuard
+    await asyncio.sleep(0.05)       # let it abort the PUT and start draining
+    task.cancel()                   # cancel 2: worker shutdown, mid-drain
+    await asyncio.sleep(0.05)
+    release.set()                   # the blocked call returns at last
+
+    with pytest.raises(TaskCancelled):
+        await asyncio.wait_for(task, 5)
+    await client.close()
+
+    assert len(handles) == 1, f"expected one open handle, got {len(handles)}"
+    handle = handles[0]
+    assert handle.closed_calls == 1, (
+        f"twice-cancelled upload blocked in {stall_at} left the source "
+        f"handle with {handle.closed_calls} close() calls, not 1 — a leaked "
+        f"descriptor per cancelled upload exhausts a long-running worker"
+    )
+    assert handle._f.closed, "the underlying file object is still open"
+
+
 @pytest.mark.asyncio
 async def test_upload_file_closes_source_when_transport_aborts_mid_body(
     tmp_path, monkeypatch,
