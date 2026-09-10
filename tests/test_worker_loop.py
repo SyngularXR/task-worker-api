@@ -1342,11 +1342,11 @@ async def test_heartbeat_stopped_when_worker_cancelled_mid_report(
 
 @pytest.mark.asyncio
 async def test_cancelled_worker_reports_shutdown_reason(
-    make_worker, fake_client, tmp_path,
+    make_worker, fake_client, tmp_path, caplog,
 ):
     """A task killed by cancelling the worker task (run_hybrid on uvicorn
     exit / container stop) must land terminal with a reason that names it,
-    not the seeded placeholder."""
+    not the seeded placeholder — and say so once in the worker's own log."""
     (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
     fake_client.queue_task(
         task_type=TaskType.DETECT_CUT_PLANES,
@@ -1364,13 +1364,28 @@ async def test_cancelled_worker_reports_shutdown_reason(
         client=fake_client,
         handlers={TaskType.DETECT_CUT_PLANES: handler},
     )
-    run = asyncio.create_task(worker.run_one())
-    await asyncio.wait_for(in_handler.wait(), timeout=5)
-    run.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await run
+    with caplog.at_level("WARNING"):
+        run = asyncio.create_task(worker.run_one())
+        await asyncio.wait_for(in_handler.wait(), timeout=5)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
 
     assert fake_client.completed_tasks == []
     assert len(fake_client.failed_tasks) == 1
+    task_id = str(fake_client.failed_tasks[0]["task_id"])
     error = fake_client.failed_tasks[0]["error"]
-    assert error == "worker task cancelled while processing", error
+    # The reason has to carry all three parts an operator reads it for: that
+    # the worker shut down, which task it dropped, and that the task was
+    # interrupted rather than attempted-and-failed.
+    assert error == (
+        f"worker shut down before task {task_id} finished; the task was "
+        "interrupted, not attempted-and-failed"
+    ), error
+
+    cancelled_logs = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "worker shut down before task" in r.message
+    ]
+    assert len(cancelled_logs) == 1, [r.message for r in caplog.records]
+    assert cancelled_logs[0].message == error

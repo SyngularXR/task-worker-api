@@ -1450,12 +1450,23 @@ class Worker:
             # is the common case, not an exotic one: run_hybrid cancels the
             # worker task whenever the app side exits (uvicorn shutdown,
             # container stop), so every task interrupted by a deploy landed on
-            # the backend — and in the UI — with an unusable reason. Worded
-            # neutrally because the caller's motive isn't knowable from here:
-            # shutdown is the usual one, but any owner of the worker task can
-            # cancel it. Re-raised so cancellation still propagates; the
-            # finally below already sends the terminal report.
-            outcome = ("fail", "worker task cancelled while processing")
+            # the backend — and in the UI — with an unusable reason. The reason
+            # names shutdown (the only caller that cancels the worker task in
+            # this codebase) and says the task was *interrupted*, not
+            # attempted-and-failed: the distinction is what tells an operator
+            # reading the task row that a retry is worth it and that no handler
+            # ever reached a verdict. Re-raised so cancellation still
+            # propagates; the finally below already sends the terminal report.
+            reason = (
+                f"worker shut down before task {task.id} finished; the task "
+                "was interrupted, not attempted-and-failed"
+            )
+            outcome = ("fail", reason)
+            # One line at WARNING so the worker's own log says an interrupt
+            # happened: without it the only trace is the task row's failure
+            # reason, and an operator reading logs after a redeploy sees a
+            # task that simply stops mid-run.
+            log.warning("%s", reason)
             raise
         except (TaskParamsError, ProtocolError) as e:
             log.error("task %s protocol error: %s", task.id, e)
