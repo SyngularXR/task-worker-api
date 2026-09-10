@@ -258,3 +258,82 @@ async def test_legacy_fallback_warns_once_per_process(caplog):
     assert sum(
         "poll_cancel_status" in r.message for r in caplog.records
     ) == 1
+
+
+class _ScriptedPollClient:
+    """Cancel-status client that replays ``script`` one entry per poll.
+
+    ``None`` raises (a failed poll), a dict is returned. Once the script is
+    exhausted the client blocks forever, so a test sees exactly the ticks it
+    scripted and no trailing log lines race the guard's teardown.
+    """
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.polls = 0
+        self.done = asyncio.Event()
+
+    async def poll_cancel_status(self, task_id):
+        if self.polls >= len(self._script):
+            self.done.set()
+            await asyncio.Event().wait()  # park until the guard cancels us
+        outcome = self._script[self.polls]
+        self.polls += 1
+        if self.polls == len(self._script):
+            self.done.set()
+        if outcome is None:
+            raise ConnectionError("boom")
+        return outcome
+
+
+async def _run_script(script, caplog):
+    """Run a CancelGuard over ``script`` and return its cancel-poll records."""
+    client = _ScriptedPollClient(script)
+    with caplog.at_level("DEBUG", logger="task_worker_api.cancel"):
+        async with CancelGuard(client, task_id=7, poll_interval_s=0.001):
+            await asyncio.wait_for(client.done.wait(), timeout=5)
+    assert client.polls == len(script)
+    return [r for r in caplog.records if "cancel poll failed" in r.message]
+
+
+@pytest.mark.asyncio
+async def test_warns_on_sustained_poll_failure(caplog):
+    """A permanently failing poll (rotated key, 404, drifted base URL) leaves
+    the guard blind for the whole task, so it must not stay at DEBUG."""
+    records = await _run_script([None, None, None], caplog)
+
+    assert [r.levelname for r in records] == ["DEBUG", "DEBUG", "WARNING"]
+    assert "task 7" in records[-1].message
+    assert "3 consecutive failures" in records[-1].message
+
+
+@pytest.mark.asyncio
+async def test_poll_warning_suppressed_between_doublings(caplog):
+    """Warning every tick would spam a 3-hour task, so after the first
+    warning the next one waits for the failure count to double."""
+    records = await _run_script([None] * 6, caplog)
+
+    warned = [r for r in records if r.levelname == "WARNING"]
+    assert [r.args[1] for r in warned] == [3, 6]  # not 4 or 5
+
+
+@pytest.mark.asyncio
+async def test_poll_failure_counter_resets_on_success(caplog):
+    """A recovered poll clears the streak: two blips either side of a good
+    tick are transient, not a sustained outage."""
+    records = await _run_script(
+        [None, None, {"cancelled": False}, None, None], caplog,
+    )
+
+    assert [r.levelname for r in records] == ["DEBUG"] * 4
+
+
+@pytest.mark.asyncio
+async def test_warns_on_sustained_malformed_response(caplog):
+    """A backend stuck on a malformed 200 (``[]`` instead of the status
+    object) blinds the guard just like a connection error, so the streak
+    must survive the successful HTTP call and escalate."""
+    records = await _run_script([[], [], []], caplog)
+
+    assert [r.levelname for r in records] == ["DEBUG", "DEBUG", "WARNING"]
+    assert "3 consecutive failures" in records[-1].message
