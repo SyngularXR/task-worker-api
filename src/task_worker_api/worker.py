@@ -37,7 +37,12 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from .cancel import CancelGuard
-from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
+from .client import (
+    BackendClient,
+    _await_unless_cancelled,
+    _DEFAULT_BACKOFF_MAX_S,
+    _JITTER_SPREAD,
+)
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -285,6 +290,11 @@ def _positive_finite_s(name: str, value: float) -> float:
       answers; ``inf`` never heartbeats at all, so the task looks stale.
     * ``cancel_poll_interval_s``: the same two failures against ``CancelGuard``
       and ``GET /tasks/{id}/cancel-status``.
+    * ``cancel_grace_s``: ``<= 0`` aborts a handler the instant the cancel
+      lands, so a cooperative or ``on_cancel`` handler never gets to unwind
+      (its ``to_thread`` GPU work is detached rather than stopped); ``inf``
+      or ``NaN`` never aborts at all, which is the bug the race exists to
+      fix — the handler runs to completion on a cancelled task.
     * ``timeout_grace_s``: ``NaN`` makes ``TaskWatchdog._wait`` return
       instantly at both grace phases (``end = now + nan``, so the loop never
       runs), collapsing SIGTERM → grace → SIGKILL → grace → hard-exit into an
@@ -533,6 +543,7 @@ class Worker:
         heartbeat_interval_s: float = 10.0,
         heartbeat_warn_threshold: int = 3,
         cancel_poll_interval_s: float = 2.0,
+        cancel_grace_s: float = 5.0,
         request_timeout_s: float = 30.0,
         file_timeout_s: float = 300.0,
         cancel_timeout_s: float = 5.0,
@@ -576,6 +587,9 @@ class Worker:
         self.heartbeat_warn_threshold = heartbeat_warn_threshold
         self.cancel_poll_interval_s = _positive_finite_s(
             "cancel_poll_interval_s", cancel_poll_interval_s,
+        )
+        self.cancel_grace_s = _positive_finite_s(
+            "cancel_grace_s", cancel_grace_s,
         )
         self.task_timeout_s = _finite_task_timeout_s(
             "task_timeout_s", task_timeout_s,
@@ -1419,7 +1433,27 @@ class Worker:
                 )
                 ctx = TaskContext(task=task, files=file_ctx, progress=progress)
 
-                result = await handler(ctx, typed_params)
+                # Race the handler against the guard's ``cancelled`` event
+                # instead of plain ``await handler(...)``. The guard only
+                # *sets* the event; nothing interrupts an await inside the
+                # handler, so a plain await raises TaskCancelled only on
+                # leaving the guarded block — i.e. after the handler has
+                # already run to completion, burning the hours of GPU work
+                # the user cancelled. Racing aborts the handler a
+                # ``cancel_grace_s`` after the cancel lands; its
+                # ``finally``/``async with`` cleanup still runs, because the
+                # abort is an ordinary asyncio cancellation that is drained
+                # to completion before TaskCancelled is raised here. The
+                # grace is what keeps the cooperative
+                # (ctx.progress.is_cancelled) and ``on_cancel`` patterns
+                # unchanged: they see the cancel first and stop on their own
+                # terms, which for a threadpool handler is the only thing
+                # that actually stops the thread.
+                result = await _await_unless_cancelled(
+                    handler(ctx, typed_params), cancelled,
+                    f"task {task.id} cancelled by user",
+                    grace_s=self.cancel_grace_s,
+                )
 
                 # Publish outputs *inside* the CancelGuard so a user cancel
                 # during the (potentially multi-minute) output upload is

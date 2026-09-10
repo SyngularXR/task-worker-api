@@ -310,8 +310,15 @@ Don't swallow errors. Raising is the right signal.
 When the backend flips a task to CANCELLED (user hit cancel, or admin
 dashboard clicked stop), the SDK's `CancelGuard` polls
 `/tasks/{id}/cancel-status` every 2 seconds. It sets
-`ctx.progress.is_cancelled = True` and, if your handler awaits
-anywhere in the hot loop, `TaskCancelled` is raised at the next await.
+`ctx.progress.is_cancelled = True`, and the worker races your handler
+against that signal. Patterns 2 and 3 below stop themselves and are
+unaffected; a handler that doesn't is aborted `cancel_grace_s` (a `Worker`
+knob, default 5s) after the cancel lands — an ordinary asyncio
+cancellation, so its `finally` / `async with` cleanup still runs and is
+awaited to completion before the task is reported. Cleanup that must
+survive a cancel belongs in `finally`, not after the last await. Raise
+`cancel_grace_s` if your handler needs longer to unwind on its own — a
+thread you signalled keeps running if the abort lands first.
 
 Three canonical handler shapes, pick yours:
 
@@ -398,12 +405,16 @@ catches it.
 ### Timing caveat
 
 Cancel visibility is bounded by the SDK's `cancel_poll_interval_s`
-(default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`.
+(default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`;
+the task is reported at most `cancel_grace_s` (default 5 s) after that,
+whether or not your handler stopped itself.
 A C extension that holds the GIL and doesn't yield won't see cancel
 until it returns. This is a Python limitation, not ours — if you need
 sub-second cancel in a C extension, either break the work into smaller
 batches with awaits between them, or run the extension in a
-subprocess you can SIGTERM.
+subprocess you can SIGTERM. Note the abort ends the *await*, not the
+work behind it: a GIL-holding extension or a thread keeps running
+detached, which is why signalling it (Pattern 3) still matters.
 
 ---
 

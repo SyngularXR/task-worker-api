@@ -2,7 +2,11 @@
 
 Three canonical usage patterns:
 
-1. Pure async handler — TaskCancelled raises at the next ``await``.
+1. Pure async handler — the ``Worker`` races the handler against the guard's
+   ``cancelled`` event, so a handler that doesn't stop itself is aborted
+   (ordinary asyncio cancellation, ``finally``/``async with`` cleanup still
+   runs) ``Worker.cancel_grace_s`` after the cancel lands, and
+   ``TaskCancelled`` is raised in its place.
 2. Subprocess handler (Blender, colmap) — ``on_cancel`` calls ``proc.terminate()``;
    the handler's ``await proc.communicate()`` unblocks; the guard raises on
    the next poll tick.
@@ -105,8 +109,15 @@ async def CancelGuard(
       - Calls ``on_cancel()`` synchronously. This runs on the guard's
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
         lands immediately.
-      - Raises ``TaskCancelled`` in the guarded block at the next
-        ``await`` point.
+      - Sets the yielded ``cancelled`` event. The guard itself does *not*
+        interrupt the guarded block — asyncio has no way to raise into
+        another coroutine — so the block must either watch the event
+        (``prepare_inputs``/``upload_outputs`` abort on it, and
+        ``Worker._execute_one`` races the handler against it via
+        ``client._await_unless_cancelled``) or be a cooperative/``on_cancel``
+        handler that stops itself.
+      - Raises ``TaskCancelled`` on exit of the guarded block if nothing
+        inside it already did, so a cancel is never reported as a success.
 
     Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
     plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C

@@ -535,11 +535,15 @@ async def _multipart_file_body(
     yield epilogue
 
 
-async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str):
+async def _await_unless_cancelled(
+    coro, cancelled: "asyncio.Event", message: str, *, grace_s: float = 0.0,
+):
     """Await ``coro``, aborting it as soon as ``cancelled`` is set.
 
     Used around each file transfer's complete retry loop, so cancellation
-    interrupts both an in-flight request and any retry backoff. The operation
+    interrupts both an in-flight request and any retry backoff, and around
+    the handler call in ``Worker._execute_one``, so a user cancel stops an
+    in-flight handler instead of waiting for it to finish. The operation
     runs as a task and races the event: whichever finishes first wins, and if
     the event wins the operation is cancelled and :class:`TaskCancelled` is
     raised with ``message``.
@@ -548,6 +552,17 @@ async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str
     last-chunk-wins behaviour of ``download_file`` and ``_copyfile_async``:
     the bytes are on the backend either way, so reporting a cancel that
     arrived after delivery would be a lie about what happened.
+
+    ``grace_s`` (0 for file transfers, ``Worker.cancel_grace_s`` for the
+    handler call) is how long the operation gets to notice the cancel and
+    stop on its own terms before it is aborted. A handler that watches the
+    signal itself — ``ctx.progress.is_cancelled``, or an ``on_cancel`` hook
+    that terminates a subprocess or sets a ``threading.Event`` — must be
+    allowed to finish its own unwind: aborting a ``to_thread`` await does
+    not stop the thread behind it, it only detaches it, so the worker would
+    claim its next task while the cancelled one still holds the GPU. Past
+    the grace the operation is aborted anyway; the point of the race is that
+    a handler which ignores the cancel cannot run unbounded.
 
     If the *caller* is cancelled while waiting (worker shutdown), the
     operation is cancelled too rather than left running detached with a file
@@ -574,6 +589,15 @@ async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str
         raise
     finally:
         await _cancel_and_drain(waiter)
+
+    if grace_s and not request.done():
+        try:
+            # asyncio.wait leaves its futures alone on timeout — unlike
+            # wait_for, which would cancel ``request`` and lose the drain.
+            await asyncio.wait((request,), timeout=grace_s)
+        except BaseException:
+            await _cancel_and_drain(request)
+            raise
 
     if request.done():
         return request.result()

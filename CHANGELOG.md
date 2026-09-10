@@ -9,6 +9,21 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- A user cancel now stops an in-flight handler. `CancelGuard` only *sets* its
+  `cancelled` event — asyncio cannot raise into another coroutine — so the plain
+  `await handler(...)` in `Worker._execute_one` ran to completion and
+  `TaskCancelled` was raised only on leaving the guarded block, i.e. after the
+  hours of GPU work the user cancelled had already been spent. Only cooperative
+  handlers (polling `ctx.progress.is_cancelled`) or ones with an `on_cancel`
+  hook stopped early; otherwise the cancel was honoured just at the
+  `prepare_inputs` / `upload_outputs` boundaries. The handler call now races the
+  guard's event, so it is aborted `cancel_grace_s` (new `Worker` knob, default
+  5s) after the cancel lands. The abort is an ordinary asyncio cancellation
+  drained to completion, so handler `finally` / `async with` cleanup still runs,
+  and the task still reports the single `cancelled by user` failure. The grace
+  keeps the cooperative and `on_cancel` patterns unchanged — they stop on their
+  own terms first, which for a threadpool handler is the only thing that
+  actually stops the thread rather than detaching it.
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are

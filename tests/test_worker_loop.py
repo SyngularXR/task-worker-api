@@ -1389,3 +1389,160 @@ async def test_cancelled_worker_reports_shutdown_reason(
     ]
     assert len(cancelled_logs) == 1, [r.message for r in caplog.records]
     assert cancelled_logs[0].message == error
+
+
+# ----- cancel aborts an in-flight handler ------------------------------------
+#
+# The CancelGuard only *sets* its ``cancelled`` event; asyncio cannot raise
+# into another coroutine, so a plain ``await handler(...)`` kept running to
+# completion and TaskCancelled was raised only on leaving the guarded block —
+# i.e. after the hours of GPU work the user cancelled had already been spent.
+# _execute_one now races the handler against the event (via
+# client._await_unless_cancelled), so a handler that ignores the cancel is
+# aborted ``cancel_grace_s`` after it lands. Non-cancelled handlers are
+# untouched — the happy-path and ``no_false_cancel`` tests above pin that.
+
+
+@pytest.mark.asyncio
+async def test_cancel_aborts_in_flight_pure_async_handler(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A handler that never checks for cancellation and has no on_cancel hook
+    must still be aborted mid-await, not awaited to completion."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    finished = False
+
+    async def handler(ctx, params):
+        nonlocal finished
+        client.handler_running.set()
+        # Stands in for hours of GPU work: no is_cancelled poll, no
+        # on_cancel hook — only the race can stop this.
+        await asyncio.sleep(30)
+        finished = True  # pragma: no cover — must never be reached
+        return {}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        cancel_grace_s=0.05,
+    )
+    # The handler's own sleep is 30s; if the abort works this returns in
+    # roughly a poll interval plus the grace.
+    await asyncio.wait_for(worker.run_one(), timeout=10)
+
+    assert finished is False, "handler ran to completion despite the cancel"
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cancel_abort_runs_handler_cleanup(
+    make_worker, tmp_path, monkeypatch,
+):
+    """Aborting the handler is an ordinary asyncio cancellation, so
+    ``finally`` blocks and ``async with`` __aexit__ still run — and are
+    drained to completion before the worker reports the task."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    cleanup: list[str] = []
+
+    class _Resource:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            # An await in the cleanup path: it must be allowed to finish,
+            # not truncated by a second cancellation.
+            await asyncio.sleep(0)
+            cleanup.append("aexit")
+            return False
+
+    async def handler(ctx, params):
+        client.handler_running.set()
+        try:
+            async with _Resource():
+                await asyncio.sleep(30)
+            return {}  # pragma: no cover — must never be reached
+        finally:
+            cleanup.append("finally")
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        cancel_grace_s=0.05,
+    )
+    await asyncio.wait_for(worker.run_one(), timeout=10)
+
+    assert cleanup == ["aexit", "finally"]
+    # And the cancel is still reported exactly once, as a cancel.
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cancel_abort_does_not_preempt_cooperative_handler(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A handler that stops itself on the cancel signal (the cooperative and
+    ``on_cancel`` patterns) still raises its own TaskCancelled: within
+    ``cancel_grace_s`` the race does not touch it. That grace is what keeps a
+    threadpool handler's ``on_cancel``-signalled thread from being detached
+    mid-iteration instead of stopped."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    stopped_itself = False
+
+    async def handler(ctx, params):
+        nonlocal stopped_itself
+        client.handler_running.set()
+        for _ in range(500):
+            if ctx.progress.is_cancelled:
+                stopped_itself = True
+                raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
+            await asyncio.sleep(0.001)
+        return {}  # pragma: no cover — should never reach
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        heartbeat_interval_s=10.0,
+        # Far longer than the handler's own 1ms check interval: if the race
+        # ever preempted a self-stopping handler, this would still catch it.
+        cancel_grace_s=5.0,
+    )
+    await asyncio.wait_for(worker.run_one(), timeout=10)
+
+    assert stopped_itself is True
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
