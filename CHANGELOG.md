@@ -54,6 +54,9 @@
   failure reason. Cancellation now sets `worker task cancelled while
   processing` and re-raises, and the placeholder is reworded to name the path
   it actually represents (an exit through a `BaseException` nothing catches).
+  The cancellation also logs one WARNING naming the task, so the interrupt is
+  visible in the worker's own log after a redeploy and not only in the task
+  row's failure reason.
   No change to whether a terminal report is sent, or to the status on the wire.
 - `CancelGuard` now escalates a sustained cancel-poll failure from DEBUG to
   WARNING. Every poll exception was swallowed at DEBUG forever, so a

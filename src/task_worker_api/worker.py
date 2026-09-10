@@ -1423,6 +1423,16 @@ class Worker:
             # cancel it. Re-raised so cancellation still propagates; the
             # finally below already sends the terminal report.
             outcome = ("fail", "worker task cancelled while processing")
+            # One line at WARNING so the worker's own log says an interrupt
+            # happened: without it the only trace is the task row's failure
+            # reason, and an operator reading logs after a redeploy sees a
+            # task that simply stops mid-run.
+            log.warning(
+                "task %s: worker task cancelled while processing; reporting "
+                "it terminal as interrupted (worker shutdown is the usual "
+                "cause)",
+                task.id,
+            )
             raise
         except (TaskParamsError, ProtocolError) as e:
             log.error("task %s protocol error: %s", task.id, e)
