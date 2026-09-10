@@ -26,7 +26,6 @@ from task_worker_api.client import (
     _MAX_FAIL_ERROR_BYTES,
     _UPLOAD_CHUNK_BYTES,
     BackendClient,
-    _cap_fail_error,
 )
 from task_worker_api.enums import TaskType
 from task_worker_api.errors import TaskCancelled
@@ -4106,22 +4105,45 @@ async def test_fail_passes_a_normal_error_through_unchanged():
     assert json.loads(sent[0])["error"] == error
 
 
-def test_cap_fail_error_bounds_escape_heavy_and_astral_input():
-    """The cap is on the *serialized* body: one code point can escape to 12
-    bytes, so capping the raw string would be no bound on the wire. Slicing is
-    by code point, so the result never splits a character — including the lone
-    surrogates a surrogateescape-decoded subprocess traceback carries."""
-    errors = [
-        "\x00" * 200_000,          # 6 bytes escaped per code point
-        "\U0001f4a5" * 200_000,    # 12 — surrogate pair
-        '"\\\n' * 100_000,          # every character escaped
-        # A traceback quoting subprocess output decoded with surrogateescape:
-        # strict UTF-8 encoding raises on these, which must not happen inside
-        # the call whose whole job is keeping the report deliverable.
+@pytest.mark.asyncio
+async def test_fail_transmits_a_large_non_ascii_error_untruncated():
+    """The cap is measured on what httpx actually sends, not on a re-implementation
+    of its encoder. httpx 0.28 encodes the body as compact UTF-8, so 1,400 emoji
+    are 5,612 bytes on the wire; measuring with ``ensure_ascii`` instead called
+    the same error 16,813 bytes and truncated one that fits three times over."""
+    error = "\U0001f4a5" * 1400
+    sent: list = []
+    client = _fail_client(sent)
+    await client.fail(7, error)
+    await client.close()
+
+    assert len(sent[0]) <= _MAX_FAIL_ERROR_BYTES
+    assert json.loads(sent[0])["error"] == error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "\x00" * 200_000,           # escapes to 6 bytes per code point
+        "\U0001f4a5" * 200_000,     # 4 bytes raw, un-escaped by httpx 0.28
+        '"\\\n' * 100_000,           # every character escaped
+        # A traceback quoting subprocess output decoded with surrogateescape.
+        # httpx encodes strict UTF-8, so an unsanitized lone surrogate raises
+        # UnicodeEncodeError while *building* the request — the transport never
+        # sees it — inside the call whose whole job is keeping the report
+        # deliverable. Asserting on stdlib json instead would miss that.
         "boom \udcff\udcfe" * 100_000,
-    ]
-    for error in errors:
-        capped = _cap_fail_error(error)
-        assert len(json.dumps({"error": capped})) <= _MAX_FAIL_ERROR_BYTES
-        round_trip = capped.encode("utf-8", "surrogatepass")
-        assert round_trip.decode("utf-8", "surrogatepass") == capped
+    ],
+    ids=["control-chars", "astral", "all-escaped", "lone-surrogates"],
+)
+@pytest.mark.asyncio
+async def test_fail_bounds_pathological_input_on_the_wire(error):
+    """Every one of these must reach the transport, and reach it under the cap."""
+    sent: list = []
+    client = _fail_client(sent)
+    await client.fail(7, error)
+    await client.close()
+
+    assert len(sent) == 1
+    assert len(sent[0]) <= _MAX_FAIL_ERROR_BYTES
+    assert "bytes truncated]..." in json.loads(sent[0])["error"]

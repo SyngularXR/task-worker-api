@@ -7,7 +7,6 @@ the pre-SDK shape — this client consolidates three divergent copies
 """
 from __future__ import annotations
 
-import json
 import logging
 import math
 import random
@@ -136,26 +135,42 @@ _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_FAIL_ERROR_BYTES = 16 * 1024
 
 
-def _utf8_len(s: str) -> int:
-    """Byte length of ``s`` as UTF-8, tolerating lone surrogates.
+# Any absolute URL works: building a request encodes the body and transmits
+# nothing. Same probe trick as ``worker._result_encode_exc``.
+_ENCODE_PROBE_URL = "http://encode-check.invalid/"
 
-    ``surrogatepass`` because a traceback that quotes subprocess output decoded
-    with ``surrogateescape`` carries lone surrogates, and strict encoding would
-    raise here — inside the very call meant to keep the report deliverable.
+
+def _encodable(error: str) -> str:
+    """``error`` with anything httpx cannot encode replaced by its escape.
+
+    A traceback quoting subprocess output decoded with ``surrogateescape``
+    carries lone surrogates, and httpx 0.28 encodes the body as strict UTF-8 —
+    so an unsanitized one raises ``UnicodeEncodeError`` while httpx *builds*
+    the request, before any transport sees it, inside the very call meant to
+    keep the report deliverable. ``backslashreplace`` is the identity for
+    anything already encodable, so no real failure reason is rewritten, and it
+    renders what it does replace legibly (``\\udcff``) instead of dropping it.
     """
-    return len(s.encode("utf-8", "surrogatepass"))
+    return error.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _fail_body_bytes(error: str) -> int:
-    """Serialized size of the ``fail`` body, in bytes, as an upper bound.
+    """Exact size of the ``fail`` body httpx will put on the wire.
 
-    Measures the whole JSON document, not the raw string: escaping expands one
-    code point to up to 12 bytes, so a cap on the string alone is no bound on
-    what goes over the wire. ``ensure_ascii`` (the default) is never smaller
-    than the raw UTF-8 httpx may send, and its output is pure ASCII, so the
-    character count is the byte count.
+    Asks httpx itself, for the same reason as ``worker._result_encode_exc``:
+    the encoder's flags moved across the declared ``httpx>=0.23`` range — 0.28
+    switched ``encode_json`` to ``ensure_ascii=False`` with compact separators
+    — so a re-implementation here drifts from the installed encoder, and one
+    that over-measures truncates an error that would have fit.
+
+    Measures the whole document rather than the raw string because escaping
+    still expands a code point (to 6 bytes for a control character), so a cap
+    on the string alone is no bound on the wire. ``error`` must already be
+    :func:`_encodable`.
     """
-    return len(json.dumps({"error": error}))
+    return len(
+        httpx.Request("PUT", _ENCODE_PROBE_URL, json={"error": error}).content
+    )
 
 
 def _cap_fail_error(error: str) -> str:
@@ -167,15 +182,16 @@ def _cap_fail_error(error: str) -> str:
     character) and the result is re-measured, because the per-character cost of
     escaping is not known in advance.
     """
+    error = _encodable(error)
     if _fail_body_bytes(error) <= _MAX_FAIL_ERROR_BYTES:
         return error
-    total = _utf8_len(error)
+    total = len(error.encode("utf-8"))
     # A quarter of the cap per side leaves room for escaping, the marker and
     # the JSON wrapper; halve until it actually fits.
     keep = min(_MAX_FAIL_ERROR_BYTES // 4, len(error) // 2)
     while keep:
         head, tail = error[:keep], error[-keep:]
-        dropped = total - _utf8_len(head) - _utf8_len(tail)
+        dropped = total - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
         capped = f"{head}\n...[{dropped} bytes truncated]...\n{tail}"
         if _fail_body_bytes(capped) <= _MAX_FAIL_ERROR_BYTES:
             return capped
