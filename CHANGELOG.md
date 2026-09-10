@@ -9,6 +9,19 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `BackendClient.fail()` now caps the error string it PUTs at 16 KB of
+  serialized body. `Worker._run_one` builds the failure reason as
+  `f"{type(e).__name__}: {e}\n{traceback}"` with no bound, so a handler that
+  raises with megabytes of subprocess stderr (colmap-splat, Blender-CLI) or a
+  `RecursionError` traceback produced a body nginx rejects with 413 or the app
+  with 400. Neither status is transient, so the terminal report was lost
+  outright and the task orphaned `in_progress` until the sweeper — the failure
+  reason was exactly what made the report undeliverable. The cap keeps the head
+  *and* the tail with a `...[N bytes truncated]...` marker between them (the
+  head carries the entry point, the tail the exception type and message), and is
+  measured on the serialized JSON document rather than the raw string, since
+  escaping can expand one code point to 12 bytes. Errors under the cap — every
+  real failure reason — are transmitted byte-identical.
 - The watchdog's last-resort `fail()` report no longer retries a permanent
   4xx. `_make_sync_fail` retried *any* exception 3× with 2s sleeps, so a
   definitive answer — 400 (bad body), 404 (task gone), 409 (already terminal)

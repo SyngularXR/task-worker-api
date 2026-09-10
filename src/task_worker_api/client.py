@@ -7,6 +7,7 @@ the pre-SDK shape — this client consolidates three divergent copies
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import random
@@ -124,6 +125,62 @@ _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 # synchronously on the event-loop thread; reading 1 MB at a time off-loop
 # keeps the thread dispatches proportional to the file size instead.
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# Cap on the serialized ``fail`` body. A handler that raises with megabytes of
+# subprocess stderr (colmap-splat, Blender-CLI) or a RecursionError traceback
+# produces a body nginx rejects with 413 or the app with 400 — neither is in
+# the transient set, so the terminal report is lost outright and the task
+# orphans in_progress until the sweeper reclaims it: the failure reason is
+# exactly what makes the report undeliverable. 16 KB is generous against any
+# real message and far under nginx's 1 MB default body limit.
+_MAX_FAIL_ERROR_BYTES = 16 * 1024
+
+
+def _utf8_len(s: str) -> int:
+    """Byte length of ``s`` as UTF-8, tolerating lone surrogates.
+
+    ``surrogatepass`` because a traceback that quotes subprocess output decoded
+    with ``surrogateescape`` carries lone surrogates, and strict encoding would
+    raise here — inside the very call meant to keep the report deliverable.
+    """
+    return len(s.encode("utf-8", "surrogatepass"))
+
+
+def _fail_body_bytes(error: str) -> int:
+    """Serialized size of the ``fail`` body, in bytes, as an upper bound.
+
+    Measures the whole JSON document, not the raw string: escaping expands one
+    code point to up to 12 bytes, so a cap on the string alone is no bound on
+    what goes over the wire. ``ensure_ascii`` (the default) is never smaller
+    than the raw UTF-8 httpx may send, and its output is pure ASCII, so the
+    character count is the byte count.
+    """
+    return len(json.dumps({"error": error}))
+
+
+def _cap_fail_error(error: str) -> str:
+    """Bound ``error`` so the terminal report stays deliverable.
+
+    Keeps a head and a tail rather than just a head: the head carries the entry
+    point and the tail carries the exception type and message, which is the
+    part that names the failure. Slices are taken by code point (never mid
+    character) and the result is re-measured, because the per-character cost of
+    escaping is not known in advance.
+    """
+    if _fail_body_bytes(error) <= _MAX_FAIL_ERROR_BYTES:
+        return error
+    total = _utf8_len(error)
+    # A quarter of the cap per side leaves room for escaping, the marker and
+    # the JSON wrapper; halve until it actually fits.
+    keep = min(_MAX_FAIL_ERROR_BYTES // 4, len(error) // 2)
+    while keep:
+        head, tail = error[:keep], error[-keep:]
+        dropped = total - _utf8_len(head) - _utf8_len(tail)
+        capped = f"{head}\n...[{dropped} bytes truncated]...\n{tail}"
+        if _fail_body_bytes(capped) <= _MAX_FAIL_ERROR_BYTES:
+            return capped
+        keep //= 2
+    return f"...[{total} bytes truncated]..."
 
 
 def _is_transient_status(
@@ -1390,9 +1447,13 @@ class BackendClient:
 
         Retries 500 with a raised attempt budget, same as :meth:`complete` —
         see there for the rationale.
+
+        ``error`` is capped at ``_MAX_FAIL_ERROR_BYTES`` (see
+        :func:`_cap_fail_error`) — the cap lives here, on the wire boundary
+        that owns the constraint, so it covers every caller.
         """
         await self._request(
-            "PUT", f"/tasks/{task_id}/fail", json={"error": error},
+            "PUT", f"/tasks/{task_id}/fail", json={"error": _cap_fail_error(error)},
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
