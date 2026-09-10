@@ -943,6 +943,94 @@ async def test_upload_file_closes_source_when_cancelled_mid_read(
 
 
 @pytest.mark.asyncio
+async def test_upload_file_closes_source_when_transport_aborts_mid_body(
+    tmp_path, monkeypatch,
+):
+    """A transport failing mid-PUT must not leak the source descriptor.
+
+    The cancel path above unwinds *through* the generator, so its ``finally``
+    runs. A transport error does not: httpx raises from its own frame and
+    never closes a body iterator it did not create, leaving the generator
+    parked on its ``yield`` with ``src`` open. Nothing reaps it either —
+    ``_retry`` parks the attempt's exception in ``last_exc`` to re-raise, and
+    that traceback keeps the generator frame reachable — so without an
+    explicit ``aclose()`` the descriptor survives the whole retry loop and
+    escapes to the caller. One per failed attempt is how a worker retrying a
+    multi-GB output upload runs out of file descriptors.
+
+    ``MockTransport`` cannot express this: it ``aread()``s the whole request
+    before invoking the handler, so the body is always fully drained. This
+    needs a transport that stops iterating part-way.
+    """
+    from task_worker_api import client as client_mod
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"y" * (3 * _UPLOAD_CHUNK_BYTES))
+
+    handles: list = []
+    real_open = open
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+            self.closed_calls = 0
+            handles.append(self)
+
+        def read(self, n=-1):
+            return self._f.read(n)
+
+        def close(self):
+            self.closed_calls += 1
+            return self._f.close()
+
+    monkeypatch.setattr(
+        client_mod, "open",
+        lambda path, mode, *a, **kw: _SpyFile(real_open(path, mode, *a, **kw)),
+        raising=False,
+    )
+
+    attempts = {"n": 0}
+
+    class _AbortingTransport(httpx.AsyncBaseTransport):
+        """Consume the prologue + one file chunk, then sever the connection."""
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            seen = 0
+            async for _ in request.stream:
+                seen += 1
+                if seen >= 2:
+                    raise httpx.ReadError("connection reset mid-upload")
+            return httpx.Response(200)
+
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=_AbortingTransport(),
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x",
+        client=http, max_retries=2, retry_backoff_s=0.0, retry_jitter=False,
+    )
+    with pytest.raises(httpx.ReadError):
+        await client.upload_file(9, "output.ply", src)
+
+    # Deliberately no gc.collect(): the point is that the handle is closed
+    # promptly by the upload itself, not eventually by the collector once the
+    # caller drops the traceback. Several turns rule out "the loop just hadn't
+    # got round to finalising it yet".
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await client.close()
+
+    assert attempts["n"] == 2, "expected both attempts to reach the transport"
+    assert len(handles) == 2, "expected one fresh handle per attempt"
+    assert all(h.closed_calls >= 1 for h in handles), (
+        "a transport failure mid-body leaked the source descriptor: "
+        f"{sum(1 for h in handles if not h.closed_calls)} of {len(handles)} "
+        "handle(s) still open"
+    )
+
+
+@pytest.mark.asyncio
 async def test_upload_file_rejects_source_that_changed_size(tmp_path, monkeypatch):
     """A file mutated between the stat and the read must fail loudly.
 

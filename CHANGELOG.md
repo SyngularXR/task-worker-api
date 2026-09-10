@@ -29,7 +29,13 @@
   signature, same bytes, same retry and cancel semantics; a fresh generator
   per attempt still restarts each retry at byte 0. A source file that changed
   size between the `stat` and the read now fails the attempt loudly instead of
-  putting a wrong-length body on the wire.
+  putting a wrong-length body on the wire. The per-attempt generator is closed
+  through `contextlib.aclosing`, so a transport that fails mid-PUT cannot leave
+  the source descriptor open: httpx does not close a body iterator it did not
+  create, and `_retry` holds the failed attempt's exception (and with it the
+  suspended generator's frame) to re-raise, so the handle would otherwise
+  survive the whole retry loop — one leaked descriptor per failed attempt on
+  exactly the multi-GB uploads most likely to be retried.
 - A task interrupted by worker shutdown now reports a diagnosable terminal
   reason instead of `unknown`. `asyncio.CancelledError` is a `BaseException`,
   so none of `_run_one`'s handlers caught it and the `finally` reported the

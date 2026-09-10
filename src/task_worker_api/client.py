@@ -11,6 +11,7 @@ import logging
 import math
 import random
 import time
+from contextlib import aclosing
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -1544,17 +1545,29 @@ class BackendClient:
             if cancelled is not None and cancelled.is_set():
                 raise TaskCancelled(cancel_message)
             size = (await asyncio.to_thread(src.stat)).st_size
-            resp = await self._client.request(
-                "PUT", path,
-                content=_multipart_file_body(src, prologue, epilogue, size),
-                params=self._worker_params,
-                headers={
-                    "Content-Type": content_type,
-                    "Content-Length": str(len(prologue) + size + len(epilogue)),
-                },
-                timeout=self._file_timeout,
-            )
-            resp.raise_for_status()
+            # aclosing, not a bare `content=_multipart_file_body(...)`: httpx
+            # never closes a body iterator it did not create, so a transport
+            # failing mid-PUT leaves the generator parked on its `yield` with
+            # src open, and nothing reaps it — `_retry` holds the attempt's
+            # exception in `last_exc` to re-raise, and that traceback keeps the
+            # generator frame reachable. One leaked descriptor per failed
+            # attempt, on exactly the multi-GB uploads most likely to retry.
+            # aclose() on an exhausted generator is a no-op, so the success
+            # path is unchanged.
+            async with aclosing(
+                _multipart_file_body(src, prologue, epilogue, size)
+            ) as body:
+                resp = await self._client.request(
+                    "PUT", path,
+                    content=body,
+                    params=self._worker_params,
+                    headers={
+                        "Content-Type": content_type,
+                        "Content-Length": str(len(prologue) + size + len(epilogue)),
+                    },
+                    timeout=self._file_timeout,
+                )
+                resp.raise_for_status()
 
         operation = self._retry(_upload_once, method="PUT", path=path)
         if cancelled is None:
