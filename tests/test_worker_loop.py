@@ -932,11 +932,19 @@ async def test_cancel_guard_propagates_to_progress_is_cancelled(
         # handler between blocking ops). The CancelGuard polls at 0.01s;
         # it should flip is_cancelled well before this loop exhausts.
         client.handler_running.set()
-        for _ in range(100):
+        try:
+            for _ in range(100):
+                if ctx.progress.is_cancelled:
+                    saw_cancelled.set()
+                    raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            # The guard also interrupts the handler at its next await now
+            # (pattern 1), which races this loop's next is_cancelled check
+            # and usually wins — the linked flag must be visible either way.
             if ctx.progress.is_cancelled:
                 saw_cancelled.set()
-                raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
-            await asyncio.sleep(0.02)
+            raise
         return {}  # pragma: no cover — should never reach
 
     worker = make_worker(

@@ -9,6 +9,24 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `CancelGuard` now interrupts the running handler when the backend reports a
+  cancel, instead of only raising on the way out of the guarded block. `_poll`
+  set the `cancelled` event and returned, and `TaskCancelled` was raised after
+  the block finished — so the documented pattern-1 guarantee ("raises
+  `TaskCancelled` in the guarded block at the next `await` point") was
+  unimplemented: a pure-async handler awaiting a long operation ran to
+  completion on a task the user had already cancelled, and only then failed.
+  The poller now cancels the task running the guarded block (after `on_cancel`,
+  so a `terminate()`/`Event.set()` still lands first — the same move
+  `AttemptLease._watch` makes via `_owner.cancel()`) and the guard converts that
+  `CancelledError` back into `TaskCancelled` on the way out, so
+  `Worker._execute_one` still reports "cancelled by user" rather than the
+  shutdown reason. A `CancelledError` from anywhere else (worker shutdown) still
+  propagates untouched, the guard's own request is balanced with `uncancel()` so
+  no delivery stays pending for a later await, and a block that swallows the
+  interrupt still gets `TaskCancelled` on exit. Cooperative patterns 2/3
+  (`on_cancel`, the linked `progress.is_cancelled` flag) and the
+  `prepare_inputs`/`upload_outputs` aborts are unchanged.
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are

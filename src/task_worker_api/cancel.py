@@ -106,7 +106,15 @@ async def CancelGuard(
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
         lands immediately.
       - Raises ``TaskCancelled`` in the guarded block at the next
-        ``await`` point.
+        ``await`` point. The poller cancels the task running the guarded
+        block (the same move ``AttemptLease._watch`` makes via
+        ``_owner.cancel()``) and converts the resulting ``CancelledError``
+        back into ``TaskCancelled`` on the way out, so a pure-async
+        handler awaiting a long operation is interrupted instead of
+        running to completion on a task the user already cancelled, and
+        ``Worker._execute_one`` still reports "cancelled by user" rather
+        than the shutdown reason. A block that swallows the
+        ``CancelledError`` still gets ``TaskCancelled`` on exit.
 
     Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
     plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C
@@ -115,8 +123,17 @@ async def CancelGuard(
     """
     cancelled = asyncio.Event()
     poll_status = _cancel_status_poller(client)
+    # The task running the guarded block: cancelling it is what makes the
+    # "raises at the next await point" guarantee real. None outside a task
+    # (the guard then degrades to raising on exit, as it always did).
+    owner = asyncio.current_task()
+    # True once ``_poll`` has requested ``owner.cancel()`` — the only
+    # CancelledError this guard may convert into TaskCancelled. A cancel from
+    # anywhere else (worker shutdown) must keep propagating as-is.
+    interrupted = False
 
     async def _poll():
+        nonlocal interrupted
         failures = 0
         # Escalate at 3 consecutive failures, then at each doubling (3, 6,
         # 12, ...) — a 3-hour task polling every 2s would otherwise emit a
@@ -135,6 +152,13 @@ async def CancelGuard(
                                 "on_cancel hook for task %s raised: %s",
                                 task_id, e,
                             )
+                    # After ``on_cancel`` so a subprocess terminate() or
+                    # threading.Event.set() has already landed. Same loop as
+                    # the owner, so a plain ``.cancel()`` — no
+                    # call_soon_threadsafe, unlike AttemptLease._watch.
+                    if owner is not None:
+                        interrupted = True
+                        owner.cancel()
                     return
                 # Reset only once the response actually parsed: a backend
                 # stuck returning a malformed 200 (``[]``, a bare string)
@@ -167,10 +191,29 @@ async def CancelGuard(
     )
 
     try:
-        yield cancelled
+        try:
+            yield cancelled
+        except asyncio.CancelledError:
+            if not interrupted:
+                raise  # someone else's cancel (shutdown) — stays a cancel
+            raise TaskCancelled(
+                f"task {task_id} cancelled by user"
+            ) from None
         if cancelled.is_set():
+            # The block finished before our cancel could be delivered: it
+            # ended without another await, or swallowed the CancelledError.
             raise TaskCancelled(f"task {task_id} cancelled by user")
     finally:
+        # Balance our own ``cancel()`` on every exit path (converted,
+        # swallowed by the block, or overtaken by another exception) and
+        # before the await below: an undelivered request would otherwise fire
+        # at some later await — the worker's terminal report — and an
+        # enclosing TaskGroup/asyncio.timeout must see the cancellation count
+        # it started with. ``uncancel`` is 3.11+; on 3.10 (requires-python
+        # still allows it) the pending request is instead absorbed by the
+        # drain below, which already swallows CancelledError.
+        if interrupted and hasattr(owner, "uncancel"):
+            owner.uncancel()
         poll_task.cancel()
         try:
             await poll_task

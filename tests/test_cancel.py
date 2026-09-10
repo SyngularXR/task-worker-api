@@ -337,3 +337,55 @@ async def test_warns_on_sustained_malformed_response(caplog):
 
     assert [r.levelname for r in records] == ["DEBUG", "DEBUG", "WARNING"]
     assert "3 consecutive failures" in records[-1].message
+
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_a_running_async_block():
+    """Pattern 1: a pure-async handler awaiting a long operation must be
+    interrupted at that await, not after it finishes. Before the guard
+    cancelled the guarded task, TaskCancelled was only raised on the way
+    *out* of the block — so a handler awaiting a multi-minute operation ran
+    to completion on a task the user had already cancelled."""
+    client = FakeBackendClient()
+    client.mark_cancelled(1)
+    finished = []
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(TaskCancelled):
+        async with CancelGuard(client, task_id=1, poll_interval_s=0.01):
+            await asyncio.sleep(30)  # the "long operation"
+            finished.append(True)
+
+    assert finished == []  # interrupted, not run to completion
+    assert loop.time() - started < 5
+    # The conversion balanced our own cancel(): this task is still usable,
+    # so the worker's terminal report (which awaits) isn't cut short.
+    assert asyncio.current_task().cancelling() == 0
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_external_cancel_still_raises_cancelled_error():
+    """Only the guard's *own* cancel converts. A worker shutdown cancelling
+    the task must still surface as CancelledError, so Worker._execute_one
+    reports the shutdown reason instead of "cancelled by user"."""
+    client = FakeBackendClient()  # never cancelled by the backend
+    inside = asyncio.Event()
+    seen = []
+
+    async def _guarded():
+        try:
+            async with CancelGuard(client, task_id=1, poll_interval_s=0.01):
+                inside.set()
+                await asyncio.sleep(30)
+        except TaskCancelled:  # pragma: no cover - the bug this guards
+            seen.append("TaskCancelled")
+            raise
+
+    task = asyncio.create_task(_guarded())
+    await asyncio.wait_for(inside.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert seen == []
