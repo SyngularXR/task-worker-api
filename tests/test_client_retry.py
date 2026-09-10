@@ -23,6 +23,7 @@ import pytest
 
 from task_worker_api.client import (
     _DOWNLOAD_CHUNK_BYTES,
+    _MAX_FAIL_ERROR_BYTES,
     _UPLOAD_CHUNK_BYTES,
     BackendClient,
 )
@@ -4050,3 +4051,99 @@ def test_timeout_knob_validation_runs_before_owning_a_client(monkeypatch):
     with pytest.raises(ValueError, match="lifecycle_timeout_s"):
         BackendClient("http://fake", "x", lifecycle_timeout_s=float("nan"))
     assert built == []
+
+
+# ---------------------------------------------------------------------------
+# fail() — error-string cap
+# ---------------------------------------------------------------------------
+
+
+def _fail_client(sent: list):
+    """Client whose fail() PUT records the transmitted body and returns 200."""
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.content)
+        return httpx.Response(200, json={})
+
+    return _client_with_handler(handler)
+
+
+@pytest.mark.asyncio
+async def test_fail_caps_giant_error_but_keeps_head_and_tail():
+    """A multi-MB traceback (colmap-splat subprocess stderr, a RecursionError
+    unwind) must not produce a body nginx rejects with 413 — that status is not
+    transient, so the terminal report would be lost and the task orphaned
+    in_progress. Head and tail both survive: the head names the entry point,
+    the tail the exception type and message."""
+    error = (
+        "RuntimeError: colmap failed\n  File \"handler.py\", line 1, in run\n"
+        + "x" * 4_000_000
+        + "\nCalledProcessError: returned non-zero exit status 1"
+    )
+    sent: list = []
+    client = _fail_client(sent)
+    await client.fail(7, error)
+    await client.close()
+
+    assert len(sent) == 1
+    assert len(sent[0]) <= _MAX_FAIL_ERROR_BYTES
+    body = json.loads(sent[0])["error"]
+    assert body.startswith("RuntimeError: colmap failed")
+    assert body.endswith("CalledProcessError: returned non-zero exit status 1")
+    assert "bytes truncated]..." in body
+
+
+@pytest.mark.asyncio
+async def test_fail_passes_a_normal_error_through_unchanged():
+    """The cap is a backstop, not a rewrite: every real failure reason is far
+    under it and must reach the backend byte-identical."""
+    error = "TaskParamsError: max_splats must be > 0\n  File \"x.py\", line 3"
+    sent: list = []
+    client = _fail_client(sent)
+    await client.fail(7, error)
+    await client.close()
+
+    assert json.loads(sent[0])["error"] == error
+
+
+@pytest.mark.asyncio
+async def test_fail_transmits_a_large_non_ascii_error_untruncated():
+    """The cap is measured on what httpx actually sends, not on a re-implementation
+    of its encoder. httpx 0.28 encodes the body as compact UTF-8, so 1,400 emoji
+    are 5,612 bytes on the wire; measuring with ``ensure_ascii`` instead called
+    the same error 16,813 bytes and truncated one that fits three times over."""
+    error = "\U0001f4a5" * 1400
+    sent: list = []
+    client = _fail_client(sent)
+    await client.fail(7, error)
+    await client.close()
+
+    assert len(sent[0]) <= _MAX_FAIL_ERROR_BYTES
+    assert json.loads(sent[0])["error"] == error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "\x00" * 200_000,           # escapes to 6 bytes per code point
+        "\U0001f4a5" * 200_000,     # 4 bytes raw, un-escaped by httpx 0.28
+        '"\\\n' * 100_000,           # every character escaped
+        # A traceback quoting subprocess output decoded with surrogateescape.
+        # httpx encodes strict UTF-8, so an unsanitized lone surrogate raises
+        # UnicodeEncodeError while *building* the request — the transport never
+        # sees it — inside the call whose whole job is keeping the report
+        # deliverable. Asserting on stdlib json instead would miss that.
+        "boom \udcff\udcfe" * 100_000,
+    ],
+    ids=["control-chars", "astral", "all-escaped", "lone-surrogates"],
+)
+@pytest.mark.asyncio
+async def test_fail_bounds_pathological_input_on_the_wire(error):
+    """Every one of these must reach the transport, and reach it under the cap."""
+    sent: list = []
+    client = _fail_client(sent)
+    await client.fail(7, error)
+    await client.close()
+
+    assert len(sent) == 1
+    assert len(sent[0]) <= _MAX_FAIL_ERROR_BYTES
+    assert "bytes truncated]..." in json.loads(sent[0])["error"]
