@@ -1030,7 +1030,7 @@ class BackendClient:
                     code = exc.response.json().get("code")
                 except (ValueError, AttributeError):
                     code = None
-                if code in ("hardware_report_stale", "cleanup_evidence_stale"):
+                if code in ("hardware_report_stale", "hardware_report_replayed", "cleanup_evidence_stale"):
                     journal.record_operation(kind, operation_id, {"rejected": code})
             raise
         state = AttemptState.model_validate(response.json())
