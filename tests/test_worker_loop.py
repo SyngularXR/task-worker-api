@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -1575,7 +1576,9 @@ async def test_cancel_abort_gives_up_on_a_handler_that_swallows_it(
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             # Swallows the abort — a bare `except:` around the work loop, or
-            # cleanup that blocks, looks exactly like this from outside.
+            # cleanup that keeps awaiting, looks exactly like this from
+            # outside. Cleanup that *blocks* the loop does not: see
+            # test_cancel_abort_of_loop_blocking_cleanup_still_reports.
             while True:
                 still_running.set()
                 await asyncio.sleep(0.01)
@@ -1597,3 +1600,59 @@ async def test_cancel_abort_gives_up_on_a_handler_that_swallows_it(
     assert any(
         "left running detached" in r.getMessage() for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_cancel_abort_of_loop_blocking_cleanup_still_reports(
+    make_worker, tmp_path, monkeypatch,
+):
+    """Cleanup that blocks the event loop is outside the ``2 *
+    cancel_grace_s`` bound, and must still report the cancel correctly.
+
+    Both graces are ``asyncio`` timeouts, so a handler that blocks the loop
+    inside ``except CancelledError:`` suspends the very timers meant to bound
+    it — no value of ``cancel_grace_s`` cuts it short (measured: 0.272s spent
+    against a 0.020s bound). That is a Python limitation, not something the
+    race can fix, so the docs advertise the bound only for handlers that
+    yield. What must never regress is the *correctness* half: the blocked
+    task is still reported cancelled exactly once, never as a success, and
+    the worker neither hangs nor loses the report.
+    """
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    blocked = []
+
+    async def handler(ctx, params):
+        client.handler_running.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            # Cleanup that holds the loop: a time.sleep, a blocking
+            # thread.join(), a GIL-holding C call. Kept far larger than the
+            # grace below so the overrun is unambiguous, and small in
+            # absolute terms so the suite stays fast.
+            time.sleep(0.2)
+            blocked.append(True)
+            raise
+        return {}  # pragma: no cover — never reached
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        cancel_grace_s=0.01,
+    )
+    await asyncio.wait_for(worker.run_one(), timeout=10)
+
+    assert blocked, "handler never reached its blocking cleanup"
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled by user" in client.failed_tasks[0]["error"].lower()

@@ -297,7 +297,10 @@ def _positive_finite_s(name: str, value: float) -> float:
       fix — the handler runs to completion on a cancelled task. It bounds
       both halves of the abort: the grace to stop itself, then the same
       again to unwind, so a cancel is reported within ``2 *
-      cancel_grace_s``.
+      cancel_grace_s`` of any handler that yields to the event loop.
+      Cleanup that blocks the loop outright is not boundable from on the
+      loop (see :func:`_await_unless_cancelled`) and stalls heartbeats
+      alongside the abort.
     * ``timeout_grace_s``: ``NaN`` makes ``TaskWatchdog._wait`` return
       instantly at both grace phases (``end = now + nan``, so the loop never
       runs), collapsing SIGTERM → grace → SIGKILL → grace → hard-exit into an
@@ -1448,7 +1451,7 @@ class Worker:
                 # abort is an ordinary asyncio cancellation that is drained
                 # before TaskCancelled is raised here — for at most another
                 # ``cancel_grace_s``, past which the handler is abandoned so
-                # that swallowing the abort cannot stall reporting. The
+                # that an await-swallowed abort cannot stall reporting. The
                 # grace is what keeps the cooperative
                 # (ctx.progress.is_cancelled) and ``on_cancel`` patterns
                 # unchanged: they see the cancel first and stop on their own

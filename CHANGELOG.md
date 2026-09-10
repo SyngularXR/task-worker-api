@@ -22,8 +22,14 @@
   that is drained, so handler `finally` / `async with` cleanup still runs, and
   the task still reports the single `cancelled by user` failure. The unwind gets
   its own `cancel_grace_s` — a handler that swallows the `CancelledError` or
-  blocks in cleanup is reported as cancelled and left running detached (with a
-  warning), so a cancel is always reported within `2 * cancel_grace_s`. The grace
+  keeps awaiting in cleanup is reported as cancelled and left running detached
+  (with a warning), so a cancel is reported within `2 * cancel_grace_s` of any
+  handler that yields to the event loop. Cleanup that *blocks* the loop instead
+  (`time.sleep`, a blocking `join()`) is outside that bound and cannot be
+  brought inside it: both graces are `asyncio` timeouts, so the blocking is
+  what stops them firing. Such a task is still reported cancelled, only late —
+  the same Python limitation that already applies to GIL-holding extensions,
+  which equally stalls heartbeats. The grace
   keeps the cooperative and `on_cancel` patterns unchanged — they stop on their
   own terms first, which for a threadpool handler is the only thing that
   actually stops the thread rather than detaching it.

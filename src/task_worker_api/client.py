@@ -469,16 +469,23 @@ async def _cancel_and_drain_bounded(
     :func:`_cancel_and_drain` waits forever, which is right for our own
     transfer coroutines — they unwind promptly and the caller is about to
     close a file handle underneath them — but not for a worker author's
-    handler. A handler that swallows ``CancelledError`` (a bare ``except``,
-    or cleanup that blocks) hangs the drain: the unbounded run the cancel
-    race exists to prevent, moved into cleanup, and un-interruptible because
-    :func:`_drain_ignoring_cancel` deliberately rides out cancellation of
-    *us* too, so not even the caller's own timeout can break it.
+    handler. A handler that swallows ``CancelledError`` — a bare ``except``
+    around the work loop, or cleanup that keeps awaiting — hangs the drain:
+    the unbounded run the cancel race exists to prevent, moved into cleanup,
+    and un-interruptible because :func:`_drain_ignoring_cancel` deliberately
+    rides out cancellation of *us* too, so not even the caller's own timeout
+    can break it.
 
     Past the timeout the task is abandoned. That leaves it running detached,
     which an aborted ``to_thread`` handler already does — the abort ends the
     await, never the work behind it — and is the lesser evil against never
     reporting the cancelled task at all.
+
+    ``timeout`` only bites on cleanup that yields. Cleanup that blocks the
+    event loop outright holds the loop this ``asyncio.wait`` timer runs on,
+    so the timeout cannot fire until the block ends; see
+    :func:`_await_unless_cancelled` for why nothing on the loop can bound
+    that.
     """
     import asyncio
 
@@ -611,6 +618,19 @@ async def _await_unless_cancelled(
     putting the reporting delay right back to unbounded. So a cancel is
     reported at most ``2 * grace_s`` after it lands — once to stop itself,
     once to unwind — and a handler that used neither is left detached.
+
+    That bound holds only while the handler *yields to the event loop*, which
+    every ``await``-based unwind does. It is not enforceable against cleanup
+    that blocks the loop synchronously (``time.sleep``, a blocking
+    ``thread.join()``, a GIL-holding C call inside ``except
+    CancelledError:``): both graces are ``asyncio`` timeouts, and their timers
+    only fire when the loop gets to run, so the very thing being bounded is
+    what stops the bound from firing. Nothing scheduled on the loop can
+    bound that — it equally stalls heartbeats and cancel polling — so it is
+    the same Python limitation as a GIL-holding extension, not a property of
+    this race. Blocking cleanup stays *correct* (the task is reported
+    cancelled once the loop runs again, never as a success); it is only the
+    timing that is unbounded.
 
     If the *caller* is cancelled while waiting (worker shutdown), the
     operation is cancelled too rather than left running detached with a file
