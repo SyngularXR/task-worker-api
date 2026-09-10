@@ -125,6 +125,79 @@ _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 # keeps the thread dispatches proportional to the file size instead.
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
+# Cap on the serialized ``fail`` body. A handler that raises with megabytes of
+# subprocess stderr (colmap-splat, Blender-CLI) or a RecursionError traceback
+# produces a body nginx rejects with 413 or the app with 400 — neither is in
+# the transient set, so the terminal report is lost outright and the task
+# orphans in_progress until the sweeper reclaims it: the failure reason is
+# exactly what makes the report undeliverable. 16 KB is generous against any
+# real message and far under nginx's 1 MB default body limit.
+_MAX_FAIL_ERROR_BYTES = 16 * 1024
+
+
+# Any absolute URL works: building a request encodes the body and transmits
+# nothing. Same probe trick as ``worker._result_encode_exc``.
+_ENCODE_PROBE_URL = "http://encode-check.invalid/"
+
+
+def _encodable(error: str) -> str:
+    """``error`` with anything httpx cannot encode replaced by its escape.
+
+    A traceback quoting subprocess output decoded with ``surrogateescape``
+    carries lone surrogates, and httpx 0.28 encodes the body as strict UTF-8 —
+    so an unsanitized one raises ``UnicodeEncodeError`` while httpx *builds*
+    the request, before any transport sees it, inside the very call meant to
+    keep the report deliverable. ``backslashreplace`` is the identity for
+    anything already encodable, so no real failure reason is rewritten, and it
+    renders what it does replace legibly (``\\udcff``) instead of dropping it.
+    """
+    return error.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _fail_body_bytes(error: str) -> int:
+    """Exact size of the ``fail`` body httpx will put on the wire.
+
+    Asks httpx itself, for the same reason as ``worker._result_encode_exc``:
+    the encoder's flags moved across the declared ``httpx>=0.23`` range — 0.28
+    switched ``encode_json`` to ``ensure_ascii=False`` with compact separators
+    — so a re-implementation here drifts from the installed encoder, and one
+    that over-measures truncates an error that would have fit.
+
+    Measures the whole document rather than the raw string because escaping
+    still expands a code point (to 6 bytes for a control character), so a cap
+    on the string alone is no bound on the wire. ``error`` must already be
+    :func:`_encodable`.
+    """
+    return len(
+        httpx.Request("PUT", _ENCODE_PROBE_URL, json={"error": error}).content
+    )
+
+
+def _cap_fail_error(error: str) -> str:
+    """Bound ``error`` so the terminal report stays deliverable.
+
+    Keeps a head and a tail rather than just a head: the head carries the entry
+    point and the tail carries the exception type and message, which is the
+    part that names the failure. Slices are taken by code point (never mid
+    character) and the result is re-measured, because the per-character cost of
+    escaping is not known in advance.
+    """
+    error = _encodable(error)
+    if _fail_body_bytes(error) <= _MAX_FAIL_ERROR_BYTES:
+        return error
+    total = len(error.encode("utf-8"))
+    # A quarter of the cap per side leaves room for escaping, the marker and
+    # the JSON wrapper; halve until it actually fits.
+    keep = min(_MAX_FAIL_ERROR_BYTES // 4, len(error) // 2)
+    while keep:
+        head, tail = error[:keep], error[-keep:]
+        dropped = total - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+        capped = f"{head}\n...[{dropped} bytes truncated]...\n{tail}"
+        if _fail_body_bytes(capped) <= _MAX_FAIL_ERROR_BYTES:
+            return capped
+        keep //= 2
+    return f"...[{total} bytes truncated]..."
+
 
 def _is_transient_status(
     exc: httpx.HTTPStatusError,
@@ -1390,9 +1463,13 @@ class BackendClient:
 
         Retries 500 with a raised attempt budget, same as :meth:`complete` —
         see there for the rationale.
+
+        ``error`` is capped at ``_MAX_FAIL_ERROR_BYTES`` (see
+        :func:`_cap_fail_error`) — the cap lives here, on the wire boundary
+        that owns the constraint, so it covers every caller.
         """
         await self._request(
-            "PUT", f"/tasks/{task_id}/fail", json={"error": error},
+            "PUT", f"/tasks/{task_id}/fail", json={"error": _cap_fail_error(error)},
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
