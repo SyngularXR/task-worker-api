@@ -22,9 +22,15 @@
   `CancelledError` back into `TaskCancelled` on the way out, so
   `Worker._execute_one` still reports "cancelled by user" rather than the
   shutdown reason. A `CancelledError` from anywhere else (worker shutdown) still
-  propagates untouched, the guard's own request is balanced with `uncancel()` so
-  no delivery stays pending for a later await, and a block that swallows the
-  interrupt still gets `TaskCancelled` on exit. Cooperative patterns 2/3
+  propagates untouched — including one that *overlaps* the guard's own cancel,
+  which asyncio coalesces into a single delivery: on 3.11+ the guard compares
+  the task's cancellation count with the count it saw at entry and re-raises
+  `CancelledError` while a request is still outstanding, so a shutdown is never
+  consumed as "cancelled by user" (which would leave `run_forever` claiming and
+  hang `run_hybrid`'s shutdown). The guard's own request is balanced with
+  `uncancel()` so no delivery stays pending for a later await, and a block that
+  swallows the interrupt still gets `TaskCancelled` on exit. Cooperative
+  patterns 2/3
   (`on_cancel`, the linked `progress.is_cancelled` flag) and the
   `prepare_inputs`/`upload_outputs` aborts are unchanged.
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file

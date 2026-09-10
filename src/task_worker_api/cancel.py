@@ -114,7 +114,12 @@ async def CancelGuard(
         running to completion on a task the user already cancelled, and
         ``Worker._execute_one`` still reports "cancelled by user" rather
         than the shutdown reason. A block that swallows the
-        ``CancelledError`` still gets ``TaskCancelled`` on exit.
+        ``CancelledError`` still gets ``TaskCancelled`` on exit. An
+        external cancel that overlaps ours (a worker shutdown landing in
+        the same delivery window) is preserved, not converted: on 3.11+
+        the guard compares the task's cancellation count against the one
+        it saw at entry and re-raises ``CancelledError`` if anything is
+        still outstanding.
 
     Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
     plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C
@@ -131,6 +136,19 @@ async def CancelGuard(
     # CancelledError this guard may convert into TaskCancelled. A cancel from
     # anywhere else (worker shutdown) must keep propagating as-is.
     interrupted = False
+    # ``cancelling()``/``uncancel()`` are 3.11+; ``requires-python`` still
+    # allows 3.10 (Neural-Canvas), where the count is unavailable and the
+    # guard keeps the coarser ``interrupted``-only behaviour.
+    counts_cancels = hasattr(owner, "uncancel")
+    # Cancellation requests already outstanding when the guard was entered.
+    # Ours lands on top; anything still above this line is somebody else's
+    # (worker shutdown) and must survive us. Same bookkeeping as
+    # ``asyncio.timeout``, which converts only when its own uncancel() brings
+    # the count back to what it saw at entry.
+    cancels_at_entry = owner.cancelling() if counts_cancels else 0
+    # Set once our own request has been balanced, so the exit paths below
+    # never uncancel() twice (which would eat an external request).
+    balanced = False
 
     async def _poll():
         nonlocal interrupted
@@ -196,6 +214,18 @@ async def CancelGuard(
         except asyncio.CancelledError:
             if not interrupted:
                 raise  # someone else's cancel (shutdown) — stays a cancel
+            if counts_cancels:
+                # asyncio coalesces overlapping cancels into a *single*
+                # delivery, so this CancelledError can be ours and a worker
+                # shutdown's at once. Drop ours; if a request is still
+                # outstanding it was never ours to convert, so re-raise.
+                # Converting it would consume the shutdown — Worker.
+                # _execute_one would report "cancelled by user", return, and
+                # let run_forever keep claiming, hanging run_hybrid's
+                # shutdown gather on a worker task that never finishes.
+                balanced = True
+                if owner.uncancel() > cancels_at_entry:
+                    raise
             raise TaskCancelled(
                 f"task {task_id} cancelled by user"
             ) from None
@@ -212,10 +242,19 @@ async def CancelGuard(
         # it started with. ``uncancel`` is 3.11+; on 3.10 (requires-python
         # still allows it) the pending request is instead absorbed by the
         # drain below, which already swallows CancelledError.
-        if interrupted and hasattr(owner, "uncancel"):
+        if interrupted and counts_cancels and not balanced:
+            balanced = True
             owner.uncancel()
         poll_task.cancel()
         try:
             await poll_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+        # That drain swallows CancelledError — including one an external
+        # cancel delivered to *us* while unwinding. ``uncancel`` is the only
+        # thing that lowers the count, so a count still above entry means a
+        # cancel is owed to the caller: re-raise it rather than let a worker
+        # shutdown vanish into this guard. On the re-raise path above this is
+        # a no-op in practice — it replaces an identical CancelledError.
+        if counts_cancels and owner.cancelling() > cancels_at_entry:
+            raise asyncio.CancelledError

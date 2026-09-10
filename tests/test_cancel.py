@@ -389,3 +389,43 @@ async def test_external_cancel_still_raises_cancelled_error():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_overlapping_shutdown_cancel_is_not_converted():
+    """A shutdown cancel landing after the guard requested its own — but
+    before asyncio delivers it — coalesces into one CancelledError.
+    Converting that one consumes the shutdown: Worker._execute_one reports
+    "cancelled by user" and returns, run_forever keeps claiming, and
+    run_hybrid's shutdown gather hangs on a worker task that never finishes.
+    The shutdown must survive the conversion."""
+
+    class _ShutdownRacer(FakeBackendClient):
+        def __init__(self):
+            super().__init__()
+            self.owner = None
+
+        async def poll_cancel_status(self, task_id):
+            # Queued from inside the poll tick, so it runs *after* the
+            # guard's own owner.cancel() (queued later in that same tick)
+            # and *before* the CancelledError reaches the guarded block.
+            asyncio.get_running_loop().call_soon(self.owner.cancel)
+            return {"cancelled": True}
+
+    client = _ShutdownRacer()
+    seen = []
+
+    async def _guarded():
+        try:
+            async with CancelGuard(client, task_id=1, poll_interval_s=0.01):
+                await asyncio.sleep(30)
+        except TaskCancelled:  # pragma: no cover - the bug this guards
+            seen.append("TaskCancelled")
+            raise
+
+    task = asyncio.create_task(_guarded())
+    client.owner = task
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert task.cancelled()
+    assert seen == []
