@@ -1602,6 +1602,39 @@ async def test_prepare_inputs_rejects_case_colliding_names(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prepare_inputs_aliases_a_repeated_filename(tmp_path):
+    """Two keys naming one input file are an alias, not a collision: both
+    resolve to the staged file, which is downloaded once."""
+    class _CountingClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.downloads: list[str] = []
+
+        async def download_file(self, task_id, filename, dest, *, cancelled=None):
+            self.downloads.append(filename)
+            await super().download_file(
+                task_id, filename, dest, cancelled=cancelled,
+            )
+
+    work_dir = tmp_path / "work" / "task_58"
+    client = _CountingClient()
+    client.queue_file(58, "model.ply", b"payload")
+    task = _claimed(58, params={"input_files": {
+        "scene": "model.ply", "warm_start": "model.ply",
+    }})
+
+    ctx = await prepare_inputs(task, client, work_dir)
+
+    staged = work_dir / "in" / "model.ply"
+    assert ctx.all_paths == {"scene": staged, "warm_start": staged}
+    assert staged.read_bytes() == b"payload"
+    assert client.downloads == ["model.ply"], (
+        "an aliased input is served by (task, filename), so one fetch "
+        "serves both keys"
+    )
+
+
+@pytest.mark.asyncio
 async def test_upload_outputs_remote_rejects_absolute_output_filename(tmp_path):
     """Remote mode: an absolute ``output_files`` name makes ``output_dir /
     name`` resolve to that absolute path, so the worker would read an
@@ -1649,6 +1682,50 @@ async def test_upload_outputs_rejects_case_colliding_names(tmp_path):
         )
 
     assert client.uploaded_files == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_volume", [False, True])
+async def test_upload_outputs_aliases_a_repeated_filename(tmp_path, shared_volume):
+    """Two output keys naming one file publish that artifact under both
+    keys — as the manifest asks — transferring it once."""
+    class _CountingClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.uploads: list[str] = []
+
+        async def upload_file(self, task_id, filename, src, *, cancelled=None):
+            self.uploads.append(filename)
+            await super().upload_file(
+                task_id, filename, src, cancelled=cancelled,
+            )
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "model.ply").write_bytes(b"splat")
+    volume = tmp_path / "shared"
+    task = _claimed(58, params=(
+        {"input_path": "/ignored"} if shared_volume
+        else {"input_files": {"mesh": "in.ply"}}
+    ))
+    client = _CountingClient()
+
+    manifest = await upload_outputs(
+        task, client, _file_ctx(out_dir),
+        output_files={"scene": "model.ply", "warm_start": "model.ply"},
+        shared_volume_path=str(volume) if shared_volume else None,
+    )
+
+    assert set(manifest) == {"scene", "warm_start"}
+    assert manifest["scene"] == manifest["warm_start"]
+    if shared_volume:
+        staged = volume / "temp" / "58" / "model.ply"
+        assert manifest["scene"] == str(staged)
+        assert staged.read_bytes() == b"splat"
+    else:
+        assert manifest["scene"] == "model.ply"
+        assert client.uploaded_files == {(58, "model.ply"): b"splat"}
+        assert client.uploads == ["model.ply"], "one artifact, one upload"
 
 
 @pytest.mark.asyncio

@@ -116,7 +116,15 @@ def _require_safe_filename(value: Any, *, field: str, key: str) -> str:
 def _require_safe_filenames(
     values: dict[str, Any], *, field: str,
 ) -> dict[str, str]:
-    """Validate one manifest and reject cross-platform filename aliases."""
+    """Validate one manifest and reject cross-platform filename aliases.
+
+    Two keys repeating one filename *exactly* are a deliberate alias, not a
+    collision: both name the same file, which is fetched by (task, name) and
+    published by name, so the second transfer is redundant rather than
+    destructive — the call sites deduplicate it. Only names that differ yet
+    land on one file on a case-insensitive filesystem really overwrite each
+    other, and those are what this rejects.
+    """
     safe: dict[str, str] = {}
     aliases: dict[str, str] = {}
     for key, value in values.items():
@@ -488,7 +496,7 @@ async def prepare_inputs(
     Remote-mode ``input_files`` names are backend-supplied and land under
     ``work_dir/in/``, so each must be a plain basename; one that isn't
     fails the task with a :class:`ProtocolError` naming its key, before any
-    download starts. See :func:`_require_safe_filename`.
+    download starts. See :func:`_require_safe_filenames`.
     """
     in_dir = work_dir / "in"
     out_dir = work_dir / "out"
@@ -533,19 +541,27 @@ async def prepare_inputs(
             input_files, field="input_files",
         )
         paths: dict[str, Path] = {}
+        staged: set[str] = set()
         for key, filename in safe_input_files.items():
             if cancelled is not None and cancelled.is_set():
                 raise TaskCancelled(
                     f"task {task.id} cancelled by user during input download"
                 )
             dest = in_dir / filename
-            await client.download_file(
-                task.id, filename, dest,
-                **_cancel_kwarg(
-                    client.download_file, cancelled,
-                    phase="remote input download",
-                ),
-            )
+            if filename not in staged:
+                # Two keys may name one input (``scene`` and ``warm_start``
+                # both ``model.ply``): the backend serves it by (task,
+                # filename), so downloading it once and pointing both keys
+                # at it is the same result without the second multi-GB
+                # transfer.
+                await client.download_file(
+                    task.id, filename, dest,
+                    **_cancel_kwarg(
+                        client.download_file, cancelled,
+                        phase="remote input download",
+                    ),
+                )
+                staged.add(filename)
             paths[key] = dest
         primary_key = "mesh" if "mesh" in paths else next(iter(paths))
         return FileContext(
@@ -619,7 +635,8 @@ async def upload_outputs(
     whole manifest is checked before the first upload or copy, so a bad
     entry can't publish the entries ahead of it first — an all-or-nothing
     check keeps a rejected manifest from leaving artifacts behind in the
-    staging dir or on the backend.
+    staging dir or on the backend. Two keys may name one file, which
+    publishes that artifact under both keys as asked, transferred once.
     """
     safe_output_files = _require_safe_filenames(
         output_files, field="output_files",
@@ -655,6 +672,10 @@ async def upload_outputs(
                     raise TaskCancelled(
                         f"task {task.id} cancelled by user during output upload"
                     )
+                if filename in uploaded:
+                    # An earlier key already published this exact file; the
+                    # manifest still carries both keys.
+                    continue
                 await client.upload_file(
                     task.id, filename, src,
                     **_cancel_kwarg(
@@ -691,18 +712,22 @@ async def upload_outputs(
             # volume — an orphan the backend's completed-task sweeper never
             # reaches, since it only sweeps dirs for tasks recorded complete.
             await _mkdirs_async(dest_dir)
+            copied: set[str] = set()
             for key, (filename, src) in output_sources.items():
                 if cancelled is not None and cancelled.is_set():
                     raise TaskCancelled(
                         f"task {task.id} cancelled by user during output upload"
                     )
                 dest = dest_dir / filename
-                await _copyfile_async(
-                    src, dest, cancelled=cancelled,
-                    cancel_message=(
-                        f"task {task.id} cancelled by user during output copy"
-                    ),
-                )
+                if filename not in copied:
+                    # Aliased keys stage one copy, same as remote mode.
+                    await _copyfile_async(
+                        src, dest, cancelled=cancelled,
+                        cancel_message=(
+                            f"task {task.id} cancelled by user during output copy"
+                        ),
+                    )
+                    copied.add(filename)
                 manifest[key] = str(dest)
         except BaseException:
             # A copy failed partway through — the staging dir holds a
