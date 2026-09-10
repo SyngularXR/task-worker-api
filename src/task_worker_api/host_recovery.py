@@ -118,6 +118,14 @@ def inspect_reboot(config):
                 # Reboot proves exit, but does not revoke persistent AppContainer grants.
                 raise AdmissionError("windows_access_cleanup_required")
             launches[attempt] = _digest(row)
+    # Enrolled pools can hold retained artifacts or Docker data without hosting
+    # any launch work roots. Inventory those volumes too; only launch roots
+    # above must be empty, never the retained data directories.
+    for value in reporter.get("scratch_paths", []):
+        path = Path(value).resolve(strict=True)
+        pool = filesystem_identity(path)
+        identity = path.stat()
+        storage.setdefault(pool, []).append([str(path), identity.st_dev, identity.st_ino])
     expected = {str(UUID(value)) for value in config["expected_attempts"]}
     if not set(launches) <= expected:
         raise AdmissionError("launch_inventory_incomplete")

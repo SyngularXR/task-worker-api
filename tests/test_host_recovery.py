@@ -11,7 +11,7 @@ from task_worker_api.resource_protocol import observation_signature
 
 
 @pytest.mark.parametrize("fault", [None, "same_boot", "container", "scratch", "missing_attempt", "foreign_host", "windows_grants",
-    "unlaunched", "orphan_without_journal", "missing_journal"])
+    "unlaunched", "orphan_without_journal", "missing_journal", "retained_pool", "missing_pool"])
 def test_reboot_inspection_reads_journal_and_refuses_leftovers(tmp_path, monkeypatch, fault):
     host, old_boot, new_boot, authority, attempt = [uuid4() for _ in range(5)]
     root = tmp_path / "scratch"
@@ -34,28 +34,37 @@ def test_reboot_inspection_reads_journal_and_refuses_leftovers(tmp_path, monkeyp
     if fault == "scratch":
         (root / "leftover").write_text("never delete me")
     monkeypatch.setattr(recovery, "physical_boot_id", lambda *a: old_boot if fault == "same_boot" else new_boot)
-    monkeypatch.setattr(recovery, "filesystem_identity", lambda p: "volume-test")
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    (retained / "artifact").write_text("preserve me")
+    monkeypatch.setattr(recovery, "filesystem_identity", lambda p: "volume-retained" if p == retained else "volume-test")
     monkeypatch.setattr(recovery, "_docker_inventory", lambda:
         [{"ID": "immutable-container", "Names": "attempt-container"}] if fault == "container" else
         [{"ID": "orphan", "Names": "synpusher-attempt-" + attempt.hex}] if fault == "orphan_without_journal" else [])
     monkeypatch.setattr(recovery, "_snapshot", lambda config, seq: HostSnapshot(
         host_id=host, boot_id=new_boot, sequence=seq, captured_at=datetime.now(timezone.utc),
         host_ram={"allocatable": 100, "available": 100}, cpu_millicores=1000, execution_scopes={}, gpus={},
-        scratch_pools={"volume-test": {"allocatable": 100, "available": 100}}))
+        scratch_pools={pool: {"allocatable": 100, "available": 100} for pool in
+            (["volume-test", "volume-retained"] if fault in ("retained_pool", "missing_pool") else ["volume-test"])}))
     config = {"reporter": {"host_id": str(host), "boot_id": str(old_boot), "authority_id": str(authority),
         "epoch": 1, "signing_key_file": str(tmp_path / "key")}, "operation_id": str(uuid4()), "reason": "test reboot",
         "expected_attempts": [] if fault == "missing_attempt" else [str(attempt)],
         "journals": [{"kind": "windows" if fault == "windows_grants" else "docker", "path": str(journal), "work_root": str(root)}]}
     before = journal.read_bytes()
+    if fault == "retained_pool":
+        config["reporter"]["scratch_paths"] = [str(retained)]
     if fault == "missing_journal":
         config["journals"] = []
-    if fault and fault != "unlaunched":
+    if fault and fault not in ("unlaunched", "retained_pool"):
         with pytest.raises(AdmissionError):
             recovery.inspect_reboot(config)
     else:
         result = recovery.inspect_reboot(config)
         assert result["signature"] == observation_signature("reboot", authority, 1, result["inspection"], key)
         assert set(result["inspection"]["stopped_launches"]) == {str(attempt)}
+        if fault == "retained_pool":
+            assert set(result["inspection"]["cleaned_storage"]) == {"volume-test", "volume-retained"}
+    assert (retained / "artifact").read_text() == "preserve me"
     assert journal.read_bytes() == before
     if fault == "scratch":
         assert (root / "leftover").read_text() == "never delete me"
