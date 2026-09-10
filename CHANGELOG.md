@@ -9,6 +9,42 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `BackendClient.upload_file` no longer blocks the event loop while reading
+  from disk — the upload-direction counterpart of the `download_file` fix
+  below, which never reached this side. It opened the source with a blocking
+  `open` and handed the *sync* file object to httpx `files=`, and httpx's
+  `MultipartStream.__aiter__` iterates the encoder synchronously while
+  `FileField.render_data` calls `file.read(64 KB)` per chunk — so every 64 KB
+  of a multi-GB output (a colmap-splat PLY, a Neural-Canvas splat) was a
+  blocking disk read on the loop thread. The heartbeat stopped ticking, so the
+  backend's stale-task sweeper read the frozen `updated_at` as abandonment and
+  reclaimed a task the worker was actively uploading; the `CancelGuard` poll
+  froze with it; and in hybrid mode the worker's FastAPI app stopped serving.
+  The body is now streamed by an async generator that opens, reads (1 MB at a
+  time) and closes the file through `asyncio.to_thread`, around multipart
+  framing still rendered by httpx itself, with explicit `Content-Type` and
+  `Content-Length` headers. The wire bytes are byte-for-byte what `files=`
+  produced, including the part headers for a non-ASCII filename, and the
+  request stays identity-framed rather than chunked. No API change — same
+  signature, same bytes, same retry and cancel semantics; a fresh generator
+  per attempt still restarts each retry at byte 0. A source file that changed
+  size between the `stat` and the read now fails the attempt loudly instead of
+  putting a wrong-length body on the wire. The per-attempt generator is closed
+  through `contextlib.aclosing`, so a transport that fails mid-PUT cannot leave
+  the source descriptor open: httpx does not close a body iterator it did not
+  create, and `_retry` holds the failed attempt's exception (and with it the
+  suspended generator's frame) to re-raise, so the handle would otherwise
+  survive the whole retry loop — one leaked descriptor per failed attempt on
+  exactly the multi-GB uploads most likely to be retried. Waiting out a
+  blocking disk call on the cancel path is now itself uncancellable:
+  `asyncio.shield` defers only the *first* cancellation, so a worker shutdown
+  landing on top of a user cancel — while `open`/`read`/`close` was still
+  blocked in its thread — abandoned that thread mid-flight and unwound before
+  it produced a handle, so the cleanup that closes a just-opened descriptor
+  never ran, and an error raised by the abandoned call could mask the
+  cancellation being reported. Both drains re-shield until the thread has
+  genuinely finished, which covers `download_file`'s writes on the same
+  helper.
 - A task interrupted by worker shutdown now reports a diagnosable terminal
   reason instead of `unknown`. `asyncio.CancelledError` is a `BaseException`,
   so none of `_run_one`'s handlers caught it and the `finally` reported the

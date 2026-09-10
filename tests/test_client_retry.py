@@ -21,7 +21,11 @@ import random
 import httpx
 import pytest
 
-from task_worker_api.client import _DOWNLOAD_CHUNK_BYTES, BackendClient
+from task_worker_api.client import (
+    _DOWNLOAD_CHUNK_BYTES,
+    _UPLOAD_CHUNK_BYTES,
+    BackendClient,
+)
 from task_worker_api.enums import TaskType
 from task_worker_api.errors import TaskCancelled
 
@@ -755,6 +759,407 @@ async def test_upload_file_sends_multipart_put(tmp_path):
 
     assert b"result-bytes" in captured["body"]
     assert "multipart/form-data" in captured["content_type"]
+
+
+@pytest.mark.parametrize("filename", ["output.stl", "scène-π.ply"])
+@pytest.mark.asyncio
+async def test_upload_file_body_is_byte_identical_to_httpx_multipart(
+    tmp_path, filename,
+):
+    """Streaming the body ourselves must not change a single wire byte.
+
+    ``upload_file`` no longer hands the open file to httpx's ``files=`` (that
+    read the file 64 KB at a time on the event-loop thread); it streams the
+    body itself around httpx-rendered framing. The framing — boundary, part
+    headers, the escaping of a non-ASCII filename, the guessed part
+    Content-Type — must still be exactly what ``files=`` would have produced,
+    and the request must stay identity-framed (explicit Content-Length, no
+    chunked Transfer-Encoding) so the backend parses it the same way.
+    """
+    from io import BytesIO
+
+    data = b"result-bytes" * 5000
+    src = tmp_path / filename
+    src.write_bytes(data)
+
+    captured: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["headers"] = request.headers
+        captured["body"] = await request.aread()
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    await client.upload_file(9, filename, src)
+    await client.close()
+
+    content_type = captured["headers"]["content-type"]
+    # httpx honours a boundary pinned via the Content-Type header, so the
+    # reference body is comparable byte for byte.
+    expected = httpx.Request(
+        "PUT", "http://fake/api/v1/tasks/9/files/x",
+        files={"file": (filename, BytesIO(data))},
+        headers={"Content-Type": content_type},
+    ).read()
+    assert captured["body"] == expected
+    assert captured["headers"]["content-length"] == str(len(expected))
+    assert "transfer-encoding" not in captured["headers"]
+
+
+@pytest.mark.asyncio
+async def test_upload_file_reads_off_the_event_loop_in_1mb_chunks(
+    tmp_path, monkeypatch,
+):
+    """Disk reads must run in a worker thread, on 1 MB chunk boundaries.
+
+    The upload-side counterpart of
+    ``test_download_file_writes_off_the_event_loop_in_1mb_chunks``. Passing
+    the open file to httpx's ``files=`` meant ``MultipartStream.__aiter__``
+    iterated the encoder synchronously and ``FileField.render_data`` called
+    ``file.read(64 KB)`` per chunk — every read of a multi-GB PLY/splat ran
+    on the event-loop thread, so the heartbeat stopped ticking (the sweeper
+    reclaims the task), the CancelGuard poll froze, and a hybrid-mode FastAPI
+    app stopped serving.
+    """
+    import threading
+
+    from task_worker_api import client as client_mod
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"x" * (2 * _UPLOAD_CHUNK_BYTES + 1234))
+
+    loop_thread = threading.current_thread()
+    reads: list[tuple[int, threading.Thread]] = []
+    real_open = open
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+
+        def read(self, n=-1):
+            data = self._f.read(n)
+            reads.append((len(data), threading.current_thread()))
+            return data
+
+        def close(self):
+            return self._f.close()
+
+        def seek(self, *a):
+            return self._f.seek(*a)
+
+        # The pre-fix code used ``with open(src, "rb") as f``; supporting the
+        # protocol keeps this test failing on its actual assertions there.
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+            return False
+
+    monkeypatch.setattr(
+        client_mod, "open",
+        lambda path, mode, *a, **kw: _SpyFile(real_open(path, mode, *a, **kw)),
+        raising=False,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    await client.upload_file(9, "output.ply", src)
+    await client.close()
+
+    assert reads, "upload read nothing"
+    assert all(t is not loop_thread for _, t in reads), (
+        "upload_file read from disk on the event-loop thread; a multi-GB "
+        "output would freeze the heartbeat and the CancelGuard poll"
+    )
+    # 1 MB reads, not httpx's 64 KB ones: 2 full chunks, a tail, then EOF.
+    assert [n for n, _ in reads] == [
+        _UPLOAD_CHUNK_BYTES, _UPLOAD_CHUNK_BYTES, 1234, 0,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upload_file_closes_source_when_cancelled_mid_read(
+    tmp_path, monkeypatch,
+):
+    """A cancel landing between chunk reads must still close the file.
+
+    The body generator owns the handle now, so an abort mid-stream unwinds
+    through its ``finally`` — a leaked descriptor per cancelled upload would
+    exhaust a long-running worker.
+    """
+    from task_worker_api import client as client_mod
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"y" * (3 * _UPLOAD_CHUNK_BYTES))
+
+    cancelled = asyncio.Event()
+    state: dict = {}
+    real_open = open
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+            self.closed_calls = 0
+            state["file"] = self
+
+        def read(self, n=-1):
+            cancelled.set()  # a user cancel arriving mid-upload
+            return self._f.read(n)
+
+        def close(self):
+            self.closed_calls += 1
+            return self._f.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+    monkeypatch.setattr(
+        client_mod, "open",
+        lambda path, mode, *a, **kw: _SpyFile(real_open(path, mode, *a, **kw)),
+        raising=False,
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        await asyncio.sleep(30)
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled):
+        await asyncio.wait_for(
+            client.upload_file(9, "output.ply", src, cancelled=cancelled), 5,
+        )
+    await client.close()
+
+    assert state["file"].closed_calls >= 1, "cancelled upload leaked the handle"
+
+
+@pytest.mark.parametrize("stall_at", ["open", "read", "close"])
+@pytest.mark.asyncio
+async def test_upload_file_closes_source_when_cancelled_twice(
+    tmp_path, monkeypatch, stall_at,
+):
+    """A *second* cancel landing mid-drain must not orphan the handle.
+
+    ``asyncio.shield`` in ``_to_thread_complete`` only defers the *first*
+    cancellation; the drain behind it used to be a bare ``await``, and so was
+    cancellable all over again. A worker shutdown landing on top of the
+    user's cancel — while ``open``/``read``/``close`` is still blocked in its
+    thread — therefore abandoned that thread mid-flight and unwound before it
+    produced a result, so the ``cancel_cleanup`` that closes a just-opened
+    handle never ran. Zero ``close()`` calls, one leaked descriptor per
+    cancelled upload, on exactly the slow storage where a blocking call sits
+    still long enough for two cancels to land on it.
+
+    Both cancels are real: ``cancelled`` is the ``CancelGuard`` poll seeing
+    the user's cancel, and ``task.cancel()`` is the worker shutting down on
+    top of it. ``upload_file`` reports the user's cancel (``TaskCancelled``)
+    — but only after the handle is actually closed, which is the point.
+    """
+    import threading
+
+    from task_worker_api import client as client_mod
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"y" * (2 * _UPLOAD_CHUNK_BYTES))
+
+    entered = threading.Event()   # set from the worker thread, in the stall
+    release = threading.Event()   # let the stalled call finally return
+    handles: list = []
+    real_open = open
+
+    def _stall(where):
+        if where == stall_at:
+            entered.set()
+            assert release.wait(10), f"test never released the blocked {where}"
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+            self.closed_calls = 0
+            handles.append(self)
+
+        def read(self, n=-1):
+            _stall("read")
+            return self._f.read(n)
+
+        def close(self):
+            _stall("close")
+            self.closed_calls += 1
+            return self._f.close()
+
+    def _spy_open(path, mode, *a, **kw):
+        # Stall *before* the real open, so cancelling here races the handle
+        # into existence: the caller has no reference to close yet.
+        _stall("open")
+        return _SpyFile(real_open(path, mode, *a, **kw))
+
+    monkeypatch.setattr(client_mod, "open", _spy_open, raising=False)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        await asyncio.sleep(30)
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    cancelled = asyncio.Event()
+    task = asyncio.create_task(
+        client.upload_file(9, "output.ply", src, cancelled=cancelled)
+    )
+
+    for _ in range(500):            # wait for the thread to reach the stall
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set(), f"upload never blocked in {stall_at}"
+
+    cancelled.set()                 # cancel 1: the user, via CancelGuard
+    await asyncio.sleep(0.05)       # let it abort the PUT and start draining
+    task.cancel()                   # cancel 2: worker shutdown, mid-drain
+    await asyncio.sleep(0.05)
+    release.set()                   # the blocked call returns at last
+
+    with pytest.raises(TaskCancelled):
+        await asyncio.wait_for(task, 5)
+    await client.close()
+
+    assert len(handles) == 1, f"expected one open handle, got {len(handles)}"
+    handle = handles[0]
+    assert handle.closed_calls == 1, (
+        f"twice-cancelled upload blocked in {stall_at} left the source "
+        f"handle with {handle.closed_calls} close() calls, not 1 — a leaked "
+        f"descriptor per cancelled upload exhausts a long-running worker"
+    )
+    assert handle._f.closed, "the underlying file object is still open"
+
+
+@pytest.mark.asyncio
+async def test_upload_file_closes_source_when_transport_aborts_mid_body(
+    tmp_path, monkeypatch,
+):
+    """A transport failing mid-PUT must not leak the source descriptor.
+
+    The cancel path above unwinds *through* the generator, so its ``finally``
+    runs. A transport error does not: httpx raises from its own frame and
+    never closes a body iterator it did not create, leaving the generator
+    parked on its ``yield`` with ``src`` open. Nothing reaps it either —
+    ``_retry`` parks the attempt's exception in ``last_exc`` to re-raise, and
+    that traceback keeps the generator frame reachable — so without an
+    explicit ``aclose()`` the descriptor survives the whole retry loop and
+    escapes to the caller. One per failed attempt is how a worker retrying a
+    multi-GB output upload runs out of file descriptors.
+
+    ``MockTransport`` cannot express this: it ``aread()``s the whole request
+    before invoking the handler, so the body is always fully drained. This
+    needs a transport that stops iterating part-way.
+    """
+    from task_worker_api import client as client_mod
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"y" * (3 * _UPLOAD_CHUNK_BYTES))
+
+    handles: list = []
+    real_open = open
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+            self.closed_calls = 0
+            handles.append(self)
+
+        def read(self, n=-1):
+            return self._f.read(n)
+
+        def close(self):
+            self.closed_calls += 1
+            return self._f.close()
+
+    monkeypatch.setattr(
+        client_mod, "open",
+        lambda path, mode, *a, **kw: _SpyFile(real_open(path, mode, *a, **kw)),
+        raising=False,
+    )
+
+    attempts = {"n": 0}
+
+    class _AbortingTransport(httpx.AsyncBaseTransport):
+        """Consume the prologue + one file chunk, then sever the connection."""
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            seen = 0
+            async for _ in request.stream:
+                seen += 1
+                if seen >= 2:
+                    raise httpx.ReadError("connection reset mid-upload")
+            return httpx.Response(200)
+
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=_AbortingTransport(),
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x",
+        client=http, max_retries=2, retry_backoff_s=0.0, retry_jitter=False,
+    )
+    with pytest.raises(httpx.ReadError):
+        await client.upload_file(9, "output.ply", src)
+
+    # Deliberately no gc.collect(): the point is that the handle is closed
+    # promptly by the upload itself, not eventually by the collector once the
+    # caller drops the traceback. Several turns rule out "the loop just hadn't
+    # got round to finalising it yet".
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await client.close()
+
+    assert attempts["n"] == 2, "expected both attempts to reach the transport"
+    assert len(handles) == 2, "expected one fresh handle per attempt"
+    assert all(h.closed_calls >= 1 for h in handles), (
+        "a transport failure mid-body leaked the source descriptor: "
+        f"{sum(1 for h in handles if not h.closed_calls)} of {len(handles)} "
+        "handle(s) still open"
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_file_rejects_source_that_changed_size(tmp_path, monkeypatch):
+    """A file mutated between the stat and the read must fail loudly.
+
+    The Content-Length is computed from ``stat``; sending fewer bytes than
+    declared would leave the backend with a truncated (or hung) upload
+    instead of an error.
+    """
+    from task_worker_api import client as client_mod
+    from task_worker_api.errors import ProtocolError
+
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"z" * 4096)
+
+    real_open = open
+
+    def shrinking_open(path, mode, *a, **kw):
+        f = real_open(path, mode, *a, **kw)
+        src.write_bytes(b"z" * 16)  # truncated after the size was measured
+        return f
+
+    monkeypatch.setattr(client_mod, "open", shrinking_open, raising=False)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler)
+    with pytest.raises(ProtocolError):
+        await client.upload_file(9, "output.ply", src)
+    await client.close()
 
 
 # -----------------------------------------------------------------------
