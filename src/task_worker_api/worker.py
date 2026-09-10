@@ -370,10 +370,13 @@ def _make_sync_fail(
                 # exclusion of 500: this is a terminal report, the same case
                 # ``complete``/``fail`` opt into 500 for — a 500 can be the
                 # backend's own dependency dying mid-write, and dropping the
-                # report orphans the task as RUNNING until the sweeper.
+                # report orphans the task as RUNNING until the sweeper. 3xx is
+                # retried too: urllib raises ``HTTPError`` rather than
+                # following a redirect on a PUT, and a redirect is a
+                # misrouted/reconfigured backend, not a definitive answer.
                 if (
                     isinstance(e, urllib.error.HTTPError)
-                    and e.code < 500
+                    and 400 <= e.code < 500
                     and e.code not in (408, 429)
                 ):
                     raise

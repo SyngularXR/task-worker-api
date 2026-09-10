@@ -14,8 +14,8 @@
   definitive answer — 400 (bad body), 404 (task gone), 409 (already terminal)
   — cost ~9s of pointless sleeping before `_on_hard_exit()`/`os._exit(75)`,
   delaying the container restart that is the entire recovery path for an
-  in-process wedge. Transient failures (URLError/socket timeout, 408, 429,
-  5xx) keep the existing retry budget; 5xx is retried here — unlike
+  in-process wedge. Everything else (URLError/socket timeout, 3xx, 408, 429,
+  5xx) keeps the existing retry budget; 5xx is retried here — unlike
   `_TRANSIENT_STATUS_CODES`' exclusion of 500 — because this is a terminal
   report, the same case `complete`/`fail` opt into 500 for. The post-loop
   `assert last_exc is not None` is now an explicit raise, matching

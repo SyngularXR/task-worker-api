@@ -533,6 +533,31 @@ def test_sync_fail_raises_permanent_http_error_on_first_attempt(monkeypatch):
     assert sleeps == []
 
 
+def test_sync_fail_retries_redirect_http_error(monkeypatch):
+    """urllib raises rather than following a 302 on a PUT — still transient."""
+    from task_worker_api import worker as worker_mod
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise _http_error(302)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 5, "worker-1"
+    )
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        sync_fail("timeout")
+
+    assert excinfo.value.code == 302
+    assert calls["n"] == 3
+    assert sleeps == [2.0, 2.0]
+
+
 def test_sync_fail_retries_transient_http_error(monkeypatch):
     """503 (and 408/429) keep the existing 3-attempt behaviour."""
     from task_worker_api import worker as worker_mod
