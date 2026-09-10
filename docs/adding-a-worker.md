@@ -328,7 +328,11 @@ a blocking `thread.join()`) outlasts the grace no matter what it is set
 to, because the grace is an `asyncio` timer that only fires when the loop
 runs. Raise `cancel_grace_s` if your handler needs longer to stop or
 unwind on its own — a thread you signalled keeps running if the abort
-lands first.
+lands first. All of this is the *user cancel* path only: a plain worker
+shutdown (uvicorn exit, container stop) with no cancel behind it waits your
+cleanup out however long it takes and never triggers the restart, so a
+deploy stays graceful — the deployment's own SIGTERM → SIGKILL grace is
+what bounds that case.
 
 Three canonical handler shapes, pick yours:
 

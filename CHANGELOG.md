@@ -32,7 +32,12 @@
   drained no longer cuts the drain short: the drain rides the cancellation out
   against the same deadline, so a handler that outlives it is still escalated
   (and the shutdown still propagates afterwards) instead of being detached,
-  reported and having its workdir deleted while it runs. That bound is on *stopping the handler*, not on the
+  reported and having its workdir deleted while it runs. The bounded, escalating
+  drain is scoped to the user-cancel path: a plain worker shutdown with no
+  cancel behind it (run_hybrid cancelling the worker task on a uvicorn shutdown
+  or container stop) waits the handler's unwind out for as long as it takes, as
+  a plain `await handler(...)` always did, so an ordinary deploy stays graceful
+  instead of hard-exiting whenever cleanup outlasts `cancel_grace_s`. That bound is on *stopping the handler*, not on the
   backend recording the cancel: the terminal `fail()` keeps its own retry
   budget, lifecycle deadline and `Retry-After` waits. Cleanup that *blocks* the
   loop (`time.sleep`, a blocking `join()`) is outside the abort bound and

@@ -676,7 +676,11 @@ async def _await_unless_cancelled(
 
     If the *caller* is cancelled while waiting (worker shutdown), the
     operation is cancelled too rather than left running detached with a file
-    handle open.
+    handle open. That drain is bounded and escalating only if the user cancel
+    had already fired; a shutdown with no cancel behind it waits out the
+    handler's unwind as a plain ``await handler(...)`` always did, so an
+    ordinary deploy stays graceful instead of hard-exiting on any cleanup
+    slower than ``grace_s``.
 
     Every exit drains both children before returning or raising: cancellation
     is cooperative, so merely requesting it would let the PUT run on past the
@@ -693,9 +697,22 @@ async def _await_unless_cancelled(
 
     async def abort(task):
         """Stop ``request``. Our own transfer coroutines are drained to
-        completion; a handler gets ``grace_s`` to unwind, past which it is
-        still running and ``on_abandoned`` escalates."""
-        if grace_s:
+        completion; a handler whose *user cancel* fired gets ``grace_s`` to
+        unwind, past which it is still running and ``on_abandoned``
+        escalates.
+
+        The bounded, escalating drain belongs to the user-cancel path only.
+        An ordinary worker shutdown (run_hybrid cancelling the worker task on
+        a uvicorn shutdown or container stop) cancels *us* with the event
+        never set, and there a slow unwind is not a handler ignoring a cancel
+        — it is the normal end of a deploy, which before the cancel race
+        awaited the handler's cleanup for as long as it took. Escalating
+        there would turn every graceful shutdown whose cleanup outlasts
+        ``grace_s`` into a hard-exit; the deployment's own SIGTERM → SIGKILL
+        grace is what bounds that case, and :class:`TaskWatchdog` still
+        covers an in-process wedge.
+        """
+        if grace_s and cancelled.is_set():
             await _cancel_and_drain_bounded(task, grace_s, on_abandoned)
         else:
             await _cancel_and_drain(task)

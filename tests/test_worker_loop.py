@@ -1760,3 +1760,65 @@ async def test_cancel_abort_of_loop_blocking_cleanup_still_reports(
     assert len(client.failed_tasks) == 1
     assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
     assert hard_exits == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_without_cancel_does_not_escalate(
+    make_worker, fake_client, tmp_path,
+):
+    """An ordinary worker shutdown must stay graceful, even when the
+    handler's cleanup outlasts ``cancel_grace_s``.
+
+    The cancel race routes *every* cancellation of the worker task through
+    the same abort helper, so a deploy-time shutdown — where the user-cancel
+    event never fired — was taking the bounded, escalating drain meant for a
+    handler ignoring a cancel: cleanup slower than the grace called
+    ``on_abandoned``, and the worker hard-exited for a supervised restart at
+    the end of every deploy. Without a cancel behind it the shutdown must
+    wait the unwind out, as a plain ``await handler(...)`` always did, and
+    report the shutdown reason rather than a cancel.
+    """
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    fake_client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    in_handler = asyncio.Event()
+    cleaned_up = []
+
+    async def handler(ctx, params):
+        in_handler.set()
+        try:
+            await asyncio.sleep(60)
+        finally:
+            # Flushing a checkpoint, terminating a subprocess, joining a
+            # worker thread: normal shutdown cleanup, deliberately far
+            # longer than the grace below.
+            await asyncio.shield(asyncio.sleep(0.2))
+            cleaned_up.append(True)
+        return {}  # pragma: no cover — cancelled first
+
+    hard_exits = []
+    worker = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_grace_s=0.01,
+        on_hard_exit=lambda: hard_exits.append(True),
+    )
+    run = asyncio.ensure_future(worker.run_one())
+    await asyncio.wait_for(in_handler.wait(), timeout=5)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=10)
+
+    assert cleaned_up, "handler cleanup never finished"
+    assert hard_exits == [], (
+        "a graceful shutdown escalated to a supervised restart"
+    )
+    assert not worker._stop.is_set()
+    assert fake_client.completed_tasks == []
+    assert len(fake_client.failed_tasks) == 1
+    error = fake_client.failed_tasks[0]["error"]
+    assert "worker shut down before task" in error, error
+    assert "cancelled by user" not in error.lower(), error
