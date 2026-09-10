@@ -1290,7 +1290,13 @@ class Worker:
             )
             wd.start()
 
-        outcome: tuple[str, object] = ("fail", "unknown")
+        # Only reachable when the try below exits through a BaseException no
+        # handler covers (SystemExit, KeyboardInterrupt) — cancellation has
+        # its own handler. Named for what it is, so a task that lands with
+        # this reason points at that path instead of reading as "no idea".
+        outcome: tuple[str, object] = (
+            "fail", "worker exited the task without recording an outcome",
+        )
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1405,6 +1411,19 @@ class Worker:
 
         except TaskCancelled:
             outcome = ("fail", "cancelled by user")
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so neither handler below sees
+            # it and the finally reported the seeded placeholder instead. That
+            # is the common case, not an exotic one: run_hybrid cancels the
+            # worker task whenever the app side exits (uvicorn shutdown,
+            # container stop), so every task interrupted by a deploy landed on
+            # the backend — and in the UI — with an unusable reason. Worded
+            # neutrally because the caller's motive isn't knowable from here:
+            # shutdown is the usual one, but any owner of the worker task can
+            # cancel it. Re-raised so cancellation still propagates; the
+            # finally below already sends the terminal report.
+            outcome = ("fail", "worker task cancelled while processing")
+            raise
         except (TaskParamsError, ProtocolError) as e:
             log.error("task %s protocol error: %s", task.id, e)
             outcome = ("fail", str(e))
