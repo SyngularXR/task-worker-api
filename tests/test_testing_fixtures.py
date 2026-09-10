@@ -98,7 +98,7 @@ async def test_complete_rejects_result_the_real_client_could_not_encode():
     the worker.
     """
     fake = FakeBackendClient()
-    with pytest.raises(TypeError, match="PosixPath"):
+    with pytest.raises(TypeError, match=type(Path("/tmp/a.ply")).__name__):
         await fake.complete(42, {"output_files": [{"path": Path("/tmp/a.ply")}]})
     assert fake.completed_tasks == []
 

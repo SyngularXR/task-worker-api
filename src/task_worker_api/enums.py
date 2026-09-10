@@ -24,6 +24,7 @@ class TaskType(str, Enum):
     DETECT_CUT_PLANES = "detect_cut_planes"
     CINEMATIC_BAKING = "cinematic_baking"
     DEPLOY_CASE = "deploy_case"
+    PREPARE_DEPLOY = "prepare_deploy"
     # Synthetic MRI super-resolution reconstruction (NiftyMIC). GENERATE is the
     # remote SRR compute (Neural-Canvas worker → synthetic-generator image);
     # FINALIZE is the backend-local DB import step (never claimed by a worker).
@@ -34,6 +35,15 @@ class TaskType(str, Enum):
     # TASK_PARAMS_SCHEMAS), mirroring FINALIZE_SYNTHETIC. Value kept <=20 chars to
     # fit the backend's task_type column (CharEnumField max_length=20).
     FINALIZE_SEGMENTATION = "finalize_segment"
+    # Admitted backend CPU publication; deliberately not publicly creatable.
+    FINALIZE_SPATIAL = "finalize_spatial"
+    FINALIZE_GS = "finalize_gs"
+    FINALIZE_RENDER = "finalize_render"
+    FINALIZE_GS4D = "finalize_gs4d"
+    FINALIZE_MODEL = "finalize_model"
+    FINALIZE_CINEMATIC = "finalize_cinematic"
+    FINALIZE_DEPLOY = "finalize_deploy"
+    FINALIZE_DEPLOY_PREPARATION = "finalize_deploy_prep"
     SPATIAL_RECONSTRUCTION = "spatial_recon"
     SPATIAL_GS_BUILD = "spatial_gs_build"
 

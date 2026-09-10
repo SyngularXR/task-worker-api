@@ -1070,7 +1070,7 @@ def test_orphan_workdir_sweep_is_age_floored_and_narrow(tmp_path):
     stale = time.time() - 7200
     for root in (old, active, recently_touched, malformed, nested):
         for path in reversed([root, *root.rglob("*")]):
-            os.utime(path, (stale, stale), follow_symlinks=False)
+            os.utime(path, (stale, stale))
     # The root can be old while a file written by a live/recent attempt is not.
     fresh_file = recently_touched / "in" / "input.bin"
     os.utime(fresh_file, None)
@@ -1216,7 +1216,7 @@ async def test_unremovable_stale_workdir_aborts_the_attempt(
         "out/planes.json would be published as this attempt's result"
     )
     assert len(fake_client.failed_tasks) == 1
-    assert str(stale) in fake_client.failed_tasks[0]["error"], (
+    assert any(path in fake_client.failed_tasks[0]["error"] for path in (str(stale), repr(str(stale)))), (
         "failure reason must name the workdir an operator has to clear"
     )
 

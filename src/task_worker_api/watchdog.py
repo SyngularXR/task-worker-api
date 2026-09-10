@@ -204,8 +204,17 @@ class TaskWatchdog:
             return
         # Phase 3 — in-process wedge: nothing killable freed the loop.
         if self.guard.claim():
-            try:
-                self._sync_fail(f"timeout: exceeded {self.timeout_s:.0f}s (hard-exit)")
-            except Exception as e:  # noqa: BLE001
-                log.warning("watchdog sync_fail failed: %s", e)
+            def report():
+                try:
+                    self._sync_fail(f"timeout: exceeded {self.timeout_s:.0f}s (hard-exit)")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("watchdog sync_fail failed: %s", e)
+
+            # Socket timeouts do not bound every resolver/transport failure.
+            # Reporting must never prevent termination of a wedged worker.
+            reporter = threading.Thread(target=report, name="watchdog-report", daemon=True)
+            reporter.start()
+            reporter.join(timeout=self.grace_s)
+            if reporter.is_alive():
+                log.warning("watchdog failure report exceeded grace; exiting without acknowledgement")
         self._on_hard_exit()

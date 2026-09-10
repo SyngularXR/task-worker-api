@@ -128,7 +128,7 @@ def _is_transient_status(
     )
 
 
-def _retry_after_delay(response: httpx.Response) -> Optional[float]:
+def _retry_after_delay(response: httpx.Response, *, maximum_seconds: Optional[int] = _MAX_RETRY_AFTER_S) -> Optional[float]:
     """Parse a response's ``Retry-After`` header into a delay in seconds.
 
     RFC 9110 allows two forms and both are accepted: delta-seconds
@@ -137,7 +137,8 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
 
     Returns ``None`` only when the header carries no usable guidance — absent
     or malformed. The caller then falls back to its own exponential schedule.
-    Valid delays are capped at ``_MAX_RETRY_AFTER_S``. This is deliberately
+    By default valid delays are capped at ``_MAX_RETRY_AFTER_S``; admission v2
+    passes maximum_seconds=None so server guidance is never shortened. This is deliberately
     separate from ``retry_backoff_max_s``: a 60-second exponential-backoff cap
     must not turn ``Retry-After: 3600`` into six requests inside a one-hour
     rate-limit window.
@@ -162,12 +163,14 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
         # overflow, this avoids Python's length limit and conversion cost for
         # an attacker-controlled string containing thousands of digits.
         value = value.lstrip("0") or "0"
-        ceiling = str(_MAX_RETRY_AFTER_S)
-        if len(value) > len(ceiling) or (
-            len(value) == len(ceiling) and value > ceiling
-        ):
-            return float(_MAX_RETRY_AFTER_S)
-        return float(value)
+        if maximum_seconds is not None:
+            ceiling = str(maximum_seconds)
+            if len(value) > len(ceiling) or (len(value) == len(ceiling) and value > ceiling):
+                return float(maximum_seconds)
+        delay = float(value)
+        if not math.isfinite(delay):
+            raise ProtocolError("Retry-After exceeds a representable wait; refusing an early retry")
+        return delay
     try:
         when = parsedate_to_datetime(raw)
     except (TypeError, ValueError, OverflowError):
@@ -181,7 +184,7 @@ def _retry_after_delay(response: httpx.Response) -> Optional[float]:
         when = when.replace(tzinfo=timezone.utc)
     # A date already past means "retry now", not "no guidance".
     delay = max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
-    return min(delay, _MAX_RETRY_AFTER_S)
+    return min(delay, maximum_seconds) if maximum_seconds is not None else delay
 
 
 def _backoff_delay(
@@ -617,6 +620,7 @@ class BackendClient:
         path: str,
         extra_transient: frozenset = frozenset(),
         attempts: Optional[int] = None,
+        retry_after_max_s: Optional[int] = _MAX_RETRY_AFTER_S,
     ):
         """Run ``await fn()`` with exponential-backoff retry on transient errors.
 
@@ -719,7 +723,7 @@ class BackendClient:
                 # in_progress until the sweeper reclaims it. Absent or
                 # unparseable header → the capped-jittered exponential
                 # schedule, exactly as before.
-                retry_after = _retry_after_delay(e.response)
+                retry_after = _retry_after_delay(e.response, maximum_seconds=retry_after_max_s)
                 if retry_after is None:
                     delay = _backoff_delay(
                         attempt, self.retry_backoff_s,
@@ -731,8 +735,11 @@ class BackendClient:
                     # moving any request back inside the closed window.
                     delay = retry_after
                     if self.retry_jitter and delay > 0:
-                        delay *= 1.0 + random.uniform(0.0, _JITTER_SPREAD)
-                        delay = min(delay, _MAX_RETRY_AFTER_S)
+                        if retry_after_max_s is None:
+                            delay += random.uniform(0.0, 1.0)
+                        else:
+                            delay *= 1.0 + random.uniform(0.0, _JITTER_SPREAD)
+                            delay = min(delay, retry_after_max_s)
                 what = f"HTTP {e.response.status_code}"
                 source = " (Retry-After)" if retry_after is not None else ""
             # Reached only from a retryable failure that still has attempts
@@ -827,6 +834,213 @@ class BackendClient:
         )
 
     # ----- task lifecycle --------------------------------------------
+
+    async def resource_claim(self, journal, worker_instance_id, task_types, host_report):
+        """V2 claim transport; returns (claim or None, minimum next-poll delay).
+
+        The caller runs heartbeat/cancel independently and waits the returned
+        delay. Journal identity is persisted before entering the HTTP retry loop.
+        This does not enable v2 on the existing Worker loop.
+        """
+        from .resources import ClaimResult
+
+        request = journal.prepare(worker_instance_id, frozenset(task_types))
+        body = {**request.model_dump(mode="json"), "host_report": host_report.model_dump(mode="json")}
+        response = await self._resource_request("POST", "/tasks/claim", json=body)
+        if response.status_code == 204:
+            journal.record_response(request.claim_request_id, None)
+            delay = _retry_after_delay(response, maximum_seconds=None)
+            return None, (5.0 if delay is None else delay)
+        result = ClaimResult.model_validate(response.json())
+        if result.ownership.worker_instance_id != worker_instance_id:
+            raise ProtocolError("claim response belongs to another worker instance")
+        journal.record_response(request.claim_request_id, result)
+        return result, 0.0
+
+    async def _resource_request(self, method, path, **kwargs):
+        async def once():
+            response = await self._client.request(method, path, timeout=self._lifecycle_timeout, **kwargs)
+            if response.status_code in (410, 426):
+                raise ProtocolError("worker_protocol_unsupported: coordinated worker upgrade required")
+            response.raise_for_status()
+            return response
+
+        return await self._retry(once, method=method, path=path, retry_after_max_s=None)
+
+    async def resource_operation(self, journal, kind, payload, *, host_report=None, cleanup=None):
+        """Persist operation UUID once, then reuse through all transport retries."""
+        from .resources import AdmissionError, ClaimResult
+
+        if kind not in ("start", "complete", "fail", "decline", "release"):
+            raise AdmissionError("invalid_operation")
+        pending = journal.pending()
+        if not pending or not pending[1] or not pending[1]["claim"]:
+            raise AdmissionError("claim_request_unknown")
+        claim = ClaimResult.model_validate(pending[1]["claim"])
+        semantic_payload = payload
+        if kind == "release":
+            if cleanup is None or host_report is None:
+                raise AdmissionError("cleanup_evidence_required")
+            semantic_payload = cleanup.observation.evidence.model_dump(mode="json")
+        body = {**payload, "protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json")}
+        if host_report is not None:
+            body["host_report"] = host_report.model_dump(mode="json")
+        if cleanup is not None:
+            body["cleanup"] = cleanup.model_dump(mode="json")
+        operation_id = journal.prepare_operation(kind, semantic_payload, request=body)
+        return await self._resource_replay_operation(journal, claim, kind, operation_id)
+
+    async def resource_recover_operations(self, journal):
+        """Replay durable requests after restart; never execute a recovered handler.
+
+        Start acknowledgement is not permission to resume an old process. The
+        supervisor must reconcile that attempt before this worker can claim again.
+        """
+        from .resources import AdmissionError, ClaimResult
+
+        pending = journal.pending()
+        if not pending or not pending[1] or not pending[1]["claim"]:
+            raise AdmissionError("claim_request_unknown")
+        claim = ClaimResult.model_validate(pending[1]["claim"])
+        states = []
+        for kind, operation_id in journal.unresolved_operations():
+            states.append(await self._resource_replay_operation(journal, claim, kind, operation_id))
+        return states
+
+    async def _resource_replay_operation(self, journal, claim, kind, operation_id):
+        from .resource_protocol import AttemptState
+
+        body = journal.operation_request(kind, operation_id)
+        method = "PUT" if kind in ("complete", "fail") else "POST"
+        try:
+            response = await self._resource_request(method, f"/tasks/{claim.task_id}/{kind}", json=body)
+        except httpx.HTTPStatusError as exc:
+            # These named precondition failures roll back the backend transaction.
+            # Timeouts, 5xx, fencing and idempotency conflicts remain unresolved.
+            if exc.response.status_code == 409:
+                try:
+                    code = exc.response.json().get("code")
+                except (ValueError, AttributeError):
+                    code = None
+                if code in ("hardware_report_stale", "cleanup_evidence_stale"):
+                    journal.record_operation(kind, operation_id, {"rejected": code})
+            raise
+        state = AttemptState.model_validate(response.json())
+        if state.attempt_id != claim.ownership.attempt_id or state.task_id != claim.task_id:
+            raise ProtocolError("operation response belongs to another attempt")
+        journal.record_operation(kind, operation_id, state.model_dump(mode="json"))
+        return state
+
+    async def resource_progress(self, claim, progress):
+        """One-shot display update; lease renewal runs independently."""
+        from .resource_protocol import AttemptState
+
+        response = await self._client.request("PUT", f"/tasks/{claim.task_id}/progress", timeout=5,
+            json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
+        response.raise_for_status()
+        return AttemptState.model_validate(response.json())
+
+    async def resource_status(self, claim):
+        from .resource_protocol import AttemptState
+
+        params = claim.ownership.model_dump(mode="json", exclude={"token"})
+        response = await self._resource_request("GET", f"/tasks/{claim.task_id}/cancel-status",
+                                                params=params, headers={"X-Attempt-Token": claim.ownership.token})
+        return AttemptState.model_validate(response.json())
+
+    async def resource_heartbeat(self, claim):
+        from .resource_protocol import AttemptState
+
+        response = await self._resource_request("POST", "/workers/heartbeat", params={"task_id": claim.task_id},
+                                                json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json")})
+        return AttemptState.model_validate(response.json())
+
+    async def resource_ready(self, journal, worker_instance_id):
+        from .resources import AdmissionError
+
+        if journal.pending() is not None:
+            raise AdmissionError("previous_claim_unresolved")
+        response = await self._resource_request("POST", "/workers/ready",
+            json={"protocol_version": 2, "worker_instance_id": str(worker_instance_id)})
+        body = response.json()
+        if body.get("worker_instance_id") != str(worker_instance_id) or body.get("ready") is not True:
+            raise ProtocolError("invalid worker readiness acknowledgement")
+
+    async def resource_download(self, claim, artifact, dest: Path):
+        """Fetch exactly the admitted input and reject truncated or changed bytes."""
+        import hashlib
+        from .files import _require_safe_filename
+
+        _require_safe_filename(artifact.filename, field="inputs", key="filename")
+        if artifact not in claim.task.inputs.values():
+            raise ProtocolError("input not declared in claim")
+        path = f"/tasks/{claim.task_id}/attempts/{claim.ownership.attempt_id}/inputs/{artifact.filename}"
+        params = claim.ownership.model_dump(mode="json", exclude={"token", "attempt_id"})
+        params["protocol_version"] = 2
+
+        async def once():
+            digest = hashlib.sha256()
+            size = 0
+            async with self._client.stream("GET", path, params=params,
+                    headers={"X-Attempt-Token": claim.ownership.token}, timeout=self._file_timeout) as response:
+                if response.status_code in (410, 426):
+                    raise ProtocolError("worker_protocol_unsupported: coordinated worker upgrade required")
+                response.raise_for_status()
+                file = await _to_thread_complete(open, dest, "wb", cancel_cleanup=lambda opened: opened.close())
+                try:
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > artifact.size_bytes:
+                            raise ProtocolError("input exceeds admitted size")
+                        digest.update(chunk)
+                        await _to_thread_complete(file.write, chunk)
+                    if size != artifact.size_bytes or digest.hexdigest() != artifact.sha256:
+                        raise ProtocolError("input differs from admitted digest")
+                finally:
+                    await _to_thread_complete(file.close)
+
+        try:
+            await self._retry(once, method="GET", path=path, retry_after_max_s=None)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
+
+    async def resource_upload(self, claim, filename, src: Path):
+        """Immutable attempt output; retries restart the stream, never overwrite another attempt."""
+        import hashlib
+        from .files import _require_safe_filename
+
+        _require_safe_filename(filename, field="output_files", key="filename")
+        path = f"/tasks/{claim.task_id}/attempts/{claim.ownership.attempt_id}/outputs/{filename}"
+        params = claim.ownership.model_dump(mode="json", exclude={"token", "attempt_id"})
+        params["protocol_version"] = 2
+
+        async def once():
+            digest = hashlib.sha256()
+            size = 0
+            file = await _to_thread_complete(open, src, "rb", cancel_cleanup=lambda opened: opened.close())
+            try:
+                async def chunks():
+                    nonlocal size
+                    while chunk := await _to_thread_complete(file.read, _DOWNLOAD_CHUNK_BYTES):
+                        size += len(chunk)
+                        digest.update(chunk)
+                        yield chunk
+
+                response = await self._client.request("PUT", path, params=params, content=chunks(),
+                    headers={"X-Attempt-Token": claim.ownership.token, "Content-Type": "application/octet-stream"},
+                    timeout=self._file_timeout)
+                if response.status_code in (410, 426):
+                    raise ProtocolError("worker_protocol_unsupported: coordinated worker upgrade required")
+                response.raise_for_status()
+                expected = {"filename": filename, "sha256": digest.hexdigest(), "size_bytes": size}
+                if response.json() != expected:
+                    raise ProtocolError("artifact acknowledgement differs from uploaded content")
+                return expected
+            finally:
+                await _to_thread_complete(file.close)
+
+        return await self._retry(once, method="PUT", path=path, retry_after_max_s=None)
 
     async def claim_next(
         self, task_types: list, worker_id: str
