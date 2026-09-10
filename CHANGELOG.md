@@ -9,6 +9,20 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- `prepare_inputs` and `upload_outputs` now reject a manifest whose keys
+  collide on one filename, instead of silently overwriting. Both flatten the
+  manifest by filename — `input_files` values are staged into `work_dir/in/`,
+  `output_files` values are published by basename — so two logical keys
+  resolving to the same name (`scene` and `warm_start` both `model.ply`) made
+  the second download clobber the first (the handler then read the wrong bytes
+  for one key) and published one artifact under both output keys. The whole
+  manifest is validated up front, so the task fails with a `ProtocolError`
+  naming both colliding keys before any download, copy or upload leaves
+  partial state — matching what the admitted (v2) path,
+  `prepare_admitted_inputs`, has always done. The v2 path's own duplicate
+  check is now redundant and was dropped; the shared
+  `_require_safe_filenames` check it delegates to raises the same
+  `ProtocolError` with a message that names the keys.
 - The watchdog's last-resort `fail()` report no longer retries a permanent
   4xx. `_make_sync_fail` retried *any* exception 3× with 2s sleeps, so a
   definitive answer — 400 (bad body), 404 (task gone), 409 (already terminal)

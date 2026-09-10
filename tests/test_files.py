@@ -1602,6 +1602,27 @@ async def test_prepare_inputs_rejects_case_colliding_names(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prepare_inputs_rejects_duplicate_filenames(tmp_path):
+    """Two logical inputs mapping to one basename would land on the same
+    staged file, so the handler would read the wrong bytes for one key."""
+    from task_worker_api.errors import ProtocolError
+
+    work_dir = tmp_path / "work" / "task_58"
+    client = FakeBackendClient()
+    client.queue_file(58, "model.ply", b"payload")
+    task = _claimed(58, params={"input_files": {
+        "scene": "model.ply", "warm_start": "model.ply",
+    }})
+
+    with pytest.raises(ProtocolError, match="'warm_start'.*'scene'"):
+        await prepare_inputs(task, client, work_dir)
+
+    assert not (work_dir / "in" / "model.ply").exists(), (
+        "no input may be staged once the manifest is known to collide"
+    )
+
+
+@pytest.mark.asyncio
 async def test_upload_outputs_remote_rejects_absolute_output_filename(tmp_path):
     """Remote mode: an absolute ``output_files`` name makes ``output_dir /
     name`` resolve to that absolute path, so the worker would read an
@@ -1649,6 +1670,34 @@ async def test_upload_outputs_rejects_case_colliding_names(tmp_path):
         )
 
     assert client.uploaded_files == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_volume", [False, True])
+async def test_upload_outputs_rejects_duplicate_filenames(tmp_path, shared_volume):
+    """Two logical outputs sharing one basename would publish a single
+    artifact under both keys — refused in remote and local mode alike."""
+    from task_worker_api.errors import ProtocolError
+
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "model.ply").write_bytes(b"splat")
+    volume = tmp_path / "shared"
+    task = _claimed(58, params=(
+        {"input_path": "/ignored"} if shared_volume
+        else {"input_files": {"mesh": "in.ply"}}
+    ))
+    client = FakeBackendClient()
+
+    with pytest.raises(ProtocolError, match="'warm_start'.*'scene'"):
+        await upload_outputs(
+            task, client, _file_ctx(out_dir),
+            output_files={"scene": "model.ply", "warm_start": "model.ply"},
+            shared_volume_path=str(volume) if shared_volume else None,
+        )
+
+    assert client.uploaded_files == {}
+    assert not volume.exists(), "no staging dir for a rejected manifest"
 
 
 @pytest.mark.asyncio

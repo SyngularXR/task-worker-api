@@ -116,20 +116,37 @@ def _require_safe_filename(value: Any, *, field: str, key: str) -> str:
 def _require_safe_filenames(
     values: dict[str, Any], *, field: str,
 ) -> dict[str, str]:
-    """Validate one manifest and reject cross-platform filename aliases."""
+    """Validate one manifest and reject colliding filenames.
+
+    Two logical keys must not resolve to one file: the manifest is staged
+    into (or published from) a flat directory keyed by filename, so a
+    collision means the second key's bytes overwrite the first's — the
+    handler reads the wrong input for one key, and the backend receives one
+    artifact published under two output keys. Exact duplicates and
+    case-insensitive aliases are both rejected, naming the colliding keys.
+    """
     safe: dict[str, str] = {}
-    aliases: dict[str, str] = {}
+    aliases: dict[str, tuple[str, str]] = {}
     for key, value in values.items():
         filename = _require_safe_filename(value, field=field, key=key)
         alias = ntpath.normcase(filename)
         previous = aliases.get(alias)
-        if previous is not None and previous != filename:
+        if previous is not None:
+            previous_key, previous_name = previous
+            if previous_name == filename:
+                raise ProtocolError(
+                    f"{field}[{key!r}] and {field}[{previous_key!r}] are both "
+                    f"{filename!r}. Task file names are staged into one flat "
+                    "directory, so two keys sharing a name would silently "
+                    "overwrite each other; each key needs a distinct filename."
+                )
             raise ProtocolError(
-                f"{field}[{key!r}] = {filename!r} aliases {previous!r} on "
-                "case-insensitive filesystems. Task file names must be "
-                "distinct on both Linux and Windows."
+                f"{field}[{key!r}] = {filename!r} aliases {previous_name!r} "
+                f"(from {field}[{previous_key!r}]) on case-insensitive "
+                "filesystems. Task file names must be distinct on both Linux "
+                "and Windows."
             )
-        aliases[alias] = filename
+        aliases[alias] = (key, filename)
         safe[key] = filename
     return safe
 
@@ -432,9 +449,8 @@ async def prepare_admitted_inputs(claim, client: "BackendClient", work_root: Pat
 
     if input_snapshot_digest(claim.task) != claim.input_digest:
         raise ProtocolError("input manifest differs from admitted digest")
-    names = _require_safe_filenames({key: item.filename for key, item in claim.task.inputs.items()}, field="inputs")
-    if len(set(names.values())) != len(names):
-        raise ProtocolError("duplicate input filenames")
+    # Rejects unsafe names AND duplicate filenames across keys.
+    _require_safe_filenames({key: item.filename for key, item in claim.task.inputs.items()}, field="inputs")
     destinations = set()
     for key, artifact in claim.task.inputs.items():
         parts = artifact.path.split("/")
@@ -486,9 +502,10 @@ async def prepare_inputs(
     cancel aborts mid-file rather than after a multi-GB copy completes.
 
     Remote-mode ``input_files`` names are backend-supplied and land under
-    ``work_dir/in/``, so each must be a plain basename; one that isn't
-    fails the task with a :class:`ProtocolError` naming its key, before any
-    download starts. See :func:`_require_safe_filename`.
+    ``work_dir/in/``, so each must be a plain basename, and two keys must
+    not resolve to the same one; a manifest that breaks either rule fails
+    the task with a :class:`ProtocolError` naming the offending key(s),
+    before any download starts. See :func:`_require_safe_filenames`.
     """
     in_dir = work_dir / "in"
     out_dir = work_dir / "out"
@@ -614,12 +631,14 @@ async def upload_outputs(
     covers the staging ``mkdir`` too, so a cancel that lands on it leaves no
     empty orphan dir behind.
 
-    Every filename in ``output_files`` must be a plain basename; one that
-    isn't fails the task with a :class:`ProtocolError` naming its key. The
-    whole manifest is checked before the first upload or copy, so a bad
-    entry can't publish the entries ahead of it first — an all-or-nothing
-    check keeps a rejected manifest from leaving artifacts behind in the
-    staging dir or on the backend.
+    Every filename in ``output_files`` must be a plain basename, and two
+    keys must not share one (that would publish a single artifact under
+    both keys); a manifest that breaks either rule fails the task with a
+    :class:`ProtocolError` naming the offending key(s). The whole manifest
+    is checked before the first upload or copy, so a bad entry can't publish
+    the entries ahead of it first — an all-or-nothing check keeps a rejected
+    manifest from leaving artifacts behind in the staging dir or on the
+    backend.
     """
     safe_output_files = _require_safe_filenames(
         output_files, field="output_files",
