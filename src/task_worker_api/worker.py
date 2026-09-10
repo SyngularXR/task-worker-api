@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -330,10 +331,13 @@ def _make_sync_fail(
     short timeout — it must never become a second wedge. Matches the wire
     format of ``BackendClient.fail``: PUT /tasks/{id}/fail {"error": ...}.
 
-    Retries a few times with a short sleep (bounded ~15s total with the
-    defaults): this is the only report path for a watchdog-fired timeout, and
-    a single attempt against a momentarily unavailable backend (restart, DB
-    blip) would silently orphan the task as RUNNING until the sweeper.
+    Retries *transient* failures a few times with a short sleep (bounded ~15s
+    total with the defaults): this is the only report path for a
+    watchdog-fired timeout, and a single attempt against a momentarily
+    unavailable backend (restart, DB blip) would silently orphan the task as
+    RUNNING until the sweeper. A permanent 4xx is raised on the first attempt
+    instead: it is a definitive answer, and sleeping on it only delays the
+    hard exit.
     """
     url = (
         f"{base_url.rstrip('/')}/tasks/{task_id}/fail"
@@ -355,10 +359,36 @@ def _make_sync_fail(
                 urllib.request.urlopen(req, timeout=timeout_s).close()
                 return
             except Exception as e:  # noqa: BLE001 — retried, re-raised on exhaustion
+                # Spend the retry budget only where a retry can help: a
+                # transport failure (URLError, socket timeout) or a transient
+                # status. A permanent 4xx is a definitive answer — 400 (bad
+                # body), 404 (task gone), 409 (already terminal) — and three
+                # attempts of it only buy ~9s of sleep before
+                # ``_on_hard_exit()``/``os._exit(75)``, delaying the container
+                # restart that is the whole recovery path for an in-process
+                # wedge. 5xx *is* retried, unlike ``_TRANSIENT_STATUS_CODES``'s
+                # exclusion of 500: this is a terminal report, the same case
+                # ``complete``/``fail`` opt into 500 for — a 500 can be the
+                # backend's own dependency dying mid-write, and dropping the
+                # report orphans the task as RUNNING until the sweeper.
+                if (
+                    isinstance(e, urllib.error.HTTPError)
+                    and e.code < 500
+                    and e.code not in (408, 429)
+                ):
+                    raise
                 last_exc = e
                 if attempt < attempts - 1:
                     time.sleep(retry_sleep_s)
-        assert last_exc is not None
+        # last_exc is set here for every caller: attempts defaults to 3 and
+        # no caller lowers it below 1, so the loop runs at least once and only
+        # a re-raise leaves it unset. Explicit over a bare assert, which is
+        # stripped under -O — same guard as ``BackendClient._retry``.
+        if last_exc is None:  # pragma: no cover — only reachable via attempts < 1
+            raise RuntimeError(
+                f"sync fail report made no attempt (attempts={attempts}); "
+                "this is a bug."
+            )
         raise last_exc
 
     return _sync_fail
