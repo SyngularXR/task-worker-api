@@ -1602,23 +1602,35 @@ async def test_prepare_inputs_rejects_case_colliding_names(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_prepare_inputs_rejects_duplicate_filenames(tmp_path):
-    """Two logical inputs mapping to one basename would land on the same
-    staged file, so the handler would read the wrong bytes for one key."""
-    from task_worker_api.errors import ProtocolError
+async def test_prepare_inputs_aliases_a_repeated_filename(tmp_path):
+    """Two keys naming one input file are an alias, not a collision: both
+    resolve to the staged file, which is downloaded once."""
+    class _CountingClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.downloads: list[str] = []
+
+        async def download_file(self, task_id, filename, dest, *, cancelled=None):
+            self.downloads.append(filename)
+            await super().download_file(
+                task_id, filename, dest, cancelled=cancelled,
+            )
 
     work_dir = tmp_path / "work" / "task_58"
-    client = FakeBackendClient()
+    client = _CountingClient()
     client.queue_file(58, "model.ply", b"payload")
     task = _claimed(58, params={"input_files": {
         "scene": "model.ply", "warm_start": "model.ply",
     }})
 
-    with pytest.raises(ProtocolError, match="'warm_start'.*'scene'"):
-        await prepare_inputs(task, client, work_dir)
+    ctx = await prepare_inputs(task, client, work_dir)
 
-    assert not (work_dir / "in" / "model.ply").exists(), (
-        "no input may be staged once the manifest is known to collide"
+    staged = work_dir / "in" / "model.ply"
+    assert ctx.all_paths == {"scene": staged, "warm_start": staged}
+    assert staged.read_bytes() == b"payload"
+    assert client.downloads == ["model.ply"], (
+        "an aliased input is served by (task, filename), so one fetch "
+        "serves both keys"
     )
 
 
@@ -1674,10 +1686,19 @@ async def test_upload_outputs_rejects_case_colliding_names(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shared_volume", [False, True])
-async def test_upload_outputs_rejects_duplicate_filenames(tmp_path, shared_volume):
-    """Two logical outputs sharing one basename would publish a single
-    artifact under both keys — refused in remote and local mode alike."""
-    from task_worker_api.errors import ProtocolError
+async def test_upload_outputs_aliases_a_repeated_filename(tmp_path, shared_volume):
+    """Two output keys naming one file publish that artifact under both
+    keys — as the manifest asks — transferring it once."""
+    class _CountingClient(FakeBackendClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.uploads: list[str] = []
+
+        async def upload_file(self, task_id, filename, src, *, cancelled=None):
+            self.uploads.append(filename)
+            await super().upload_file(
+                task_id, filename, src, cancelled=cancelled,
+            )
 
     out_dir = tmp_path / "work" / "out"
     out_dir.mkdir(parents=True)
@@ -1687,17 +1708,24 @@ async def test_upload_outputs_rejects_duplicate_filenames(tmp_path, shared_volum
         {"input_path": "/ignored"} if shared_volume
         else {"input_files": {"mesh": "in.ply"}}
     ))
-    client = FakeBackendClient()
+    client = _CountingClient()
 
-    with pytest.raises(ProtocolError, match="'warm_start'.*'scene'"):
-        await upload_outputs(
-            task, client, _file_ctx(out_dir),
-            output_files={"scene": "model.ply", "warm_start": "model.ply"},
-            shared_volume_path=str(volume) if shared_volume else None,
-        )
+    manifest = await upload_outputs(
+        task, client, _file_ctx(out_dir),
+        output_files={"scene": "model.ply", "warm_start": "model.ply"},
+        shared_volume_path=str(volume) if shared_volume else None,
+    )
 
-    assert client.uploaded_files == {}
-    assert not volume.exists(), "no staging dir for a rejected manifest"
+    assert set(manifest) == {"scene", "warm_start"}
+    assert manifest["scene"] == manifest["warm_start"]
+    if shared_volume:
+        staged = volume / "temp" / "58" / "model.ply"
+        assert manifest["scene"] == str(staged)
+        assert staged.read_bytes() == b"splat"
+    else:
+        assert manifest["scene"] == "model.ply"
+        assert client.uploaded_files == {(58, "model.ply"): b"splat"}
+        assert client.uploads == ["model.ply"], "one artifact, one upload"
 
 
 @pytest.mark.asyncio
