@@ -84,7 +84,7 @@ The worker must reconcile an existing entry on restart before requesting work.
                 raise AdmissionError("claim_request_unknown")
             row = db.execute("SELECT operation_id,payload,response FROM operation WHERE kind=?", [kind]).fetchone()
             if row:
-                rejected = row[2] and json.loads(row[2]).get("rejected") in ("hardware_report_stale", "cleanup_evidence_stale")
+                rejected = row[2] and json.loads(row[2]).get("rejected") in ("hardware_report_stale", "hardware_report_replayed", "cleanup_evidence_stale")
                 if rejected:
                     # Backend explicitly rejected before committing the operation.
                     # The next observation can safely form a new logical request.
