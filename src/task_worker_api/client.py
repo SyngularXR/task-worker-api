@@ -656,10 +656,16 @@ async def _await_unless_cancelled(
     ``grace_s`` is set) and the caller escalates to a supervised process
     restart rather than continuing on a process the handler still owns.
     Stopping the await is *not* the same as the backend recording the
-    cancel: the terminal ``fail()`` after it has its own retry budget
-    (6 attempts), 15s lifecycle deadline and any ``Retry-After`` the backend
-    asks for, so report latency is bounded by the client's retry policy, not
-    by ``grace_s``.
+    cancel: on the ordinary path the terminal ``fail()`` after it has its own
+    retry budget (6 attempts), 15s lifecycle deadline and any ``Retry-After``
+    the backend asks for, so report latency is bounded by the client's retry
+    policy, not by ``grace_s``. On the ``on_abandoned`` path it deliberately
+    is not that call — an eventual report there would defer the restart for
+    as long as the backend stays degraded (``Retry-After`` is capped per
+    sleep at 6h and ``retry_sleep_budget_s`` is None by default, so ~30h on
+    one call) while the abandoned handler keeps the GPU. The caller drops to
+    a bounded last-resort report instead, so the escalation is prompt and a
+    slow backend costs a late report rather than a deferred restart.
 
     Even the ``2 * grace_s`` abort bound holds only while the handler
     *yields to the event loop*, which every ``await``-based unwind does. It

@@ -414,6 +414,41 @@ def _make_sync_fail(
     return _sync_fail
 
 
+def _bounded_sync_report(
+    sync_fail: Callable[[str], None], error: str, *, bound_s: float,
+) -> None:
+    """Send a last-resort terminal fail report, off the loop and time-boxed.
+
+    The same shape TaskWatchdog uses for an in-process wedge, for the same
+    reason: the caller is already on its way to a hard exit, so the report
+    must never be the thing that delays it. ``sync_fail`` bounds itself
+    (~15s with ``_make_sync_fail``'s defaults), but socket timeouts do not
+    cover every resolver/transport stall, so the wait is capped and an
+    overrunning daemon thread is simply left behind.
+
+    Blocking rather than awaiting is deliberate. The caller is abandoning a
+    handler that is still running on this event loop; if that handler goes
+    back to blocking it, an ``asyncio`` timeout meant to bound the wait is
+    starved by the very thing it is bounding. A thread join is not.
+    """
+    def report() -> None:
+        try:
+            sync_fail(error)
+        except Exception as e:  # noqa: BLE001
+            log.warning("abandoned-handler sync_fail failed: %s", e)
+
+    reporter = threading.Thread(
+        target=report, name="abandon-report", daemon=True,
+    )
+    reporter.start()
+    reporter.join(timeout=bound_s)
+    if reporter.is_alive():
+        log.warning(
+            "abandoned-handler failure report exceeded %.0fs; "
+            "escalating without acknowledgement", bound_s,
+        )
+
+
 def _clear_workdir(task_dir: Path) -> None:
     """Remove a leftover attempt's workdir, or raise. Runs in a thread.
 
@@ -1614,10 +1649,39 @@ class Worker:
                         terminal = "complete"
                     else:
                         terminal = "fail"
+                    # How the fail report goes out, not what it says. On the
+                    # ordinary path that is the async client. Once the handler
+                    # is abandoned it must not be: the process is on its way to
+                    # a supervised restart, and ``fail()`` is eventual rather
+                    # than bounded — six attempts honouring whatever
+                    # ``Retry-After`` the backend asks for (up to 6h a sleep,
+                    # and ``retry_sleep_budget_s`` is None by default), so a
+                    # degraded backend can pin this single await for ~30h. That
+                    # is 30h in which the abandoned handler still holds the GPU,
+                    # its subprocess and its workdir, and this worker claims
+                    # nothing. Report through the same bounded stdlib path
+                    # TaskWatchdog uses for an in-process wedge, capped by the
+                    # same ``timeout_grace_s``, so the escalation below follows
+                    # promptly. A late report is recoverable — the backend's
+                    # stale-task sweeper reclaims the task; a restart deferred
+                    # past the outage is not.
+                    async def report_fail(error: str) -> None:
+                        if not handler_abandoned:
+                            await target.client.fail(task.id, error)
+                            return
+                        _bounded_sync_report(
+                            _make_sync_fail(
+                                target.base_url, target.api_key,
+                                task.id, self.worker_id,
+                            ),
+                            error,
+                            bound_s=self.timeout_grace_s,
+                        )
+
                     try:
                         if fired:
-                            await target.client.fail(
-                                task.id, f"timeout: exceeded {timeout_s:.0f}s",
+                            await report_fail(
+                                f"timeout: exceeded {timeout_s:.0f}s",
                             )
                             log.warning(
                                 "task %s timed out (%s)",
@@ -1630,7 +1694,7 @@ class Worker:
                                 task.id, task.task_type.value,
                             )
                         else:
-                            await target.client.fail(task.id, outcome[1])
+                            await report_fail(outcome[1])
                             if outcome[1] == "cancelled by user":
                                 log.info("task %s cancelled by user", task.id)
                     except Exception as report_exc:  # noqa: BLE001
@@ -1675,20 +1739,35 @@ class Worker:
                 # that returns still cannot claim another task.
                 self._stop.set()
                 self._on_hard_exit()
-            # Off the event loop: a finished task's workdir holds its staged
-            # inputs *and* its outputs (colmap-splat PLYs, Neural-Canvas
-            # splats), so a synchronous rmtree freezes the loop for the whole
-            # delete — in hybrid mode that stalls the FastAPI app, and in any
-            # mode it delays the next claim. ``ignore_errors=True`` keeps this
-            # non-raising, so the semantics are unchanged.
-            try:
-                await asyncio.to_thread(
-                    shutil.rmtree, task_dir, ignore_errors=True,
-                )
-            finally:
-                # This assignment must not await: cancellation during cleanup
-                # must not leave a dead task protected from future sweeps.
-                self._active_task_dir = None
+                # ``on_hard_exit`` is expected not to return (os._exit), but an
+                # injected or in-process supervisor's does — and everything
+                # below still assumes the task is over. It is not: the handler
+                # is running, so the workdir is not ours to delete, and
+                # ``_active_task_dir`` deliberately keeps pointing at it so
+                # this process's own periodic sweep skips it too. Whatever
+                # restarts us clears the leftover: a re-claim of the same task
+                # goes through ``_clear_workdir`` (fails closed), and any other
+                # path leaves it to the orphan sweep. Skipped with an ``else``
+                # rather than a ``return``: returning out of a ``finally``
+                # would also swallow the shutdown ``CancelledError`` this block
+                # can be unwinding.
+            else:
+                # Off the event loop: a finished task's workdir holds its
+                # staged inputs *and* its outputs (colmap-splat PLYs, Neural-
+                # Canvas splats), so a synchronous rmtree freezes the loop for
+                # the whole delete — in hybrid mode that stalls the FastAPI
+                # app, and in any mode it delays the next claim.
+                # ``ignore_errors=True`` keeps this non-raising, so the
+                # semantics are unchanged.
+                try:
+                    await asyncio.to_thread(
+                        shutil.rmtree, task_dir, ignore_errors=True,
+                    )
+                finally:
+                    # This assignment must not await: cancellation during
+                    # cleanup must not leave a dead task protected from future
+                    # sweeps.
+                    self._active_task_dir = None
 
 
 async def run_hybrid(

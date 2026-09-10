@@ -428,7 +428,10 @@ Stopping the handler is not the same as the backend showing the task
 cancelled: the terminal `fail()` that follows has its own retry budget
 (6 attempts), 15 s lifecycle deadline and any `Retry-After` the backend
 asks for, so report latency is bounded by the client's retry policy, not by
-`cancel_grace_s`.
+`cancel_grace_s`. The restart path above is the exception — there the cancel
+goes out through a bounded last-resort report (capped by `timeout_grace_s`)
+so a degraded backend delays the report rather than the restart, which
+would otherwise leave your handler holding its GPU for the whole outage.
 The yields-to-the-loop proviso is the same GIL caveat below, applied to
 cleanup: both graces
 are `asyncio` timeouts, so a handler that blocks the loop instead of

@@ -38,8 +38,17 @@
   or container stop) waits the handler's unwind out for as long as it takes, as
   a plain `await handler(...)` always did, so an ordinary deploy stays graceful
   instead of hard-exiting whenever cleanup outlasts `cancel_grace_s`. That bound is on *stopping the handler*, not on the
-  backend recording the cancel: the terminal `fail()` keeps its own retry
-  budget, lifecycle deadline and `Retry-After` waits. Cleanup that *blocks* the
+  backend recording the cancel: on the ordinary path the terminal `fail()`
+  keeps its own retry budget, lifecycle deadline and `Retry-After` waits. On
+  the escalation path it does not — an abandoned handler's cancel is reported
+  through the same bounded stdlib call `TaskWatchdog` uses for an in-process
+  wedge (capped by `timeout_grace_s`), because the async `fail()` there could
+  honour `Retry-After` for up to ~30h across its six attempts and defer the
+  restart for the whole of a backend outage while the handler still held the
+  GPU. The workdir is likewise left in place once a handler is abandoned
+  (rather than deleted out from under it) — including when an injected or
+  in-process `on_hard_exit` returns instead of terminating; whatever restarts
+  the worker clears it. Cleanup that *blocks* the
   loop (`time.sleep`, a blocking `join()`) is outside the abort bound and
   cannot be brought inside it: both graces are `asyncio` timeouts, so the
   blocking is what stops them firing. Such a task is still reported cancelled,
