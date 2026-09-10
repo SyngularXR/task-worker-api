@@ -491,16 +491,48 @@ async def _cancel_and_drain_bounded(
     so the timeout cannot fire until the block ends; see
     :func:`_await_unless_cancelled` for why nothing on the loop can bound
     that.
+
+    The wait rides out cancellation of *us* — a worker shutdown landing on
+    top of the user cancel — because returning early there is the same
+    detached-handler state as returning on timeout, minus the escalation
+    that makes it survivable: ``on_abandoned`` would never run, and the
+    caller would delete the workdir and continue on a process the handler
+    still owns. The deadline is measured once, so riding the cancel out
+    neither extends nor restarts the grace, and the cancellation is re-raised
+    once the drain has settled so the caller's own shutdown still unwinds.
     """
     import asyncio
 
     task.cancel()
+    ours: Optional[BaseException] = None
     try:
-        done, _ = await asyncio.wait((task,), timeout=timeout)
-        if not done:
-            on_abandoned()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                on_abandoned()
+                break
+            try:
+                await asyncio.wait((task,), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                # Cancellation of *us* (worker shutdown landing on top of the
+                # user cancel) must not end the drain: ``asyncio.wait`` is not
+                # shielded, so a bare await here returned with the handler
+                # still live and ``on_abandoned`` never called — the caller
+                # then deleted the workdir and moved on under a running
+                # handler, the exact state this function exists to prevent.
+                # Keep waiting against the *same* deadline, so riding out the
+                # cancel neither extends nor restarts the grace, and re-raise
+                # it once the drain has settled (finished, or escalated)
+                # rather than dropping it as :func:`_drain_ignoring_cancel`
+                # does — the caller's own unwind, shutdown included, is still
+                # owed.
+                ours = exc
     finally:
         task.add_done_callback(_discard_outcome)
+    if ours is not None:
+        raise ours
 
 
 async def _to_thread_complete(func, /, *args, cancel_cleanup=None):

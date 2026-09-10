@@ -28,7 +28,11 @@
   workdir: the worker reports the cancel and then terminates for a supervised
   restart — the same `on_hard_exit` escalation `TaskWatchdog` already uses for
   an in-process wedge — instead of detaching the handler and claiming the next
-  task on top of it. That bound is on *stopping the handler*, not on the
+  task on top of it. A worker shutdown that lands while that unwind is being
+  drained no longer cuts the drain short: the drain rides the cancellation out
+  against the same deadline, so a handler that outlives it is still escalated
+  (and the shutdown still propagates afterwards) instead of being detached,
+  reported and having its workdir deleted while it runs. That bound is on *stopping the handler*, not on the
   backend recording the cancel: the terminal `fail()` keeps its own retry
   budget, lifecycle deadline and `Retry-After` waits. Cleanup that *blocks* the
   loop (`time.sleep`, a blocking `join()`) is outside the abort bound and

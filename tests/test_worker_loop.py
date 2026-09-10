@@ -1625,6 +1625,81 @@ async def test_cancel_abort_restarts_worker_if_handler_swallows_it(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_during_cancel_drain_still_escalates(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A worker shutdown landing *during* the bounded drain must not abandon
+    it silently.
+
+    The drain waits out the second grace with ``asyncio.wait``, which is not
+    shielded: cancelling the worker task (run_hybrid on a uvicorn shutdown or
+    container stop) used to interrupt that wait, so ``on_abandoned`` never
+    ran even though the handler was still swallowing the abort. _execute_one
+    then reported the shutdown, deleted the workdir out from under the live
+    handler and returned as if the task were over — while it still held the
+    GPU, its subprocess and the files being deleted. The drain must ride the
+    cancel out against the same deadline, escalate when the deadline passes,
+    and only then let the shutdown propagate.
+    """
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    # Set on the handler's first await *after* the abort lands, i.e. once the
+    # bounded drain is already waiting — which is where the shutdown must be
+    # delivered for this to test anything.
+    draining = asyncio.Event()
+
+    async def handler(ctx, params):
+        client.handler_running.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            while True:
+                draining.set()
+                await asyncio.sleep(0.01)
+        return {}  # pragma: no cover — never reached
+
+    at_exit: list[tuple[int, list[str]]] = []
+
+    def on_hard_exit():
+        at_exit.append((
+            len(client.failed_tasks),
+            sorted(p.name for p in worker.work_dir.glob("task_*")),
+        ))
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        cancel_grace_s=0.05,
+        on_hard_exit=on_hard_exit,
+    )
+    run = asyncio.ensure_future(worker.run_one())
+    await asyncio.wait_for(draining.wait(), timeout=10)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=10)
+
+    # The task is still reported terminal exactly once, and the handler that
+    # outlived both graces still takes the worker down before its workdir is
+    # deleted.
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert at_exit == [(1, [f"task_{task.id}"])], (
+        "shutdown during the drain detached the live handler: no escalation, "
+        f"or the workdir went first: {at_exit}"
+    )
+    assert worker._stop.is_set()
+
+
+@pytest.mark.asyncio
 async def test_cancel_abort_of_loop_blocking_cleanup_still_reports(
     make_worker, tmp_path, monkeypatch,
 ):
