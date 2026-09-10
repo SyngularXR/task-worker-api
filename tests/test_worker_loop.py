@@ -1373,12 +1373,19 @@ async def test_cancelled_worker_reports_shutdown_reason(
 
     assert fake_client.completed_tasks == []
     assert len(fake_client.failed_tasks) == 1
+    task_id = str(fake_client.failed_tasks[0]["task_id"])
     error = fake_client.failed_tasks[0]["error"]
-    assert error == "worker task cancelled while processing", error
+    # The reason has to carry all three parts an operator reads it for: that
+    # the worker shut down, which task it dropped, and that the task was
+    # interrupted rather than attempted-and-failed.
+    assert error == (
+        f"worker shut down before task {task_id} finished; the task was "
+        "interrupted, not attempted-and-failed"
+    ), error
 
     cancelled_logs = [
         r for r in caplog.records
-        if r.levelname == "WARNING" and "cancelled while processing" in r.message
+        if r.levelname == "WARNING" and "worker shut down before task" in r.message
     ]
     assert len(cancelled_logs) == 1, [r.message for r in caplog.records]
-    assert str(fake_client.failed_tasks[0]["task_id"]) in cancelled_logs[0].message
+    assert cancelled_logs[0].message == error

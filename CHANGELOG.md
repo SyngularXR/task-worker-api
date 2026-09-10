@@ -51,12 +51,14 @@
   seeded placeholder — and `run_hybrid` cancels the worker task whenever the
   app side exits, so *every* task interrupted by a deploy (uvicorn shutdown,
   container stop) landed on the backend, and in the UI, with `unknown` as its
-  failure reason. Cancellation now sets `worker task cancelled while
-  processing` and re-raises, and the placeholder is reworded to name the path
-  it actually represents (an exit through a `BaseException` nothing catches).
-  The cancellation also logs one WARNING naming the task, so the interrupt is
-  visible in the worker's own log after a redeploy and not only in the task
-  row's failure reason.
+  failure reason. Cancellation now sets `worker shut down before task <id>
+  finished; the task was interrupted, not attempted-and-failed` and re-raises,
+  and the placeholder is reworded to name the path it actually represents (an
+  exit through a `BaseException` nothing catches). The reason names the task
+  and distinguishes an interrupt from a real attempt, so the task row says
+  whether a retry is worth it. The cancellation also logs that same line once
+  at WARNING, so the interrupt is visible in the worker's own log after a
+  redeploy and not only in the task row's failure reason.
   No change to whether a terminal report is sent, or to the status on the wire.
 - `CancelGuard` now escalates a sustained cancel-poll failure from DEBUG to
   WARNING. Every poll exception was swallowed at DEBUG forever, so a
