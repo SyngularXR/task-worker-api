@@ -315,10 +315,13 @@ against that signal. Patterns 2 and 3 below stop themselves and are
 unaffected; a handler that doesn't is aborted `cancel_grace_s` (a `Worker`
 knob, default 5s) after the cancel lands — an ordinary asyncio
 cancellation, so its `finally` / `async with` cleanup still runs and is
-awaited to completion before the task is reported. Cleanup that must
-survive a cancel belongs in `finally`, not after the last await. Raise
-`cancel_grace_s` if your handler needs longer to unwind on its own — a
-thread you signalled keeps running if the abort lands first.
+awaited before the task is reported. That unwind gets `cancel_grace_s` of
+its own: a handler that swallows the `CancelledError`, or whose cleanup
+blocks past the grace, is reported as cancelled anyway and left running
+detached. Cleanup that must survive a cancel belongs in `finally`, not
+after the last await, and it should not outlast the grace. Raise
+`cancel_grace_s` if your handler needs longer to stop or unwind on its
+own — a thread you signalled keeps running if the abort lands first.
 
 Three canonical handler shapes, pick yours:
 
@@ -406,8 +409,9 @@ catches it.
 
 Cancel visibility is bounded by the SDK's `cancel_poll_interval_s`
 (default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`;
-the task is reported at most `cancel_grace_s` (default 5 s) after that,
-whether or not your handler stopped itself.
+the task is reported at most `2 x cancel_grace_s` (default 5 s each —
+one grace to stop itself, one to unwind) after that, whether or not your
+handler stopped itself.
 A C extension that holds the GIL and doesn't yield won't see cancel
 until it returns. This is a Python limitation, not ours — if you need
 sub-second cancel in a C extension, either break the work into smaller

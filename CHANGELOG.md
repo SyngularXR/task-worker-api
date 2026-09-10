@@ -19,8 +19,11 @@
   `prepare_inputs` / `upload_outputs` boundaries. The handler call now races the
   guard's event, so it is aborted `cancel_grace_s` (new `Worker` knob, default
   5s) after the cancel lands. The abort is an ordinary asyncio cancellation
-  drained to completion, so handler `finally` / `async with` cleanup still runs,
-  and the task still reports the single `cancelled by user` failure. The grace
+  that is drained, so handler `finally` / `async with` cleanup still runs, and
+  the task still reports the single `cancelled by user` failure. The unwind gets
+  its own `cancel_grace_s` — a handler that swallows the `CancelledError` or
+  blocks in cleanup is reported as cancelled and left running detached (with a
+  warning), so a cancel is always reported within `2 * cancel_grace_s`. The grace
   keeps the cooperative and `on_cancel` patterns unchanged — they stop on their
   own terms first, which for a threadpool handler is the only thing that
   actually stops the thread rather than detaching it.

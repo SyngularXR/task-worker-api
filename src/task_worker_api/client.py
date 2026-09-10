@@ -454,6 +454,47 @@ async def _cancel_and_drain(task: "asyncio.Future") -> None:
     await _drain_ignoring_cancel(task)
 
 
+def _discard_outcome(task: "asyncio.Future") -> None:
+    """Retrieve an abandoned task's outcome so asyncio does not log it as an
+    unretrieved exception. We have already reported why we stopped waiting."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _cancel_and_drain_bounded(
+    task: "asyncio.Future", timeout: float, message: str,
+) -> None:
+    """Cancel ``task``, wait at most ``timeout`` for it to stop, then give up.
+
+    :func:`_cancel_and_drain` waits forever, which is right for our own
+    transfer coroutines — they unwind promptly and the caller is about to
+    close a file handle underneath them — but not for a worker author's
+    handler. A handler that swallows ``CancelledError`` (a bare ``except``,
+    or cleanup that blocks) hangs the drain: the unbounded run the cancel
+    race exists to prevent, moved into cleanup, and un-interruptible because
+    :func:`_drain_ignoring_cancel` deliberately rides out cancellation of
+    *us* too, so not even the caller's own timeout can break it.
+
+    Past the timeout the task is abandoned. That leaves it running detached,
+    which an aborted ``to_thread`` handler already does — the abort ends the
+    await, never the work behind it — and is the lesser evil against never
+    reporting the cancelled task at all.
+    """
+    import asyncio
+
+    task.cancel()
+    try:
+        done, _ = await asyncio.wait((task,), timeout=timeout)
+        if not done:
+            log.warning(
+                "%s: handler did not unwind within %ss of the abort; "
+                "reporting the cancel, handler left running detached",
+                message, timeout,
+            )
+    finally:
+        task.add_done_callback(_discard_outcome)
+
+
 async def _to_thread_complete(func, /, *args, cancel_cleanup=None):
     """Do not let task cancellation race a blocking thread operation.
 
@@ -564,16 +605,30 @@ async def _await_unless_cancelled(
     the grace the operation is aborted anyway; the point of the race is that
     a handler which ignores the cancel cannot run unbounded.
 
+    ``grace_s`` bounds the unwind too, via :func:`_cancel_and_drain_bounded`:
+    the code being aborted is then the worker author's, and a handler that
+    swallows the ``CancelledError`` would otherwise stall the drain forever,
+    putting the reporting delay right back to unbounded. So a cancel is
+    reported at most ``2 * grace_s`` after it lands — once to stop itself,
+    once to unwind — and a handler that used neither is left detached.
+
     If the *caller* is cancelled while waiting (worker shutdown), the
     operation is cancelled too rather than left running detached with a file
     handle open.
 
-    Every exit drains both children to completion via
-    :func:`_cancel_and_drain` before returning or raising: cancellation is
-    cooperative, so merely requesting it would let the PUT run on past the
+    Every exit drains both children before returning or raising: cancellation
+    is cooperative, so merely requesting it would let the PUT run on past the
     ``with open(src)`` block that ``upload_file`` is unwinding out of.
     """
     import asyncio
+
+    async def abort(task):
+        """Stop ``request``. Our own transfer coroutines are drained to
+        completion; a handler only gets ``grace_s`` before it is abandoned."""
+        if grace_s:
+            await _cancel_and_drain_bounded(task, grace_s, message)
+        else:
+            await _cancel_and_drain(task)
 
     request = asyncio.ensure_future(coro)
     waiter = asyncio.ensure_future(cancelled.wait())
@@ -585,7 +640,7 @@ async def _await_unless_cancelled(
         # asyncio.wait does not cancel its futures when the awaiting task is
         # cancelled; without this the PUT would keep streaming after the
         # worker moved on.
-        await _cancel_and_drain(request)
+        await abort(request)
         raise
     finally:
         await _cancel_and_drain(waiter)
@@ -596,16 +651,16 @@ async def _await_unless_cancelled(
             # wait_for, which would cancel ``request`` and lose the drain.
             await asyncio.wait((request,), timeout=grace_s)
         except BaseException:
-            await _cancel_and_drain(request)
+            await abort(request)
             raise
 
     if request.done():
         return request.result()
 
-    # The upload is aborted on purpose; wait for it to unwind so the
+    # The operation is aborted on purpose; wait for it to unwind so the
     # connection is closed and the body has stopped reading src before
     # upload_file's `with open(src)` closes the handle underneath it.
-    await _cancel_and_drain(request)
+    await abort(request)
     raise TaskCancelled(message)
 
 

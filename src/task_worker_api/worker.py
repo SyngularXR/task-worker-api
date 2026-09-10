@@ -294,7 +294,10 @@ def _positive_finite_s(name: str, value: float) -> float:
       lands, so a cooperative or ``on_cancel`` handler never gets to unwind
       (its ``to_thread`` GPU work is detached rather than stopped); ``inf``
       or ``NaN`` never aborts at all, which is the bug the race exists to
-      fix — the handler runs to completion on a cancelled task.
+      fix — the handler runs to completion on a cancelled task. It bounds
+      both halves of the abort: the grace to stop itself, then the same
+      again to unwind, so a cancel is reported within ``2 *
+      cancel_grace_s``.
     * ``timeout_grace_s``: ``NaN`` makes ``TaskWatchdog._wait`` return
       instantly at both grace phases (``end = now + nan``, so the loop never
       runs), collapsing SIGTERM → grace → SIGKILL → grace → hard-exit into an
@@ -1443,7 +1446,9 @@ class Worker:
                 # ``cancel_grace_s`` after the cancel lands; its
                 # ``finally``/``async with`` cleanup still runs, because the
                 # abort is an ordinary asyncio cancellation that is drained
-                # to completion before TaskCancelled is raised here. The
+                # before TaskCancelled is raised here — for at most another
+                # ``cancel_grace_s``, past which the handler is abandoned so
+                # that swallowing the abort cannot stall reporting. The
                 # grace is what keeps the cooperative
                 # (ctx.progress.is_cancelled) and ``on_cancel`` patterns
                 # unchanged: they see the cancel first and stop on their own

@@ -1546,3 +1546,54 @@ async def test_cancel_abort_does_not_preempt_cooperative_handler(
     assert client.completed_tasks == []
     assert len(client.failed_tasks) == 1
     assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cancel_abort_gives_up_on_a_handler_that_swallows_it(
+    make_worker, tmp_path, monkeypatch, caplog,
+):
+    """The abort must be bounded on both halves. A handler that catches the
+    CancelledError and keeps working used to stall the drain forever — and
+    un-interruptibly, since the drain deliberately rides out the caller's own
+    cancellation — which put the reporting delay right back to unbounded. It
+    is now abandoned after a second grace and reported as cancelled."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    still_running = asyncio.Event()
+
+    async def handler(ctx, params):
+        client.handler_running.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            # Swallows the abort — a bare `except:` around the work loop, or
+            # cleanup that blocks, looks exactly like this from outside.
+            while True:
+                still_running.set()
+                await asyncio.sleep(0.01)
+        return {}  # pragma: no cover — never reached
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        cancel_grace_s=0.05,
+    )
+    with caplog.at_level("WARNING"):
+        await asyncio.wait_for(worker.run_one(), timeout=10)
+
+    assert still_running.is_set(), "handler never reached its swallow branch"
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
+    assert any(
+        "left running detached" in r.getMessage() for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
