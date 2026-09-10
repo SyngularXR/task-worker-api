@@ -296,11 +296,12 @@ def _positive_finite_s(name: str, value: float) -> float:
       or ``NaN`` never aborts at all, which is the bug the race exists to
       fix — the handler runs to completion on a cancelled task. It bounds
       both halves of the abort: the grace to stop itself, then the same
-      again to unwind, so a cancel is reported within ``2 *
-      cancel_grace_s`` of any handler that yields to the event loop.
-      Cleanup that blocks the loop outright is not boundable from on the
-      loop (see :func:`_await_unless_cancelled`) and stalls heartbeats
-      alongside the abort.
+      again to unwind, so a handler that yields to the event loop stops
+      awaiting within ``2 * cancel_grace_s``; one that is still running
+      after both takes the worker down for a supervised restart. Cleanup
+      that blocks the loop outright is not boundable from on the loop (see
+      :func:`_await_unless_cancelled`) and stalls heartbeats alongside the
+      abort.
     * ``timeout_grace_s``: ``NaN`` makes ``TaskWatchdog._wait`` return
       instantly at both grace phases (``end = now + nan``, so the loop never
       runs), collapsing SIGTERM → grace → SIGKILL → grace → hard-exit into an
@@ -1350,6 +1351,9 @@ class Worker:
         outcome: tuple[str, object] = (
             "fail", "worker exited the task without recording an outcome",
         )
+        # Set when a cancelled handler outlives both graces: it is still
+        # running, so this process cannot be handed the next task.
+        handler_abandoned = False
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1450,17 +1454,29 @@ class Worker:
                 # ``finally``/``async with`` cleanup still runs, because the
                 # abort is an ordinary asyncio cancellation that is drained
                 # before TaskCancelled is raised here — for at most another
-                # ``cancel_grace_s``, past which the handler is abandoned so
-                # that an await-swallowed abort cannot stall reporting. The
-                # grace is what keeps the cooperative
-                # (ctx.progress.is_cancelled) and ``on_cancel`` patterns
-                # unchanged: they see the cancel first and stop on their own
-                # terms, which for a threadpool handler is the only thing
-                # that actually stops the thread.
+                # ``cancel_grace_s``, past which the handler is still
+                # running and the process is no longer reusable — see
+                # ``handler_abandoned`` in the finally below. The grace is
+                # what keeps the cooperative (ctx.progress.is_cancelled) and
+                # ``on_cancel`` patterns unchanged: they see the cancel
+                # first and stop on their own terms, which for a threadpool
+                # handler is the only thing that actually stops the thread.
+                def _abandoned() -> None:
+                    nonlocal handler_abandoned
+                    handler_abandoned = True
+                    log.error(
+                        "task %s: handler did not unwind within %ss of the "
+                        "cancel abort and is still running; reporting the "
+                        "cancel, then terminating the worker for a "
+                        "supervised restart",
+                        task.id, self.cancel_grace_s,
+                    )
+
                 result = await _await_unless_cancelled(
                     handler(ctx, typed_params), cancelled,
                     f"task {task.id} cancelled by user",
                     grace_s=self.cancel_grace_s,
+                    on_abandoned=_abandoned,
                 )
 
                 # Publish outputs *inside* the CancelGuard so a user cancel
@@ -1645,6 +1661,20 @@ class Worker:
                 # leaked heartbeat outlives the task and double-starts the next
                 # one (start_heartbeat rejects a double start).
                 await progress.stop()
+            if handler_abandoned:
+                # The abort was not honoured, so the handler is still running
+                # and asyncio has no way to take back the GPU, subprocess or
+                # workdir it holds. Everything below and after here assumes
+                # the task is over: the rmtree deletes files the handler may
+                # still be reading or writing, and run_forever would claim the
+                # next task onto hardware this one never released. The only
+                # sound recovery is the one TaskWatchdog already uses for an
+                # in-process wedge — report the outcome (done above), then let
+                # the supervisor restart the process, which is what actually
+                # ends the work. ``_stop`` first, so an injected on_hard_exit
+                # that returns still cannot claim another task.
+                self._stop.set()
+                self._on_hard_exit()
             # Off the event loop: a finished task's workdir holds its staged
             # inputs *and* its outputs (colmap-splat PLYs, Neural-Canvas
             # splats), so a synchronous rmtree freezes the loop for the whole

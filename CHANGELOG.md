@@ -21,18 +21,24 @@
   5s) after the cancel lands. The abort is an ordinary asyncio cancellation
   that is drained, so handler `finally` / `async with` cleanup still runs, and
   the task still reports the single `cancelled by user` failure. The unwind gets
-  its own `cancel_grace_s` — a handler that swallows the `CancelledError` or
-  keeps awaiting in cleanup is reported as cancelled and left running detached
-  (with a warning), so a cancel is reported within `2 * cancel_grace_s` of any
-  handler that yields to the event loop. Cleanup that *blocks* the loop instead
-  (`time.sleep`, a blocking `join()`) is outside that bound and cannot be
-  brought inside it: both graces are `asyncio` timeouts, so the blocking is
-  what stops them firing. Such a task is still reported cancelled, only late —
-  the same Python limitation that already applies to GIL-holding extensions,
-  which equally stalls heartbeats. The grace
-  keeps the cooperative and `on_cancel` patterns unchanged — they stop on their
-  own terms first, which for a threadpool handler is the only thing that
-  actually stops the thread rather than detaching it.
+  its own `cancel_grace_s`, so a handler that yields to the event loop stops
+  awaiting within `2 * cancel_grace_s` of the cancel. A handler that swallows
+  the `CancelledError` (or keeps awaiting in cleanup) past that is still
+  running, and nothing on the loop can take back its GPU, subprocess or
+  workdir: the worker reports the cancel and then terminates for a supervised
+  restart — the same `on_hard_exit` escalation `TaskWatchdog` already uses for
+  an in-process wedge — instead of detaching the handler and claiming the next
+  task on top of it. That bound is on *stopping the handler*, not on the
+  backend recording the cancel: the terminal `fail()` keeps its own retry
+  budget, lifecycle deadline and `Retry-After` waits. Cleanup that *blocks* the
+  loop (`time.sleep`, a blocking `join()`) is outside the abort bound and
+  cannot be brought inside it: both graces are `asyncio` timeouts, so the
+  blocking is what stops them firing. Such a task is still reported cancelled,
+  only late — the same Python limitation that already applies to GIL-holding
+  extensions, which equally stalls heartbeats. The grace keeps the cooperative
+  and `on_cancel` patterns unchanged — they stop on their own terms first,
+  which for a threadpool handler is the only thing that actually stops the
+  thread rather than detaching it.
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are

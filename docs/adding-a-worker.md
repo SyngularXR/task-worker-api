@@ -317,9 +317,12 @@ knob, default 5s) after the cancel lands — an ordinary asyncio
 cancellation, so its `finally` / `async with` cleanup still runs and is
 awaited before the task is reported. That unwind gets `cancel_grace_s` of
 its own: a handler that swallows the `CancelledError`, or whose cleanup
-keeps awaiting past the grace, is reported as cancelled anyway and left
-running detached. Cleanup that must survive a cancel belongs in `finally`,
-not after the last await, and it should not outlast the grace — and it
+keeps awaiting past the grace, is still running with the worker unable to
+take its GPU or subprocess back — so the task is reported cancelled and the
+worker then exits for a supervised restart (`on_hard_exit`, the same path a
+wedged task's watchdog takes). Cleanup that must survive a cancel belongs in
+`finally`, not after the last await, and it should not outlast the grace — a
+restart is a blunt recovery and costs every other task queued behind it. It
 must `await`, not block: cleanup that holds the event loop (a `time.sleep`,
 a blocking `thread.join()`) outlasts the grace no matter what it is set
 to, because the grace is an `asyncio` timer that only fires when the loop
@@ -413,11 +416,17 @@ catches it.
 
 Cancel visibility is bounded by the SDK's `cancel_poll_interval_s`
 (default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`;
-the task is reported at most `2 x cancel_grace_s` (default 5 s each —
-one grace to stop itself, one to unwind) after that, whether or not your
-handler stopped itself — provided it yields to the event loop, as every
+your handler stops awaiting at most `2 x cancel_grace_s` (default 5 s each —
+one grace to stop itself, one to unwind) after that, whether or not it
+stopped itself — provided it yields to the event loop, as every
 `await`-based handler and unwind does.
-That proviso is the same GIL caveat below, applied to cleanup: both graces
+Stopping the handler is not the same as the backend showing the task
+cancelled: the terminal `fail()` that follows has its own retry budget
+(6 attempts), 15 s lifecycle deadline and any `Retry-After` the backend
+asks for, so report latency is bounded by the client's retry policy, not by
+`cancel_grace_s`.
+The yields-to-the-loop proviso is the same GIL caveat below, applied to
+cleanup: both graces
 are `asyncio` timeouts, so a handler that blocks the loop instead of
 awaiting (including inside `except asyncio.CancelledError:`) suspends the
 timers meant to bound it, and no value of `cancel_grace_s` will cut it

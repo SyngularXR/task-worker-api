@@ -462,9 +462,9 @@ def _discard_outcome(task: "asyncio.Future") -> None:
 
 
 async def _cancel_and_drain_bounded(
-    task: "asyncio.Future", timeout: float, message: str,
+    task: "asyncio.Future", timeout: float, on_abandoned,
 ) -> None:
-    """Cancel ``task``, wait at most ``timeout`` for it to stop, then give up.
+    """Cancel ``task``, wait at most ``timeout`` for it to stop, then escalate.
 
     :func:`_cancel_and_drain` waits forever, which is right for our own
     transfer coroutines — they unwind promptly and the caller is about to
@@ -476,10 +476,15 @@ async def _cancel_and_drain_bounded(
     rides out cancellation of *us* too, so not even the caller's own timeout
     can break it.
 
-    Past the timeout the task is abandoned. That leaves it running detached,
-    which an aborted ``to_thread`` handler already does — the abort ends the
-    await, never the work behind it — and is the lesser evil against never
-    reporting the cancelled task at all.
+    Past the timeout we stop *waiting*, but the task is still running and
+    nothing on the loop can take its GPU, subprocess or workdir back — so
+    this is not a state the caller may continue from. ``on_abandoned`` is
+    called to say so; ``Worker._execute_one`` reports the cancel and then
+    hands the process to its supervisor for a restart (the same escalation
+    :class:`~task_worker_api.watchdog.TaskWatchdog` already uses for an
+    in-process wedge), which is what actually ends the work. Returning
+    instead would let the caller delete the workdir under a live handler and
+    claim the next task onto a GPU this one still holds.
 
     ``timeout`` only bites on cleanup that yields. Cleanup that blocks the
     event loop outright holds the loop this ``asyncio.wait`` timer runs on,
@@ -493,11 +498,7 @@ async def _cancel_and_drain_bounded(
     try:
         done, _ = await asyncio.wait((task,), timeout=timeout)
         if not done:
-            log.warning(
-                "%s: handler did not unwind within %ss of the abort; "
-                "reporting the cancel, handler left running detached",
-                message, timeout,
-            )
+            on_abandoned()
     finally:
         task.add_done_callback(_discard_outcome)
 
@@ -585,6 +586,7 @@ async def _multipart_file_body(
 
 async def _await_unless_cancelled(
     coro, cancelled: "asyncio.Event", message: str, *, grace_s: float = 0.0,
+    on_abandoned=None,
 ):
     """Await ``coro``, aborting it as soon as ``cancelled`` is set.
 
@@ -615,22 +617,30 @@ async def _await_unless_cancelled(
     ``grace_s`` bounds the unwind too, via :func:`_cancel_and_drain_bounded`:
     the code being aborted is then the worker author's, and a handler that
     swallows the ``CancelledError`` would otherwise stall the drain forever,
-    putting the reporting delay right back to unbounded. So a cancel is
-    reported at most ``2 * grace_s`` after it lands — once to stop itself,
-    once to unwind — and a handler that used neither is left detached.
+    putting the delay right back to unbounded. So the handler's *await* is
+    stopped within ``2 * grace_s`` of the cancel landing — once to stop
+    itself, once to unwind — and if the second grace also runs out the
+    handler is still running: ``on_abandoned`` is called (required whenever
+    ``grace_s`` is set) and the caller escalates to a supervised process
+    restart rather than continuing on a process the handler still owns.
+    Stopping the await is *not* the same as the backend recording the
+    cancel: the terminal ``fail()`` after it has its own retry budget
+    (6 attempts), 15s lifecycle deadline and any ``Retry-After`` the backend
+    asks for, so report latency is bounded by the client's retry policy, not
+    by ``grace_s``.
 
-    That bound holds only while the handler *yields to the event loop*, which
-    every ``await``-based unwind does. It is not enforceable against cleanup
-    that blocks the loop synchronously (``time.sleep``, a blocking
-    ``thread.join()``, a GIL-holding C call inside ``except
-    CancelledError:``): both graces are ``asyncio`` timeouts, and their timers
-    only fire when the loop gets to run, so the very thing being bounded is
-    what stops the bound from firing. Nothing scheduled on the loop can
-    bound that — it equally stalls heartbeats and cancel polling — so it is
-    the same Python limitation as a GIL-holding extension, not a property of
-    this race. Blocking cleanup stays *correct* (the task is reported
-    cancelled once the loop runs again, never as a success); it is only the
-    timing that is unbounded.
+    Even the ``2 * grace_s`` abort bound holds only while the handler
+    *yields to the event loop*, which every ``await``-based unwind does. It
+    is not enforceable against cleanup that blocks the loop synchronously
+    (``time.sleep``, a blocking ``thread.join()``, a GIL-holding C call
+    inside ``except CancelledError:``): both graces are ``asyncio``
+    timeouts, and their timers only fire when the loop gets to run, so the
+    very thing being bounded is what stops the bound from firing. Nothing
+    scheduled on the loop can bound that — it equally stalls heartbeats and
+    cancel polling — so it is the same Python limitation as a GIL-holding
+    extension, not a property of this race. Blocking cleanup stays *correct*
+    (the task is reported cancelled once the loop runs again, never as a
+    success); it is only the timing that is unbounded.
 
     If the *caller* is cancelled while waiting (worker shutdown), the
     operation is cancelled too rather than left running detached with a file
@@ -642,11 +652,19 @@ async def _await_unless_cancelled(
     """
     import asyncio
 
+    if grace_s and on_abandoned is None:
+        raise ValueError(
+            "grace_s requires on_abandoned: a handler that outlasts the "
+            "grace is still running, and the caller must escalate rather "
+            "than silently continue with it detached"
+        )
+
     async def abort(task):
         """Stop ``request``. Our own transfer coroutines are drained to
-        completion; a handler only gets ``grace_s`` before it is abandoned."""
+        completion; a handler gets ``grace_s`` to unwind, past which it is
+        still running and ``on_abandoned`` escalates."""
         if grace_s:
-            await _cancel_and_drain_bounded(task, grace_s, message)
+            await _cancel_and_drain_bounded(task, grace_s, on_abandoned)
         else:
             await _cancel_and_drain(task)
 

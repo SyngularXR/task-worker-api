@@ -1550,20 +1550,24 @@ async def test_cancel_abort_does_not_preempt_cooperative_handler(
 
 
 @pytest.mark.asyncio
-async def test_cancel_abort_gives_up_on_a_handler_that_swallows_it(
+async def test_cancel_abort_restarts_worker_if_handler_swallows_it(
     make_worker, tmp_path, monkeypatch, caplog,
 ):
     """The abort must be bounded on both halves. A handler that catches the
-    CancelledError and keeps working used to stall the drain forever — and
+    CancelledError and keeps working stalls the drain forever — and
     un-interruptibly, since the drain deliberately rides out the caller's own
-    cancellation — which put the reporting delay right back to unbounded. It
-    is now abandoned after a second grace and reported as cancelled."""
+    cancellation. After the second grace the worker stops waiting, but the
+    handler is still running: it still holds the GPU, its subprocess and its
+    workdir, so the worker must not simply detach it and carry on. It reports
+    the cancel and then takes the supervised-restart path (``on_hard_exit``,
+    the same escalation TaskWatchdog uses for an in-process wedge) — before
+    deleting the workdir out from under the live handler."""
     monkeypatch.setitem(
         TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
     )
     client = _CancelGuardPropagationClient()
     (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
-    client.queue_task(
+    task = client.queue_task(
         task_type=TaskType.DETECT_CUT_PLANES,
         params={"input_path": str(tmp_path / "fake.stl")},
     )
@@ -1584,21 +1588,39 @@ async def test_cancel_abort_gives_up_on_a_handler_that_swallows_it(
                 await asyncio.sleep(0.01)
         return {}  # pragma: no cover — never reached
 
+    # Recorded at the moment of the exit, not after: the report must already
+    # have landed and the workdir must still be there.
+    at_exit: list[tuple[int, list[str]]] = []
+
+    def on_hard_exit():
+        at_exit.append((
+            len(client.failed_tasks),
+            sorted(p.name for p in worker.work_dir.glob("task_*")),
+        ))
+
     worker = make_worker(
         client=client,
         handlers={TaskType.DETECT_CUT_PLANES: handler},
         cancel_poll_interval_s=0.01,
         cancel_grace_s=0.05,
+        on_hard_exit=on_hard_exit,
     )
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("ERROR"):
         await asyncio.wait_for(worker.run_one(), timeout=10)
 
     assert still_running.is_set(), "handler never reached its swallow branch"
     assert client.completed_tasks == []
     assert len(client.failed_tasks) == 1
     assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
+    assert at_exit == [(1, [f"task_{task.id}"])], (
+        "worker kept running with the handler detached, or wiped the "
+        f"workdir before escalating: {at_exit}"
+    )
+    # Even against an on_hard_exit that returns (as here, and in-process
+    # supervisors), the loop must not claim another task.
+    assert worker._stop.is_set()
     assert any(
-        "left running detached" in r.getMessage() for r in caplog.records
+        "supervised restart" in r.getMessage() for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
 
 
@@ -1607,7 +1629,7 @@ async def test_cancel_abort_of_loop_blocking_cleanup_still_reports(
     make_worker, tmp_path, monkeypatch,
 ):
     """Cleanup that blocks the event loop is outside the ``2 *
-    cancel_grace_s`` bound, and must still report the cancel correctly.
+    cancel_grace_s`` abort bound, and must still report the cancel correctly.
 
     Both graces are ``asyncio`` timeouts, so a handler that blocks the loop
     inside ``except CancelledError:`` suspends the very timers meant to bound
@@ -1616,7 +1638,9 @@ async def test_cancel_abort_of_loop_blocking_cleanup_still_reports(
     race can fix, so the docs advertise the bound only for handlers that
     yield. What must never regress is the *correctness* half: the blocked
     task is still reported cancelled exactly once, never as a success, and
-    the worker neither hangs nor loses the report.
+    the worker neither hangs nor loses the report. Blocking late is also not
+    the same as never unwinding — this handler does finish its unwind, so it
+    must NOT take the worker down for a restart.
     """
     monkeypatch.setitem(
         TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
@@ -1644,11 +1668,15 @@ async def test_cancel_abort_of_loop_blocking_cleanup_still_reports(
             raise
         return {}  # pragma: no cover — never reached
 
+    hard_exits = []
     worker = make_worker(
         client=client,
         handlers={TaskType.DETECT_CUT_PLANES: handler},
         cancel_poll_interval_s=0.01,
         cancel_grace_s=0.01,
+        # Also keeps a real os._exit out of the test process if the drain
+        # ever loses the race against the (already finished) handler task.
+        on_hard_exit=lambda: hard_exits.append(True),
     )
     await asyncio.wait_for(worker.run_one(), timeout=10)
 
@@ -1656,3 +1684,4 @@ async def test_cancel_abort_of_loop_blocking_cleanup_still_reports(
     assert client.completed_tasks == []
     assert len(client.failed_tasks) == 1
     assert "cancelled by user" in client.failed_tasks[0]["error"].lower()
+    assert hard_exits == []
