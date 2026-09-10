@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time as _time
+import urllib.error
 
 import pytest
 
@@ -499,3 +500,84 @@ def test_sync_fail_no_sleep_on_first_success(monkeypatch):
 
     assert calls["n"] == 1
     assert sleeps == []
+
+
+def _http_error(code: int):
+    return urllib.error.HTTPError(
+        "http://fake/api/v1/tasks/5/fail", code, "nope", {}, None
+    )
+
+
+def test_sync_fail_raises_permanent_http_error_on_first_attempt(monkeypatch):
+    """A 404 is definitive — don't spend ~9s of sleep before the hard exit."""
+    from task_worker_api import worker as worker_mod
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise _http_error(404)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 5, "worker-1"
+    )
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        sync_fail("timeout")
+
+    assert excinfo.value.code == 404
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_sync_fail_retries_redirect_http_error(monkeypatch):
+    """urllib raises rather than following a 302 on a PUT — still transient."""
+    from task_worker_api import worker as worker_mod
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise _http_error(302)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 5, "worker-1"
+    )
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        sync_fail("timeout")
+
+    assert excinfo.value.code == 302
+    assert calls["n"] == 3
+    assert sleeps == [2.0, 2.0]
+
+
+def test_sync_fail_retries_transient_http_error(monkeypatch):
+    """503 (and 408/429) keep the existing 3-attempt behaviour."""
+    from task_worker_api import worker as worker_mod
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise _http_error(503)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda s: sleeps.append(s))
+
+    sync_fail = worker_mod._make_sync_fail(
+        "http://fake/api/v1", "key", 5, "worker-1"
+    )
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        sync_fail("timeout")
+
+    assert excinfo.value.code == 503
+    assert calls["n"] == 3
+    assert sleeps == [2.0, 2.0]

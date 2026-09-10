@@ -9,6 +9,17 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- The watchdog's last-resort `fail()` report no longer retries a permanent
+  4xx. `_make_sync_fail` retried *any* exception 3× with 2s sleeps, so a
+  definitive answer — 400 (bad body), 404 (task gone), 409 (already terminal)
+  — cost ~9s of pointless sleeping before `_on_hard_exit()`/`os._exit(75)`,
+  delaying the container restart that is the entire recovery path for an
+  in-process wedge. Everything else (URLError/socket timeout, 3xx, 408, 429,
+  5xx) keeps the existing retry budget; 5xx is retried here — unlike
+  `_TRANSIENT_STATUS_CODES`' exclusion of 500 — because this is a terminal
+  report, the same case `complete`/`fail` opt into 500 for. The post-loop
+  `assert last_exc is not None` is now an explicit raise, matching
+  `BackendClient._retry`: asserts are stripped under `-O`.
 - `BackendClient.upload_file` no longer blocks the event loop while reading
   from disk — the upload-direction counterpart of the `download_file` fix
   below, which never reached this side. It opened the source with a blocking
