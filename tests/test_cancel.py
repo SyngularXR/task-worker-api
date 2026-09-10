@@ -339,13 +339,18 @@ async def test_warns_on_sustained_malformed_response(caplog):
     assert "3 consecutive failures" in records[-1].message
 
 
+@pytest.mark.skipif(
+    not cancel_mod._CAN_INTERRUPT,
+    reason="interrupting the block needs Task.cancelling()/uncancel() (3.11+)",
+)
 @pytest.mark.asyncio
 async def test_cancel_interrupts_a_running_async_block():
     """Pattern 1: a pure-async handler awaiting a long operation must be
     interrupted at that await, not after it finishes. Before the guard
     cancelled the guarded task, TaskCancelled was only raised on the way
     *out* of the block — so a handler awaiting a multi-minute operation ran
-    to completion on a task the user had already cancelled."""
+    to completion on a task the user had already cancelled. 3.11+ only; the
+    3.10 fallback is covered below."""
     client = FakeBackendClient()
     client.mark_cancelled(1)
     finished = []
@@ -363,6 +368,29 @@ async def test_cancel_interrupts_a_running_async_block():
     # so the worker's terminal report (which awaits) isn't cut short.
     assert asyncio.current_task().cancelling() == 0
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_without_uncancel_the_block_is_not_interrupted(monkeypatch):
+    """3.10 has no ``Task.cancelling()``/``uncancel()``, and without the count
+    the guard cannot tell its own cancel from a worker shutdown's that
+    overlaps it — converting that one would consume the shutdown. So on 3.10
+    the guard must not interrupt at all: the block runs to its end and
+    TaskCancelled is raised on the way out, exactly as before the interrupt
+    existed. Simulated on any interpreter by flipping the gate."""
+    monkeypatch.setattr(cancel_mod, "_CAN_INTERRUPT", False)
+    client = FakeBackendClient()
+    client.mark_cancelled(1)
+    finished = []
+
+    with pytest.raises(TaskCancelled):
+        async with CancelGuard(
+            client, task_id=1, poll_interval_s=0.01,
+        ) as cancelled:
+            await asyncio.wait_for(cancelled.wait(), timeout=2)
+            finished.append(True)
+
+    assert finished == [True]  # ran to completion, not interrupted
 
 
 @pytest.mark.asyncio
@@ -391,14 +419,22 @@ async def test_external_cancel_still_raises_cancelled_error():
     assert seen == []
 
 
+@pytest.mark.parametrize("can_interrupt", [True, False], ids=["3.11+", "3.10"])
 @pytest.mark.asyncio
-async def test_overlapping_shutdown_cancel_is_not_converted():
+async def test_overlapping_shutdown_cancel_is_not_converted(
+    monkeypatch, can_interrupt,
+):
     """A shutdown cancel landing after the guard requested its own — but
     before asyncio delivers it — coalesces into one CancelledError.
     Converting that one consumes the shutdown: Worker._execute_one reports
     "cancelled by user" and returns, run_forever keeps claiming, and
     run_hybrid's shutdown gather hangs on a worker task that never finishes.
-    The shutdown must survive the conversion."""
+    The shutdown must survive on both runtimes: on 3.11+ because the
+    cancellation count is still above the one seen at entry, on 3.10 because
+    the guard never cancelled the task, so nothing is converted at all."""
+    if can_interrupt and not cancel_mod._CAN_INTERRUPT:
+        pytest.skip("needs Task.cancelling()/uncancel() (3.11+)")
+    monkeypatch.setattr(cancel_mod, "_CAN_INTERRUPT", can_interrupt)
 
     class _ShutdownRacer(FakeBackendClient):
         def __init__(self):
@@ -406,9 +442,10 @@ async def test_overlapping_shutdown_cancel_is_not_converted():
             self.owner = None
 
         async def poll_cancel_status(self, task_id):
-            # Queued from inside the poll tick, so it runs *after* the
-            # guard's own owner.cancel() (queued later in that same tick)
-            # and *before* the CancelledError reaches the guarded block.
+            # Queued from inside the poll tick, so on 3.11+ it runs *after*
+            # the guard's own owner.cancel() (queued later in that same tick)
+            # and *before* the CancelledError reaches the guarded block. On
+            # 3.10 it is the only cancel there is.
             asyncio.get_running_loop().call_soon(self.owner.cancel)
             return {"cancelled": True}
 
