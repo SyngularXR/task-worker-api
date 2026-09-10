@@ -939,9 +939,10 @@ async def test_cancel_guard_propagates_to_progress_is_cancelled(
                     raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
-            # The guard also interrupts the handler at its next await now
-            # (pattern 1), which races this loop's next is_cancelled check
-            # and usually wins — the linked flag must be visible either way.
+            # The worker also races the handler against the guard's event
+            # now, and that cancel lands on this sleep before the loop's next
+            # is_cancelled check — the linked flag must be visible from here
+            # too, which is what a cooperative handler's cleanup reads.
             if ctx.progress.is_cancelled:
                 saw_cancelled.set()
             raise
@@ -999,6 +1000,51 @@ async def test_progress_is_cancelled_stays_false_without_cancel(
     assert len(client.completed_tasks) == 1
     assert client.failed_tasks == []
 
+
+@pytest.mark.asyncio
+async def test_cancel_interrupts_a_pure_async_handler(
+    make_worker, tmp_path, monkeypatch,
+):
+    """Pattern 1: a pure-async handler awaiting a long operation must be
+    aborted at that await. The CancelGuard only raises TaskCancelled on the
+    way *out* of the guarded block, so until the handler was raced against
+    the guard's ``cancelled`` event a handler awaiting a multi-minute
+    operation ran to completion on a task the user had already cancelled and
+    only then landed as cancelled."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    # Cancels only once the handler is running, and never reports cancelled
+    # on the heartbeat: the abort can only come from the guard's event.
+    client = _CancelGuardPropagationClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    finished = []
+
+    async def handler(ctx, params):
+        client.handler_running.set()
+        await asyncio.sleep(30)  # the "long operation"
+        finished.append(True)  # pragma: no cover — cancelled first
+        return {}
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        heartbeat_interval_s=10.0,  # long: isolates the guard path
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await worker.run_one()
+
+    assert finished == [], "handler ran to completion on a cancelled task"
+    assert loop.time() - started < 5, "handler was not interrupted at its await"
+    assert client.completed_tasks == []
+    assert [f["error"] for f in client.failed_tasks] == ["cancelled by user"]
 
 
 # ----- per-task workdir cleanup ---------------------------------------------

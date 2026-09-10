@@ -310,8 +310,10 @@ Don't swallow errors. Raising is the right signal.
 When the backend flips a task to CANCELLED (user hit cancel, or admin
 dashboard clicked stop), the SDK's `CancelGuard` polls
 `/tasks/{id}/cancel-status` every 2 seconds. It sets
-`ctx.progress.is_cancelled = True` and, if your handler awaits
-anywhere in the hot loop, `TaskCancelled` is raised at the next await.
+`ctx.progress.is_cancelled = True` and, if your handler awaits anywhere in
+the hot loop, the worker cancels it at the next await (a `CancelledError`,
+so clean up in `finally` / `except BaseException`, not `except Exception`)
+and reports the task as `TaskCancelled` — "cancelled by user".
 
 Three canonical handler shapes, pick yours:
 
