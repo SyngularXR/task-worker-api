@@ -454,89 +454,6 @@ async def _cancel_and_drain(task: "asyncio.Future") -> None:
     await _drain_ignoring_cancel(task)
 
 
-def _discard_outcome(task: "asyncio.Future") -> None:
-    """Retrieve an abandoned task's outcome so asyncio does not log it as an
-    unretrieved exception. We have already reported why we stopped waiting."""
-    if not task.cancelled():
-        task.exception()
-
-
-async def _cancel_and_drain_bounded(
-    task: "asyncio.Future", timeout: float, on_abandoned,
-) -> None:
-    """Cancel ``task``, wait at most ``timeout`` for it to stop, then escalate.
-
-    :func:`_cancel_and_drain` waits forever, which is right for our own
-    transfer coroutines — they unwind promptly and the caller is about to
-    close a file handle underneath them — but not for a worker author's
-    handler. A handler that swallows ``CancelledError`` — a bare ``except``
-    around the work loop, or cleanup that keeps awaiting — hangs the drain:
-    the unbounded run the cancel race exists to prevent, moved into cleanup,
-    and un-interruptible because :func:`_drain_ignoring_cancel` deliberately
-    rides out cancellation of *us* too, so not even the caller's own timeout
-    can break it.
-
-    Past the timeout we stop *waiting*, but the task is still running and
-    nothing on the loop can take its GPU, subprocess or workdir back — so
-    this is not a state the caller may continue from. ``on_abandoned`` is
-    called to say so; ``Worker._execute_one`` starts a
-    :class:`~task_worker_api.watchdog.TaskWatchdog` on an already-expired
-    deadline, which reports the cancel and hands the process to its supervisor
-    for a restart from its own thread — the escalation that watchdog already
-    runs for an in-process wedge, and off the loop for the same reason, since
-    the live handler resumes on it at the next await. Returning instead would
-    let the caller delete the workdir under a live handler and claim the next
-    task onto a GPU this one still holds.
-
-    ``timeout`` only bites on cleanup that yields. Cleanup that blocks the
-    event loop outright holds the loop this ``asyncio.wait`` timer runs on,
-    so the timeout cannot fire until the block ends; see
-    :func:`_await_unless_cancelled` for why nothing on the loop can bound
-    that.
-
-    The wait rides out cancellation of *us* — a worker shutdown landing on
-    top of the user cancel — because returning early there is the same
-    detached-handler state as returning on timeout, minus the escalation
-    that makes it survivable: ``on_abandoned`` would never run, and the
-    caller would delete the workdir and continue on a process the handler
-    still owns. The deadline is measured once, so riding the cancel out
-    neither extends nor restarts the grace, and the cancellation is re-raised
-    once the drain has settled so the caller's own shutdown still unwinds.
-    """
-    import asyncio
-
-    task.cancel()
-    ours: Optional[BaseException] = None
-    try:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while not task.done():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                on_abandoned()
-                break
-            try:
-                await asyncio.wait((task,), timeout=remaining)
-            except asyncio.CancelledError as exc:
-                # Cancellation of *us* (worker shutdown landing on top of the
-                # user cancel) must not end the drain: ``asyncio.wait`` is not
-                # shielded, so a bare await here returned with the handler
-                # still live and ``on_abandoned`` never called — the caller
-                # then deleted the workdir and moved on under a running
-                # handler, the exact state this function exists to prevent.
-                # Keep waiting against the *same* deadline, so riding out the
-                # cancel neither extends nor restarts the grace, and re-raise
-                # it once the drain has settled (finished, or escalated)
-                # rather than dropping it as :func:`_drain_ignoring_cancel`
-                # does — the caller's own unwind, shutdown included, is still
-                # owed.
-                ours = exc
-    finally:
-        task.add_done_callback(_discard_outcome)
-    if ours is not None:
-        raise ours
-
-
 async def _to_thread_complete(func, /, *args, cancel_cleanup=None):
     """Do not let task cancellation race a blocking thread operation.
 
@@ -618,16 +535,11 @@ async def _multipart_file_body(
     yield epilogue
 
 
-async def _await_unless_cancelled(
-    coro, cancelled: "asyncio.Event", message: str, *, grace_s: float = 0.0,
-    on_abandoned=None,
-):
+async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str):
     """Await ``coro``, aborting it as soon as ``cancelled`` is set.
 
     Used around each file transfer's complete retry loop, so cancellation
-    interrupts both an in-flight request and any retry backoff, and around
-    the handler call in ``Worker._execute_one``, so a user cancel stops an
-    in-flight handler instead of waiting for it to finish. The operation
+    interrupts both an in-flight request and any retry backoff. The operation
     runs as a task and races the event: whichever finishes first wins, and if
     the event wins the operation is cancelled and :class:`TaskCancelled` is
     raised with ``message``.
@@ -637,95 +549,16 @@ async def _await_unless_cancelled(
     the bytes are on the backend either way, so reporting a cancel that
     arrived after delivery would be a lie about what happened.
 
-    ``grace_s`` (0 for file transfers, ``Worker.cancel_grace_s`` for the
-    handler call) is how long the operation gets to notice the cancel and
-    stop on its own terms before it is aborted. A handler that watches the
-    signal itself — ``ctx.progress.is_cancelled``, or an ``on_cancel`` hook
-    that terminates a subprocess or sets a ``threading.Event`` — must be
-    allowed to finish its own unwind: aborting a ``to_thread`` await does
-    not stop the thread behind it, it only detaches it, so the worker would
-    claim its next task while the cancelled one still holds the GPU. Past
-    the grace the operation is aborted anyway; the point of the race is that
-    a handler which ignores the cancel cannot run unbounded.
-
-    ``grace_s`` bounds the unwind too, via :func:`_cancel_and_drain_bounded`:
-    the code being aborted is then the worker author's, and a handler that
-    swallows the ``CancelledError`` would otherwise stall the drain forever,
-    putting the delay right back to unbounded. So the handler's *await* is
-    stopped within ``2 * grace_s`` of the cancel landing — once to stop
-    itself, once to unwind — and if the second grace also runs out the
-    handler is still running: ``on_abandoned`` is called (required whenever
-    ``grace_s`` is set) and the caller escalates to a supervised process
-    restart rather than continuing on a process the handler still owns.
-    Stopping the await is *not* the same as the backend recording the
-    cancel: on the ordinary path the terminal ``fail()`` after it has its own
-    retry budget (6 attempts), 15s lifecycle deadline and any ``Retry-After``
-    the backend asks for, so report latency is bounded by the client's retry
-    policy, not by ``grace_s``. On the ``on_abandoned`` path it deliberately
-    is not that call — it is loop-bound, and eventual: an abandoned handler
-    can block the loop it would be awaited on, and even on a running loop it
-    would defer the restart for as long as the backend stays degraded
-    (``Retry-After`` is capped per sleep at 6h and ``retry_sleep_budget_s`` is
-    None by default, so ~30h on one call) while the handler keeps the GPU. The
-    escalation watchdog makes the bounded last-resort report from its thread
-    instead, so a blocked loop or a slow backend costs a late report rather
-    than a deferred restart.
-
-    Even the ``2 * grace_s`` abort bound holds only while the handler
-    *yields to the event loop*, which every ``await``-based unwind does. It
-    is not enforceable against cleanup that blocks the loop synchronously
-    (``time.sleep``, a blocking ``thread.join()``, a GIL-holding C call
-    inside ``except CancelledError:``): both graces are ``asyncio``
-    timeouts, and their timers only fire when the loop gets to run, so the
-    very thing being bounded is what stops the bound from firing. Nothing
-    scheduled on the loop can bound that — it equally stalls heartbeats and
-    cancel polling — so it is the same Python limitation as a GIL-holding
-    extension, not a property of this race. Blocking cleanup stays *correct*
-    (the task is reported cancelled once the loop runs again, never as a
-    success); it is only the timing that is unbounded.
-
     If the *caller* is cancelled while waiting (worker shutdown), the
     operation is cancelled too rather than left running detached with a file
-    handle open. That drain is bounded and escalating only if the user cancel
-    had already fired; a shutdown with no cancel behind it waits out the
-    handler's unwind as a plain ``await handler(...)`` always did, so an
-    ordinary deploy stays graceful instead of hard-exiting on any cleanup
-    slower than ``grace_s``.
+    handle open.
 
-    Every exit drains both children before returning or raising: cancellation
-    is cooperative, so merely requesting it would let the PUT run on past the
+    Every exit drains both children to completion via
+    :func:`_cancel_and_drain` before returning or raising: cancellation is
+    cooperative, so merely requesting it would let the PUT run on past the
     ``with open(src)`` block that ``upload_file`` is unwinding out of.
     """
     import asyncio
-
-    if grace_s and on_abandoned is None:
-        raise ValueError(
-            "grace_s requires on_abandoned: a handler that outlasts the "
-            "grace is still running, and the caller must escalate rather "
-            "than silently continue with it detached"
-        )
-
-    async def abort(task):
-        """Stop ``request``. Our own transfer coroutines are drained to
-        completion; a handler whose *user cancel* fired gets ``grace_s`` to
-        unwind, past which it is still running and ``on_abandoned``
-        escalates.
-
-        The bounded, escalating drain belongs to the user-cancel path only.
-        An ordinary worker shutdown (run_hybrid cancelling the worker task on
-        a uvicorn shutdown or container stop) cancels *us* with the event
-        never set, and there a slow unwind is not a handler ignoring a cancel
-        — it is the normal end of a deploy, which before the cancel race
-        awaited the handler's cleanup for as long as it took. Escalating
-        there would turn every graceful shutdown whose cleanup outlasts
-        ``grace_s`` into a hard-exit; the deployment's own SIGTERM → SIGKILL
-        grace is what bounds that case, and :class:`TaskWatchdog` still
-        covers an in-process wedge.
-        """
-        if grace_s and cancelled.is_set():
-            await _cancel_and_drain_bounded(task, grace_s, on_abandoned)
-        else:
-            await _cancel_and_drain(task)
 
     request = asyncio.ensure_future(coro)
     waiter = asyncio.ensure_future(cancelled.wait())
@@ -737,27 +570,18 @@ async def _await_unless_cancelled(
         # asyncio.wait does not cancel its futures when the awaiting task is
         # cancelled; without this the PUT would keep streaming after the
         # worker moved on.
-        await abort(request)
+        await _cancel_and_drain(request)
         raise
     finally:
         await _cancel_and_drain(waiter)
 
-    if grace_s and not request.done():
-        try:
-            # asyncio.wait leaves its futures alone on timeout — unlike
-            # wait_for, which would cancel ``request`` and lose the drain.
-            await asyncio.wait((request,), timeout=grace_s)
-        except BaseException:
-            await abort(request)
-            raise
-
     if request.done():
         return request.result()
 
-    # The operation is aborted on purpose; wait for it to unwind so the
+    # The upload is aborted on purpose; wait for it to unwind so the
     # connection is closed and the body has stopped reading src before
     # upload_file's `with open(src)` closes the handle underneath it.
-    await abort(request)
+    await _cancel_and_drain(request)
     raise TaskCancelled(message)
 
 

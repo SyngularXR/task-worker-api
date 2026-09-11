@@ -9,58 +9,20 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
-- A user cancel now stops an in-flight handler. `CancelGuard` only *sets* its
-  `cancelled` event — asyncio cannot raise into another coroutine — so the plain
-  `await handler(...)` in `Worker._execute_one` ran to completion and
-  `TaskCancelled` was raised only on leaving the guarded block, i.e. after the
-  hours of GPU work the user cancelled had already been spent. Only cooperative
-  handlers (polling `ctx.progress.is_cancelled`) or ones with an `on_cancel`
-  hook stopped early; otherwise the cancel was honoured just at the
-  `prepare_inputs` / `upload_outputs` boundaries. The handler call now races the
-  guard's event, so it is aborted `cancel_grace_s` (new `Worker` knob, default
-  5s) after the cancel lands. The abort is an ordinary asyncio cancellation
-  that is drained, so handler `finally` / `async with` cleanup still runs, and
-  the task still reports the single `cancelled by user` failure. The unwind gets
-  its own `cancel_grace_s`, so a handler that yields to the event loop stops
-  awaiting within `2 * cancel_grace_s` of the cancel. A handler that swallows
-  the `CancelledError` (or keeps awaiting in cleanup) past that is still
-  running, and nothing on the loop can take back its GPU, subprocess or
-  workdir: the worker hands the recovery to a `TaskWatchdog` started on an
-  already-expired deadline, which reports the cancel and then terminates the
-  process for a supervised restart, instead of detaching the handler and
-  claiming the next task on top of it. That escalation deliberately runs on
-  the watchdog's thread, not the loop: the abandoned handler is still on the
-  loop and resumes at the next await, so cleanup that blocks rather than
-  awaits would otherwise hold up the very report and exit meant to recover
-  from it. A worker shutdown that lands while that unwind is being
-  drained no longer cuts the drain short: the drain rides the cancellation out
-  against the same deadline, so a handler that outlives it is still escalated
-  (and the shutdown still propagates afterwards) instead of being detached,
-  reported and having its workdir deleted while it runs. The bounded, escalating
-  drain is scoped to the user-cancel path: a plain worker shutdown with no
-  cancel behind it (run_hybrid cancelling the worker task on a uvicorn shutdown
-  or container stop) waits the handler's unwind out for as long as it takes, as
-  a plain `await handler(...)` always did, so an ordinary deploy stays graceful
-  instead of hard-exiting whenever cleanup outlasts `cancel_grace_s`. That bound is on *stopping the handler*, not on the
-  backend recording the cancel: on the ordinary path the terminal `fail()`
-  keeps its own retry budget, lifecycle deadline and `Retry-After` waits. On
-  the escalation path it does not — an abandoned handler's cancel goes out
-  through the same bounded stdlib call `TaskWatchdog` uses for an in-process
-  wedge (capped by `timeout_grace_s`), because the async `fail()` is both
-  loop-bound and eventual: it could honour `Retry-After` for up to ~30h across
-  its six attempts and defer the restart for the whole of a backend outage
-  while the handler still held the GPU. The workdir is likewise left in place once a handler is abandoned
-  (rather than deleted out from under it) — including when an injected or
-  in-process `on_hard_exit` returns instead of terminating; whatever restarts
-  the worker clears it. Cleanup that *blocks* the
-  loop (`time.sleep`, a blocking `join()`) is outside the abort bound and
-  cannot be brought inside it: both graces are `asyncio` timeouts, so the
-  blocking is what stops them firing. Such a task is still reported cancelled,
-  only late — the same Python limitation that already applies to GIL-holding
-  extensions, which equally stalls heartbeats. The grace keeps the cooperative
-  and `on_cancel` patterns unchanged — they stop on their own terms first,
-  which for a threadpool handler is the only thing that actually stops the
-  thread rather than detaching it.
+- Document the cancel contract the SDK actually delivers. `CancelGuard`'s
+  docstring and `docs/adding-a-worker.md` both claimed `TaskCancelled` is
+  "raised at the next await" inside the guarded block; asyncio has no way to
+  raise into another coroutine, so the poller only *sets* the `cancelled`
+  event. A handler that doesn't check the signal runs to completion, and the
+  cancel is honoured at the `prepare_inputs` / `upload_outputs` boundaries and
+  on leaving the guarded block — the task is still reported `cancelled by
+  user`, never as a success, just no sooner than the handler returns. Stopping
+  the work stays cooperative on purpose: the SDK does not cancel the handler's
+  task, because cancelling an `await` ends the await and not the work behind
+  it, so a `to_thread` GPU job would keep running detached while the worker
+  deleted its workdir and claimed the next task on the same GPU. Handlers
+  needing unconditional termination should run the work in a subprocess they
+  can `terminate()` (Pattern 2).
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are

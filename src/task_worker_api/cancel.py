@@ -2,14 +2,18 @@
 
 Three canonical usage patterns:
 
-1. Pure async handler — the ``Worker`` races the handler against the guard's
-   ``cancelled`` event, so a handler that doesn't stop itself is aborted
-   (ordinary asyncio cancellation, ``finally``/``async with`` cleanup still
-   runs) ``Worker.cancel_grace_s`` after the cancel lands, and
-   ``TaskCancelled`` is raised in its place.
+1. Pure async handler — polls ``ctx.progress.is_cancelled`` between steps
+   and returns (or raises ``TaskCancelled``) itself. Nothing interrupts a
+   handler that doesn't: asyncio has no way to raise into another coroutine,
+   and the guard deliberately does not cancel the handler's task, because
+   cancelling an ``await`` does not stop the work behind it (pattern 3's
+   thread would keep running, detached, holding the GPU). A handler that
+   ignores the signal therefore runs to completion, and the cancel is
+   honoured at the ``prepare_inputs``/``upload_outputs`` boundaries and on
+   leaving the guarded block.
 2. Subprocess handler (Blender, colmap) — ``on_cancel`` calls ``proc.terminate()``;
-   the handler's ``await proc.communicate()`` unblocks; the guard raises on
-   the next poll tick.
+   the handler's ``await proc.communicate()`` unblocks; its
+   ``ctx.progress.raise_if_cancelled()`` then raises.
 3. Threadpool handler (Neural-Canvas GPU work) — ``on_cancel`` sets a
    ``threading.Event``; the thread checks the event between iterations
    and raises ``TaskCancelled`` from within its synchronous loop.
@@ -109,13 +113,11 @@ async def CancelGuard(
       - Calls ``on_cancel()`` synchronously. This runs on the guard's
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
         lands immediately.
-      - Sets the yielded ``cancelled`` event. The guard itself does *not*
-        interrupt the guarded block — asyncio has no way to raise into
-        another coroutine — so the block must either watch the event
-        (``prepare_inputs``/``upload_outputs`` abort on it, and
-        ``Worker._execute_one`` races the handler against it via
-        ``client._await_unless_cancelled``) or be a cooperative/``on_cancel``
-        handler that stops itself.
+      - Sets the yielded ``cancelled`` event. The guard does *not*
+        interrupt the guarded block — see pattern 1 above — so the block
+        must watch the event itself: ``prepare_inputs``/``upload_outputs``
+        abort on it, and the handler stops on its own terms
+        (``ctx.progress.is_cancelled``, or the ``on_cancel`` hook).
       - Raises ``TaskCancelled`` on exit of the guarded block if nothing
         inside it already did, so a cancel is never reported as a success.
 

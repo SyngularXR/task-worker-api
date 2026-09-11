@@ -310,30 +310,20 @@ Don't swallow errors. Raising is the right signal.
 When the backend flips a task to CANCELLED (user hit cancel, or admin
 dashboard clicked stop), the SDK's `CancelGuard` polls
 `/tasks/{id}/cancel-status` every 2 seconds. It sets
-`ctx.progress.is_cancelled = True`, and the worker races your handler
-against that signal. Patterns 2 and 3 below stop themselves and are
-unaffected; a handler that doesn't is aborted `cancel_grace_s` (a `Worker`
-knob, default 5s) after the cancel lands — an ordinary asyncio
-cancellation, so its `finally` / `async with` cleanup still runs and is
-awaited before the task is reported. That unwind gets `cancel_grace_s` of
-its own: a handler that swallows the `CancelledError`, or whose cleanup
-keeps awaiting past the grace, is still running with the worker unable to
-take its GPU or subprocess back — so the task is reported cancelled and the
-worker then exits for a supervised restart (`on_hard_exit`, the same path a
-wedged task's watchdog takes, run from the watchdog's own thread so it lands
-even if your cleanup goes on to block the loop). Cleanup that must survive a cancel belongs in
-`finally`, not after the last await, and it should not outlast the grace — a
-restart is a blunt recovery and costs every other task queued behind it. It
-must `await`, not block: cleanup that holds the event loop (a `time.sleep`,
-a blocking `thread.join()`) outlasts the grace no matter what it is set
-to, because the grace is an `asyncio` timer that only fires when the loop
-runs. Raise `cancel_grace_s` if your handler needs longer to stop or
-unwind on its own — a thread you signalled keeps running if the abort
-lands first. All of this is the *user cancel* path only: a plain worker
-shutdown (uvicorn exit, container stop) with no cancel behind it waits your
-cleanup out however long it takes and never triggers the restart, so a
-deploy stays graceful — the deployment's own SIGTERM → SIGKILL grace is
-what bounds that case.
+`ctx.progress.is_cancelled = True` — and that is the whole of it. Nothing
+interrupts your handler: asyncio has no way to raise into another
+coroutine, and the SDK deliberately does not cancel your handler's task,
+because cancelling an `await` ends the await, not the work behind it — a
+`to_thread` GPU job would keep running, detached, while the worker claimed
+its next task on the same GPU. Stopping the actual work is something only
+your handler can do, so every pattern below checks the signal itself.
+
+A handler that ignores it runs to completion; the cancel is then honoured
+at the `prepare_inputs` / `upload_outputs` boundaries and on the way out of
+the guarded block, so the task is still reported `cancelled by user` and
+never as a success — just no sooner than your handler returns. If you need
+unconditional termination rather than cooperation, run the work in a
+subprocess you can `terminate()` (Pattern 2).
 
 Three canonical handler shapes, pick yours:
 
@@ -346,7 +336,7 @@ async def run(ctx, params):
     async with httpx.AsyncClient() as http:
         for chunk_url in params.chunks:
             ctx.progress.raise_if_cancelled()
-            chunk = await http.get(chunk_url)       # cancel lands here
+            chunk = await http.get(chunk_url)
             await asyncio.to_thread(process, chunk)
     return {...}
 ```
@@ -420,34 +410,14 @@ catches it.
 ### Timing caveat
 
 Cancel visibility is bounded by the SDK's `cancel_poll_interval_s`
-(default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`;
-your handler stops awaiting at most `2 x cancel_grace_s` (default 5 s each —
-one grace to stop itself, one to unwind) after that, whether or not it
-stopped itself — provided it yields to the event loop, as every
-`await`-based handler and unwind does.
-Stopping the handler is not the same as the backend showing the task
-cancelled: the terminal `fail()` that follows has its own retry budget
-(6 attempts), 15 s lifecycle deadline and any `Retry-After` the backend
-asks for, so report latency is bounded by the client's retry policy, not by
-`cancel_grace_s`. The restart path above is the exception — there the cancel
-goes out through a bounded last-resort report (capped by `timeout_grace_s`)
-so a degraded backend delays the report rather than the restart, which
-would otherwise leave your handler holding its GPU for the whole outage.
-The yields-to-the-loop proviso is the same GIL caveat below, applied to
-cleanup: both graces
-are `asyncio` timeouts, so a handler that blocks the loop instead of
-awaiting (including inside `except asyncio.CancelledError:`) suspends the
-timers meant to bound it, and no value of `cancel_grace_s` will cut it
-short. Such a task is still reported cancelled rather than successful —
-only late. Keep loop-blocking work in `to_thread` / a subprocess, where it
-belongs anyway, and the bound holds.
-A C extension that holds the GIL and doesn't yield won't see cancel
+(default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`. That
+bounds when the *signal* arrives; when the work stops is up to how often
+your handler checks it, so check between work units rather than once per
+task. A C extension that holds the GIL and doesn't yield won't see cancel
 until it returns. This is a Python limitation, not ours — if you need
 sub-second cancel in a C extension, either break the work into smaller
 batches with awaits between them, or run the extension in a
-subprocess you can SIGTERM. Note the abort ends the *await*, not the
-work behind it: a GIL-holding extension or a thread keeps running
-detached, which is why signalling it (Pattern 3) still matters.
+subprocess you can SIGTERM.
 
 ---
 

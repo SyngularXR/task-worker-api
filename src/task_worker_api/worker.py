@@ -37,12 +37,7 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from .cancel import CancelGuard
-from .client import (
-    BackendClient,
-    _await_unless_cancelled,
-    _DEFAULT_BACKOFF_MAX_S,
-    _JITTER_SPREAD,
-)
+from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -290,18 +285,6 @@ def _positive_finite_s(name: str, value: float) -> float:
       answers; ``inf`` never heartbeats at all, so the task looks stale.
     * ``cancel_poll_interval_s``: the same two failures against ``CancelGuard``
       and ``GET /tasks/{id}/cancel-status``.
-    * ``cancel_grace_s``: ``<= 0`` aborts a handler the instant the cancel
-      lands, so a cooperative or ``on_cancel`` handler never gets to unwind
-      (its ``to_thread`` GPU work is detached rather than stopped); ``inf``
-      or ``NaN`` never aborts at all, which is the bug the race exists to
-      fix — the handler runs to completion on a cancelled task. It bounds
-      both halves of the abort: the grace to stop itself, then the same
-      again to unwind, so a handler that yields to the event loop stops
-      awaiting within ``2 * cancel_grace_s``; one that is still running
-      after both takes the worker down for a supervised restart. Cleanup
-      that blocks the loop outright is not boundable from on the loop (see
-      :func:`_await_unless_cancelled`) and stalls heartbeats alongside the
-      abort.
     * ``timeout_grace_s``: ``NaN`` makes ``TaskWatchdog._wait`` return
       instantly at both grace phases (``end = now + nan``, so the loop never
       runs), collapsing SIGTERM → grace → SIGKILL → grace → hard-exit into an
@@ -550,7 +533,6 @@ class Worker:
         heartbeat_interval_s: float = 10.0,
         heartbeat_warn_threshold: int = 3,
         cancel_poll_interval_s: float = 2.0,
-        cancel_grace_s: float = 5.0,
         request_timeout_s: float = 30.0,
         file_timeout_s: float = 300.0,
         cancel_timeout_s: float = 5.0,
@@ -594,9 +576,6 @@ class Worker:
         self.heartbeat_warn_threshold = heartbeat_warn_threshold
         self.cancel_poll_interval_s = _positive_finite_s(
             "cancel_poll_interval_s", cancel_poll_interval_s,
-        )
-        self.cancel_grace_s = _positive_finite_s(
-            "cancel_grace_s", cancel_grace_s,
         )
         self.task_timeout_s = _finite_task_timeout_s(
             "task_timeout_s", task_timeout_s,
@@ -1326,10 +1305,6 @@ class Worker:
             env=self._timeout_env,
         )
         guard = TerminalGuard()
-        # Snapshot the process tree before any of this task's work starts:
-        # both escalation paths below kill ``descendants now - this``, so it
-        # has to be taken before the handler spawns anything.
-        children_before = list_descendants(os.getpid())
         wd = None
         if timeout_s > 0:
             log.info(
@@ -1344,7 +1319,7 @@ class Worker:
                     target.base_url, target.api_key, task.id, self.worker_id,
                 ),
                 on_hard_exit=self._on_hard_exit,
-                children_before=children_before,
+                children_before=list_descendants(os.getpid()),
             )
             wd.start()
 
@@ -1355,9 +1330,6 @@ class Worker:
         outcome: tuple[str, object] = (
             "fail", "worker exited the task without recording an outcome",
         )
-        # Set when a cancelled handler outlives both graces: it is still
-        # running, so this process cannot be handed the next task.
-        handler_abandoned = False
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1447,69 +1419,7 @@ class Worker:
                 )
                 ctx = TaskContext(task=task, files=file_ctx, progress=progress)
 
-                # Race the handler against the guard's ``cancelled`` event
-                # instead of plain ``await handler(...)``. The guard only
-                # *sets* the event; nothing interrupts an await inside the
-                # handler, so a plain await raises TaskCancelled only on
-                # leaving the guarded block — i.e. after the handler has
-                # already run to completion, burning the hours of GPU work
-                # the user cancelled. Racing aborts the handler a
-                # ``cancel_grace_s`` after the cancel lands; its
-                # ``finally``/``async with`` cleanup still runs, because the
-                # abort is an ordinary asyncio cancellation that is drained
-                # before TaskCancelled is raised here — for at most another
-                # ``cancel_grace_s``, past which the handler is still
-                # running and the process is no longer reusable — see
-                # ``handler_abandoned`` in the finally below. The grace is
-                # what keeps the cooperative (ctx.progress.is_cancelled) and
-                # ``on_cancel`` patterns unchanged: they see the cancel
-                # first and stop on their own terms, which for a threadpool
-                # handler is the only thing that actually stops the thread.
-                def _abandoned() -> None:
-                    nonlocal handler_abandoned
-                    handler_abandoned = True
-                    log.error(
-                        "task %s: handler did not unwind within %ss of the "
-                        "cancel abort and is still running; escalating off "
-                        "the loop to report the cancel and restart the worker",
-                        task.id, self.cancel_grace_s,
-                    )
-                    # Off the loop, because the handler is still *on* it and
-                    # runnable: it resumes at the very next await here — the
-                    # terminal report, ``progress.stop()`` — and cleanup that
-                    # blocks rather than awaits (a blocking ``join()``, a
-                    # GIL-holding C call) never gives the loop back. Reporting
-                    # and exiting from here would then deliver neither, which
-                    # is exactly the in-process wedge TaskWatchdog exists for:
-                    # its thread kills what the task spawned, makes the
-                    # bounded last-resort report and hard-exits, all without
-                    # the loop. An already-expired deadline starts that ladder
-                    # now; it shares the TerminalGuard, so the report stays
-                    # exactly-once. The deadline watchdog is stopped because
-                    # this one supersedes it — a task being abandoned mid
-                    # cancel is not a timeout, and one restart is enough.
-                    self._stop.set()
-                    if wd is not None:
-                        wd.stop()
-                    self._watchdog_factory(
-                        timeout_s=0.0,
-                        grace_s=self.timeout_grace_s,
-                        guard=guard,
-                        sync_fail=_make_sync_fail(
-                            target.base_url, target.api_key,
-                            task.id, self.worker_id,
-                        ),
-                        on_hard_exit=self._on_hard_exit,
-                        children_before=children_before,
-                        reason="cancelled by user",
-                    ).start()
-
-                result = await _await_unless_cancelled(
-                    handler(ctx, typed_params), cancelled,
-                    f"task {task.id} cancelled by user",
-                    grace_s=self.cancel_grace_s,
-                    on_abandoned=_abandoned,
-                )
+                result = await handler(ctx, typed_params)
 
                 # Publish outputs *inside* the CancelGuard so a user cancel
                 # during the (potentially multi-minute) output upload is
@@ -1581,12 +1491,7 @@ class Worker:
                 # Single terminal report. If the watchdog fired, the deadline
                 # won; otherwise report the handler outcome. The guard makes
                 # this exactly-once even against the watchdog's hard-exit path.
-                # An abandoned handler is reported by the escalation watchdog
-                # instead, off the loop: the handler can block this loop at any
-                # await from here on, and the outcome must not be stuck behind
-                # it. Not claiming leaves that report to the watchdog thread —
-                # claiming and then blocking would lose it altogether.
-                if not handler_abandoned and guard.claim():
+                if guard.claim():
                     # Determine the terminal method + payload up front so the
                     # except handler can log *which* report failed and on which
                     # task — a bare ``except: pass`` here was silently swallowing
@@ -1698,37 +1603,20 @@ class Worker:
                 # leaked heartbeat outlives the task and double-starts the next
                 # one (start_heartbeat rejects a double start).
                 await progress.stop()
-            # Skipped for an abandoned handler: the abort was not honoured,
-            # so it is still running and asyncio has no way to take back the
-            # GPU, subprocess or workdir it holds. Its recovery — report, then
-            # hard exit — is already under way on the escalation watchdog's
-            # thread, and what is left here is not doing the cleanup that
-            # assumes the task is over: the rmtree would delete files the
-            # handler may still be reading or writing, and ``_active_task_dir``
-            # deliberately keeps pointing at the workdir so this process's own
-            # periodic sweep skips it too, for however long the process
-            # survives. Whatever restarts us clears the leftover: a re-claim of
-            # the same task goes through ``_clear_workdir`` (fails closed), and
-            # any other path leaves it to the orphan sweep. Skipped rather than
-            # returned early: returning out of a ``finally`` would also swallow
-            # the shutdown ``CancelledError`` this block can be unwinding.
-            if not handler_abandoned:
-                # Off the event loop: a finished task's workdir holds its
-                # staged inputs *and* its outputs (colmap-splat PLYs, Neural-
-                # Canvas splats), so a synchronous rmtree freezes the loop for
-                # the whole delete — in hybrid mode that stalls the FastAPI
-                # app, and in any mode it delays the next claim.
-                # ``ignore_errors=True`` keeps this non-raising, so the
-                # semantics are unchanged.
-                try:
-                    await asyncio.to_thread(
-                        shutil.rmtree, task_dir, ignore_errors=True,
-                    )
-                finally:
-                    # This assignment must not await: cancellation during
-                    # cleanup must not leave a dead task protected from future
-                    # sweeps.
-                    self._active_task_dir = None
+            # Off the event loop: a finished task's workdir holds its staged
+            # inputs *and* its outputs (colmap-splat PLYs, Neural-Canvas
+            # splats), so a synchronous rmtree freezes the loop for the whole
+            # delete — in hybrid mode that stalls the FastAPI app, and in any
+            # mode it delays the next claim. ``ignore_errors=True`` keeps this
+            # non-raising, so the semantics are unchanged.
+            try:
+                await asyncio.to_thread(
+                    shutil.rmtree, task_dir, ignore_errors=True,
+                )
+            finally:
+                # This assignment must not await: cancellation during cleanup
+                # must not leave a dead task protected from future sweeps.
+                self._active_task_dir = None
 
 
 async def run_hybrid(

@@ -136,7 +136,6 @@ class TaskWatchdog:
         sync_fail: Callable[[str], None],
         on_hard_exit: Callable[[], None],
         children_before: set,
-        reason: str = "",
         list_descendants_fn: Callable[[int], set] = list_descendants,
         kill_fn: Callable[[set, int], None] = kill_procs,
         now_fn: Callable[[], float] = time.monotonic,
@@ -146,13 +145,6 @@ class TaskWatchdog:
     ):
         self.timeout_s = timeout_s
         self.grace_s = grace_s
-        # What is being escalated, for the log line and the last-resort
-        # report. Default: this watchdog's own wall-clock deadline. A caller
-        # that borrows the escalation for another reason — Worker starting one
-        # on an already-expired deadline for a cancelled handler it had to
-        # abandon — says so here, so the task lands carrying that reason
-        # instead of a timeout it never hit.
-        self.reason = reason or f"timeout: exceeded {timeout_s:.0f}s"
         self.guard = guard
         self._sync_fail = sync_fail
         self._on_hard_exit = on_hard_exit
@@ -199,7 +191,8 @@ class TaskWatchdog:
             return  # finished before the deadline
         self.fired = True
         log.warning(
-            "task watchdog: %s; terminating task work", self.reason,
+            "task watchdog: deadline %.0fs exceeded; terminating task work",
+            self.timeout_s,
         )
         # Phase 1 — SIGTERM the task-spawned children.
         self._kill(self._task_spawned(), _SIGTERM)
@@ -213,7 +206,7 @@ class TaskWatchdog:
         if self.guard.claim():
             def report():
                 try:
-                    self._sync_fail(f"{self.reason} (hard-exit)")
+                    self._sync_fail(f"timeout: exceeded {self.timeout_s:.0f}s (hard-exit)")
                 except Exception as e:  # noqa: BLE001
                     log.warning("watchdog sync_fail failed: %s", e)
 
