@@ -153,11 +153,14 @@ def supervisor(tmp_path, monkeypatch):
 @pytest.mark.parametrize("backend,changed", [("cuda", None), ("vulkan", None),
     ("vulkan", "NVIDIA_DRIVER_CAPABILITIES"), ("vulkan", "SPECTRA_GPU_ID"), ("vulkan", "SPECTRA_GPU_BACKEND"),
     ("vulkan", "runtime")])
-def test_launch_is_durable_gpu_pinned_and_never_restarted(tmp_path, monkeypatch, backend, changed):
+@pytest.mark.parametrize("windows_host", [False, True])
+def test_launch_is_durable_gpu_pinned_and_never_restarted(tmp_path, monkeypatch, backend, changed, windows_host):
     instance, claim = supervisor(tmp_path, monkeypatch)
     claim.profile.gpu_backend = backend
     monkeypatch.setattr("task_worker_api.docker_supervisor.os.getuid", lambda: 1000, raising=False)
     monkeypatch.setattr("task_worker_api.docker_supervisor.os.getgid", lambda: 1001, raising=False)
+    if windows_host:
+        monkeypatch.delattr("task_worker_api.docker_supervisor.os.getuid")
     calls = []
     container = "a" * 64
 
@@ -168,7 +171,7 @@ def test_launch_is_durable_gpu_pinned_and_never_restarted(tmp_path, monkeypatch,
             assert instance._row(claim)[1] == "creating"
             assert args[args.index("--gpus") + 1] == "device=GPU-test"
             assert args[args.index("--network") + 1] == instance.network_id
-            assert args[args.index("--user") + 1] == "1000:1001"
+            assert args[args.index("--user") + 1] == ("1000:1000" if windows_host else "1000:1001")
             assert "USER=worker" in args and "HOME=/work" in args
             assert "XDG_CACHE_HOME=/work/.cache" in args
             assert ("NVIDIA_DRIVER_CAPABILITIES=graphics,utility" in args) == (backend == "vulkan")
