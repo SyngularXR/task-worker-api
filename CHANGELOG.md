@@ -9,6 +9,20 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- Document the cancel contract the SDK actually delivers. `CancelGuard`'s
+  docstring and `docs/adding-a-worker.md` both claimed `TaskCancelled` is
+  "raised at the next await" inside the guarded block; asyncio has no way to
+  raise into another coroutine, so the poller only *sets* the `cancelled`
+  event. A handler that doesn't check the signal runs to completion, and the
+  cancel is honoured at the `prepare_inputs` / `upload_outputs` boundaries and
+  on leaving the guarded block — the task is still reported `cancelled by
+  user`, never as a success, just no sooner than the handler returns. Stopping
+  the work stays cooperative on purpose: the SDK does not cancel the handler's
+  task, because cancelling an `await` ends the await and not the work behind
+  it, so a `to_thread` GPU job would keep running detached while the worker
+  deleted its workdir and claimed the next task on the same GPU. Handlers
+  needing unconditional termination should run the work in a subprocess they
+  can `terminate()` (Pattern 2).
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are

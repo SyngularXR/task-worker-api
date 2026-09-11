@@ -133,12 +133,14 @@ async def test_worker_reports_cancel_as_fail_cooperative(
     fake_client.mark_cancelled(task.id)
 
     async def handler(ctx, params):
-        # The handler never explicitly checks; the CancelGuard raises
-        # TaskCancelled at the next await.
+        # The handler never explicitly checks, so nothing stops it early: it
+        # runs to completion and the cancel is reported on the way out of the
+        # guarded block. See test_cancel_never_abandons_a_threadpool_handler
+        # for why the SDK does not abort it instead.
         import asyncio
         for _ in range(20):
             await asyncio.sleep(0.1)
-        return {}  # pragma: no cover — should never reach
+        return {}
 
     worker = make_worker(
         client=fake_client,
@@ -147,6 +149,104 @@ async def test_worker_reports_cancel_as_fail_cooperative(
     )
     await worker.run_one()
 
+    assert fake_client.completed_tasks == []
+    assert len(fake_client.failed_tasks) == 1
+    assert "cancelled" in fake_client.failed_tasks[0]["error"].lower()
+
+
+# ----- cancel must stay cooperative -----------------------------------------
+# Regression: an earlier attempt at "stop the handler" cancelled the handler's
+# asyncio task once a cancel landed. For the documented threadpool pattern
+# (Pattern 3 in docs/adding-a-worker.md — Neural-Canvas's GPU work) that
+# cancels the *await*, not the thread: the task completes at once while the
+# thread keeps running, so the worker reported the cancel, deleted the workdir
+# under the live thread and claimed its next task onto the same GPU. The worker
+# must wait for the handler instead, however long its own stop takes.
+
+
+@pytest.mark.asyncio
+async def test_cancel_never_abandons_a_threadpool_handler(
+    make_worker, fake_client, tmp_path,
+):
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    task = fake_client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    import threading
+
+    started = asyncio.Event()       # the handler is inside to_thread
+    signalled = threading.Event()   # the bridge saw the cancel
+    release = threading.Event()     # the test lets the thread stop
+    state: dict = {}
+
+    def work(cancel_event: threading.Event) -> None:
+        """Stands in for run_inference: a slow cooperative stop."""
+        assert cancel_event.wait(10)
+        signalled.set()
+        # Longer than any grace the worker could have imposed. A forced
+        # Task.cancel() would unblock the await here, leaving this thread —
+        # and the GPU it stands for — running past the worker's report.
+        assert release.wait(10)
+        state["thread_finished"] = True
+
+    async def handler(ctx, params):
+        cancel_event = threading.Event()
+
+        async def bridge():
+            while not cancel_event.is_set():
+                if ctx.progress.is_cancelled:
+                    cancel_event.set()
+                    return
+                await asyncio.sleep(0.01)
+
+        state["work_dir"] = ctx.files.input_dir
+        state["handler_task"] = asyncio.current_task()
+        b = asyncio.create_task(bridge())
+        started.set()
+        try:
+            await asyncio.to_thread(work, cancel_event)
+        finally:
+            b.cancel()
+        raise TaskCancelled("stopped on my own terms")
+
+    worker = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+    )
+    run = asyncio.create_task(worker.run_one())
+    # Cancel only once the handler is running: a cancel that lands earlier is
+    # honoured by prepare_inputs and the handler never starts.
+    await asyncio.wait_for(started.wait(), 10)
+    fake_client.mark_cancelled(task.id)
+
+    # Wait for the thread to be told to stop, then hold it there.
+    async def wait_signalled():
+        while not signalled.is_set():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_signalled(), 10)
+    await asyncio.sleep(0.2)
+
+    # The handler runs in the worker's own task, so there is no separate task
+    # to cancel: that is what makes the guarantee hold for a hold of any
+    # length, not just the 0.2s this test can afford to wait.
+    assert state["handler_task"] is run
+
+    # The worker is still awaiting the handler: nothing reported, nothing
+    # deleted, no next task claimed.
+    assert not run.done()
+    assert fake_client.failed_tasks == []
+    assert fake_client.completed_tasks == []
+    assert state["work_dir"].exists()
+
+    release.set()
+    await asyncio.wait_for(run, 10)
+
+    # The thread stopped itself before the worker moved on.
+    assert state["thread_finished"] is True
     assert fake_client.completed_tasks == []
     assert len(fake_client.failed_tasks) == 1
     assert "cancelled" in fake_client.failed_tasks[0]["error"].lower()

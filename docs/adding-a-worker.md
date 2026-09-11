@@ -310,8 +310,20 @@ Don't swallow errors. Raising is the right signal.
 When the backend flips a task to CANCELLED (user hit cancel, or admin
 dashboard clicked stop), the SDK's `CancelGuard` polls
 `/tasks/{id}/cancel-status` every 2 seconds. It sets
-`ctx.progress.is_cancelled = True` and, if your handler awaits
-anywhere in the hot loop, `TaskCancelled` is raised at the next await.
+`ctx.progress.is_cancelled = True` — and that is the whole of it. Nothing
+interrupts your handler: asyncio has no way to raise into another
+coroutine, and the SDK deliberately does not cancel your handler's task,
+because cancelling an `await` ends the await, not the work behind it — a
+`to_thread` GPU job would keep running, detached, while the worker claimed
+its next task on the same GPU. Stopping the actual work is something only
+your handler can do, so every pattern below checks the signal itself.
+
+A handler that ignores it runs to completion; the cancel is then honoured
+at the `prepare_inputs` / `upload_outputs` boundaries and on the way out of
+the guarded block, so the task is still reported `cancelled by user` and
+never as a success — just no sooner than your handler returns. If you need
+unconditional termination rather than cooperation, run the work in a
+subprocess you can `terminate()` (Pattern 2).
 
 Three canonical handler shapes, pick yours:
 
@@ -324,7 +336,7 @@ async def run(ctx, params):
     async with httpx.AsyncClient() as http:
         for chunk_url in params.chunks:
             ctx.progress.raise_if_cancelled()
-            chunk = await http.get(chunk_url)       # cancel lands here
+            chunk = await http.get(chunk_url)
             await asyncio.to_thread(process, chunk)
     return {...}
 ```
@@ -398,8 +410,10 @@ catches it.
 ### Timing caveat
 
 Cancel visibility is bounded by the SDK's `cancel_poll_interval_s`
-(default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`.
-A C extension that holds the GIL and doesn't yield won't see cancel
+(default 2 s) + one HTTP round-trip to `/tasks/{id}/cancel-status`. That
+bounds when the *signal* arrives; when the work stops is up to how often
+your handler checks it, so check between work units rather than once per
+task. A C extension that holds the GIL and doesn't yield won't see cancel
 until it returns. This is a Python limitation, not ours — if you need
 sub-second cancel in a C extension, either break the work into smaller
 batches with awaits between them, or run the extension in a

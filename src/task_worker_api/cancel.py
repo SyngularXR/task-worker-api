@@ -2,10 +2,18 @@
 
 Three canonical usage patterns:
 
-1. Pure async handler — TaskCancelled raises at the next ``await``.
+1. Pure async handler — polls ``ctx.progress.is_cancelled`` between steps
+   and returns (or raises ``TaskCancelled``) itself. Nothing interrupts a
+   handler that doesn't: asyncio has no way to raise into another coroutine,
+   and the guard deliberately does not cancel the handler's task, because
+   cancelling an ``await`` does not stop the work behind it (pattern 3's
+   thread would keep running, detached, holding the GPU). A handler that
+   ignores the signal therefore runs to completion, and the cancel is
+   honoured at the ``prepare_inputs``/``upload_outputs`` boundaries and on
+   leaving the guarded block.
 2. Subprocess handler (Blender, colmap) — ``on_cancel`` calls ``proc.terminate()``;
-   the handler's ``await proc.communicate()`` unblocks; the guard raises on
-   the next poll tick.
+   the handler's ``await proc.communicate()`` unblocks; its
+   ``ctx.progress.raise_if_cancelled()`` then raises.
 3. Threadpool handler (Neural-Canvas GPU work) — ``on_cancel`` sets a
    ``threading.Event``; the thread checks the event between iterations
    and raises ``TaskCancelled`` from within its synchronous loop.
@@ -105,8 +113,13 @@ async def CancelGuard(
       - Calls ``on_cancel()`` synchronously. This runs on the guard's
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
         lands immediately.
-      - Raises ``TaskCancelled`` in the guarded block at the next
-        ``await`` point.
+      - Sets the yielded ``cancelled`` event. The guard does *not*
+        interrupt the guarded block — see pattern 1 above — so the block
+        must watch the event itself: ``prepare_inputs``/``upload_outputs``
+        abort on it, and the handler stops on its own terms
+        (``ctx.progress.is_cancelled``, or the ``on_cancel`` hook).
+      - Raises ``TaskCancelled`` on exit of the guarded block if nothing
+        inside it already did, so a cancel is never reported as a success.
 
     Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
     plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C
