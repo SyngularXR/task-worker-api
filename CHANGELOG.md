@@ -9,6 +9,23 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
+- Document that SDK cancellation is cooperative, and keep it that way. The
+  `CancelGuard` docstring and `docs/adding-a-worker.md` promised pattern-1
+  handlers were "interrupted at the next `await`"; nothing implemented that,
+  and it cannot be implemented safely. Cancelling an `await` does not stop
+  the work behind it — a cancelled `proc.communicate()` leaves the child
+  process running, a cancelled `to_thread` leaves the thread running — and
+  force-cancelling the handler kills the bridge task that patterns 2 and 3
+  tear down in their own `finally`, which is the thing that terminates that
+  child or sets that stop event. The worker would report "cancelled by user"
+  and delete the workdir while the GPU/CLI work ran on. Both docs now say
+  what actually happens: the guard flips `ctx.progress.is_cancelled`, the
+  handler notices and stops its own work, and `TaskCancelled` is raised on
+  the way *out* of the guarded block. A pure-async handler parked in one
+  long `await` with no cancel check runs to completion by design — call
+  `ctx.progress.raise_if_cancelled()` between awaits. The
+  `prepare_inputs`/`upload_outputs` aborts, which cancel transfers the SDK
+  itself owns, are unchanged. A regression test pins the bridge contract.
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are
