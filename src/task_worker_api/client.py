@@ -1058,6 +1058,15 @@ class BackendClient:
         if not pending or not pending[1] or not pending[1]["claim"]:
             raise AdmissionError("claim_request_unknown")
         claim = ClaimResult.model_validate(pending[1]["claim"])
+        if kind == "fail" and isinstance(payload.get("error"), str):
+            # Same wire constraint as v1 :meth:`fail`, and it bites harder here:
+            # the journal stores this request and replays it forever, so a
+            # multi-MB traceback (413) or a surrogate-escaped subprocess message
+            # (UnicodeEncodeError while httpx *builds* the request) leaves the
+            # attempt permanently unresolved and wedges the worker behind
+            # previous_claim_unresolved. Cap before prepare_operation so the
+            # durable body is the deliverable one.
+            payload = {**payload, "error": _cap_fail_error(payload["error"])}
         semantic_payload = payload
         if kind == "release":
             if cleanup is None or host_report is None:
