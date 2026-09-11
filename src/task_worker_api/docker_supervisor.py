@@ -168,7 +168,7 @@ class DockerSupervisor:
             raise AdmissionError("staging_deadline_exceeded")
         plan = dict(id=str(uuid4()), name="synpusher-attempt-" + claim.ownership.attempt_id.hex,
             ownership=claim.ownership.model_dump(mode="json"), image=image, command=command,
-            user=f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "0:0",
+            user=f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "1000:1000",
             gpu=claim.gpu_uuid, memory=claim.profile.execution_ram_mib, cpu=claim.profile.cpu_millicores,
             mounts=read_only_mounts, environment=environment, publication=str(publication_directory) if publication_directory else None,
             root=str(self.root), scope=self.execution_scope, cgroup_parent=self.cgroup_parent, network_id=self.network_id,
