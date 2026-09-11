@@ -414,41 +414,6 @@ def _make_sync_fail(
     return _sync_fail
 
 
-def _bounded_sync_report(
-    sync_fail: Callable[[str], None], error: str, *, bound_s: float,
-) -> None:
-    """Send a last-resort terminal fail report, off the loop and time-boxed.
-
-    The same shape TaskWatchdog uses for an in-process wedge, for the same
-    reason: the caller is already on its way to a hard exit, so the report
-    must never be the thing that delays it. ``sync_fail`` bounds itself
-    (~15s with ``_make_sync_fail``'s defaults), but socket timeouts do not
-    cover every resolver/transport stall, so the wait is capped and an
-    overrunning daemon thread is simply left behind.
-
-    Blocking rather than awaiting is deliberate. The caller is abandoning a
-    handler that is still running on this event loop; if that handler goes
-    back to blocking it, an ``asyncio`` timeout meant to bound the wait is
-    starved by the very thing it is bounding. A thread join is not.
-    """
-    def report() -> None:
-        try:
-            sync_fail(error)
-        except Exception as e:  # noqa: BLE001
-            log.warning("abandoned-handler sync_fail failed: %s", e)
-
-    reporter = threading.Thread(
-        target=report, name="abandon-report", daemon=True,
-    )
-    reporter.start()
-    reporter.join(timeout=bound_s)
-    if reporter.is_alive():
-        log.warning(
-            "abandoned-handler failure report exceeded %.0fs; "
-            "escalating without acknowledgement", bound_s,
-        )
-
-
 def _clear_workdir(task_dir: Path) -> None:
     """Remove a leftover attempt's workdir, or raise. Runs in a thread.
 
@@ -1361,6 +1326,10 @@ class Worker:
             env=self._timeout_env,
         )
         guard = TerminalGuard()
+        # Snapshot the process tree before any of this task's work starts:
+        # both escalation paths below kill ``descendants now - this``, so it
+        # has to be taken before the handler spawns anything.
+        children_before = list_descendants(os.getpid())
         wd = None
         if timeout_s > 0:
             log.info(
@@ -1375,7 +1344,7 @@ class Worker:
                     target.base_url, target.api_key, task.id, self.worker_id,
                 ),
                 on_hard_exit=self._on_hard_exit,
-                children_before=list_descendants(os.getpid()),
+                children_before=children_before,
             )
             wd.start()
 
@@ -1501,11 +1470,39 @@ class Worker:
                     handler_abandoned = True
                     log.error(
                         "task %s: handler did not unwind within %ss of the "
-                        "cancel abort and is still running; reporting the "
-                        "cancel, then terminating the worker for a "
-                        "supervised restart",
+                        "cancel abort and is still running; escalating off "
+                        "the loop to report the cancel and restart the worker",
                         task.id, self.cancel_grace_s,
                     )
+                    # Off the loop, because the handler is still *on* it and
+                    # runnable: it resumes at the very next await here — the
+                    # terminal report, ``progress.stop()`` — and cleanup that
+                    # blocks rather than awaits (a blocking ``join()``, a
+                    # GIL-holding C call) never gives the loop back. Reporting
+                    # and exiting from here would then deliver neither, which
+                    # is exactly the in-process wedge TaskWatchdog exists for:
+                    # its thread kills what the task spawned, makes the
+                    # bounded last-resort report and hard-exits, all without
+                    # the loop. An already-expired deadline starts that ladder
+                    # now; it shares the TerminalGuard, so the report stays
+                    # exactly-once. The deadline watchdog is stopped because
+                    # this one supersedes it — a task being abandoned mid
+                    # cancel is not a timeout, and one restart is enough.
+                    self._stop.set()
+                    if wd is not None:
+                        wd.stop()
+                    self._watchdog_factory(
+                        timeout_s=0.0,
+                        grace_s=self.timeout_grace_s,
+                        guard=guard,
+                        sync_fail=_make_sync_fail(
+                            target.base_url, target.api_key,
+                            task.id, self.worker_id,
+                        ),
+                        on_hard_exit=self._on_hard_exit,
+                        children_before=children_before,
+                        reason="cancelled by user",
+                    ).start()
 
                 result = await _await_unless_cancelled(
                     handler(ctx, typed_params), cancelled,
@@ -1584,7 +1581,12 @@ class Worker:
                 # Single terminal report. If the watchdog fired, the deadline
                 # won; otherwise report the handler outcome. The guard makes
                 # this exactly-once even against the watchdog's hard-exit path.
-                if guard.claim():
+                # An abandoned handler is reported by the escalation watchdog
+                # instead, off the loop: the handler can block this loop at any
+                # await from here on, and the outcome must not be stuck behind
+                # it. Not claiming leaves that report to the watchdog thread —
+                # claiming and then blocking would lose it altogether.
+                if not handler_abandoned and guard.claim():
                     # Determine the terminal method + payload up front so the
                     # except handler can log *which* report failed and on which
                     # task — a bare ``except: pass`` here was silently swallowing
@@ -1649,39 +1651,10 @@ class Worker:
                         terminal = "complete"
                     else:
                         terminal = "fail"
-                    # How the fail report goes out, not what it says. On the
-                    # ordinary path that is the async client. Once the handler
-                    # is abandoned it must not be: the process is on its way to
-                    # a supervised restart, and ``fail()`` is eventual rather
-                    # than bounded — six attempts honouring whatever
-                    # ``Retry-After`` the backend asks for (up to 6h a sleep,
-                    # and ``retry_sleep_budget_s`` is None by default), so a
-                    # degraded backend can pin this single await for ~30h. That
-                    # is 30h in which the abandoned handler still holds the GPU,
-                    # its subprocess and its workdir, and this worker claims
-                    # nothing. Report through the same bounded stdlib path
-                    # TaskWatchdog uses for an in-process wedge, capped by the
-                    # same ``timeout_grace_s``, so the escalation below follows
-                    # promptly. A late report is recoverable — the backend's
-                    # stale-task sweeper reclaims the task; a restart deferred
-                    # past the outage is not.
-                    async def report_fail(error: str) -> None:
-                        if not handler_abandoned:
-                            await target.client.fail(task.id, error)
-                            return
-                        _bounded_sync_report(
-                            _make_sync_fail(
-                                target.base_url, target.api_key,
-                                task.id, self.worker_id,
-                            ),
-                            error,
-                            bound_s=self.timeout_grace_s,
-                        )
-
                     try:
                         if fired:
-                            await report_fail(
-                                f"timeout: exceeded {timeout_s:.0f}s",
+                            await target.client.fail(
+                                task.id, f"timeout: exceeded {timeout_s:.0f}s",
                             )
                             log.warning(
                                 "task %s timed out (%s)",
@@ -1694,7 +1667,7 @@ class Worker:
                                 task.id, task.task_type.value,
                             )
                         else:
-                            await report_fail(outcome[1])
+                            await target.client.fail(task.id, outcome[1])
                             if outcome[1] == "cancelled by user":
                                 log.info("task %s cancelled by user", task.id)
                     except Exception as report_exc:  # noqa: BLE001
@@ -1725,33 +1698,21 @@ class Worker:
                 # leaked heartbeat outlives the task and double-starts the next
                 # one (start_heartbeat rejects a double start).
                 await progress.stop()
-            if handler_abandoned:
-                # The abort was not honoured, so the handler is still running
-                # and asyncio has no way to take back the GPU, subprocess or
-                # workdir it holds. Everything below and after here assumes
-                # the task is over: the rmtree deletes files the handler may
-                # still be reading or writing, and run_forever would claim the
-                # next task onto hardware this one never released. The only
-                # sound recovery is the one TaskWatchdog already uses for an
-                # in-process wedge — report the outcome (done above), then let
-                # the supervisor restart the process, which is what actually
-                # ends the work. ``_stop`` first, so an injected on_hard_exit
-                # that returns still cannot claim another task.
-                self._stop.set()
-                self._on_hard_exit()
-                # ``on_hard_exit`` is expected not to return (os._exit), but an
-                # injected or in-process supervisor's does — and everything
-                # below still assumes the task is over. It is not: the handler
-                # is running, so the workdir is not ours to delete, and
-                # ``_active_task_dir`` deliberately keeps pointing at it so
-                # this process's own periodic sweep skips it too. Whatever
-                # restarts us clears the leftover: a re-claim of the same task
-                # goes through ``_clear_workdir`` (fails closed), and any other
-                # path leaves it to the orphan sweep. Skipped with an ``else``
-                # rather than a ``return``: returning out of a ``finally``
-                # would also swallow the shutdown ``CancelledError`` this block
-                # can be unwinding.
-            else:
+            # Skipped for an abandoned handler: the abort was not honoured,
+            # so it is still running and asyncio has no way to take back the
+            # GPU, subprocess or workdir it holds. Its recovery — report, then
+            # hard exit — is already under way on the escalation watchdog's
+            # thread, and what is left here is not doing the cleanup that
+            # assumes the task is over: the rmtree would delete files the
+            # handler may still be reading or writing, and ``_active_task_dir``
+            # deliberately keeps pointing at the workdir so this process's own
+            # periodic sweep skips it too, for however long the process
+            # survives. Whatever restarts us clears the leftover: a re-claim of
+            # the same task goes through ``_clear_workdir`` (fails closed), and
+            # any other path leaves it to the orphan sweep. Skipped rather than
+            # returned early: returning out of a ``finally`` would also swallow
+            # the shutdown ``CancelledError`` this block can be unwinding.
+            if not handler_abandoned:
                 # Off the event loop: a finished task's workdir holds its
                 # staged inputs *and* its outputs (colmap-splat PLYs, Neural-
                 # Canvas splats), so a synchronous rmtree freezes the loop for

@@ -320,7 +320,8 @@ its own: a handler that swallows the `CancelledError`, or whose cleanup
 keeps awaiting past the grace, is still running with the worker unable to
 take its GPU or subprocess back — so the task is reported cancelled and the
 worker then exits for a supervised restart (`on_hard_exit`, the same path a
-wedged task's watchdog takes). Cleanup that must survive a cancel belongs in
+wedged task's watchdog takes, run from the watchdog's own thread so it lands
+even if your cleanup goes on to block the loop). Cleanup that must survive a cancel belongs in
 `finally`, not after the last await, and it should not outlast the grace — a
 restart is a blunt recovery and costs every other task queued behind it. It
 must `await`, not block: cleanup that holds the event loop (a `time.sleep`,

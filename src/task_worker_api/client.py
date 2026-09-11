@@ -479,12 +479,14 @@ async def _cancel_and_drain_bounded(
     Past the timeout we stop *waiting*, but the task is still running and
     nothing on the loop can take its GPU, subprocess or workdir back — so
     this is not a state the caller may continue from. ``on_abandoned`` is
-    called to say so; ``Worker._execute_one`` reports the cancel and then
-    hands the process to its supervisor for a restart (the same escalation
-    :class:`~task_worker_api.watchdog.TaskWatchdog` already uses for an
-    in-process wedge), which is what actually ends the work. Returning
-    instead would let the caller delete the workdir under a live handler and
-    claim the next task onto a GPU this one still holds.
+    called to say so; ``Worker._execute_one`` starts a
+    :class:`~task_worker_api.watchdog.TaskWatchdog` on an already-expired
+    deadline, which reports the cancel and hands the process to its supervisor
+    for a restart from its own thread — the escalation that watchdog already
+    runs for an in-process wedge, and off the loop for the same reason, since
+    the live handler resumes on it at the next await. Returning instead would
+    let the caller delete the workdir under a live handler and claim the next
+    task onto a GPU this one still holds.
 
     ``timeout`` only bites on cleanup that yields. Cleanup that blocks the
     event loop outright holds the loop this ``asyncio.wait`` timer runs on,
@@ -660,12 +662,14 @@ async def _await_unless_cancelled(
     retry budget (6 attempts), 15s lifecycle deadline and any ``Retry-After``
     the backend asks for, so report latency is bounded by the client's retry
     policy, not by ``grace_s``. On the ``on_abandoned`` path it deliberately
-    is not that call — an eventual report there would defer the restart for
-    as long as the backend stays degraded (``Retry-After`` is capped per
-    sleep at 6h and ``retry_sleep_budget_s`` is None by default, so ~30h on
-    one call) while the abandoned handler keeps the GPU. The caller drops to
-    a bounded last-resort report instead, so the escalation is prompt and a
-    slow backend costs a late report rather than a deferred restart.
+    is not that call — it is loop-bound, and eventual: an abandoned handler
+    can block the loop it would be awaited on, and even on a running loop it
+    would defer the restart for as long as the backend stays degraded
+    (``Retry-After`` is capped per sleep at 6h and ``retry_sleep_budget_s`` is
+    None by default, so ~30h on one call) while the handler keeps the GPU. The
+    escalation watchdog makes the bounded last-resort report from its thread
+    instead, so a blocked loop or a slow backend costs a late report rather
+    than a deferred restart.
 
     Even the ``2 * grace_s`` abort bound holds only while the handler
     *yields to the event loop*, which every ``await``-based unwind does. It

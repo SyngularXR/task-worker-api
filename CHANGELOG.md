@@ -25,10 +25,14 @@
   awaiting within `2 * cancel_grace_s` of the cancel. A handler that swallows
   the `CancelledError` (or keeps awaiting in cleanup) past that is still
   running, and nothing on the loop can take back its GPU, subprocess or
-  workdir: the worker reports the cancel and then terminates for a supervised
-  restart — the same `on_hard_exit` escalation `TaskWatchdog` already uses for
-  an in-process wedge — instead of detaching the handler and claiming the next
-  task on top of it. A worker shutdown that lands while that unwind is being
+  workdir: the worker hands the recovery to a `TaskWatchdog` started on an
+  already-expired deadline, which reports the cancel and then terminates the
+  process for a supervised restart, instead of detaching the handler and
+  claiming the next task on top of it. That escalation deliberately runs on
+  the watchdog's thread, not the loop: the abandoned handler is still on the
+  loop and resumes at the next await, so cleanup that blocks rather than
+  awaits would otherwise hold up the very report and exit meant to recover
+  from it. A worker shutdown that lands while that unwind is being
   drained no longer cuts the drain short: the drain rides the cancellation out
   against the same deadline, so a handler that outlives it is still escalated
   (and the shutdown still propagates afterwards) instead of being detached,
@@ -40,12 +44,12 @@
   instead of hard-exiting whenever cleanup outlasts `cancel_grace_s`. That bound is on *stopping the handler*, not on the
   backend recording the cancel: on the ordinary path the terminal `fail()`
   keeps its own retry budget, lifecycle deadline and `Retry-After` waits. On
-  the escalation path it does not — an abandoned handler's cancel is reported
+  the escalation path it does not — an abandoned handler's cancel goes out
   through the same bounded stdlib call `TaskWatchdog` uses for an in-process
-  wedge (capped by `timeout_grace_s`), because the async `fail()` there could
-  honour `Retry-After` for up to ~30h across its six attempts and defer the
-  restart for the whole of a backend outage while the handler still held the
-  GPU. The workdir is likewise left in place once a handler is abandoned
+  wedge (capped by `timeout_grace_s`), because the async `fail()` is both
+  loop-bound and eventual: it could honour `Retry-After` for up to ~30h across
+  its six attempts and defer the restart for the whole of a backend outage
+  while the handler still held the GPU. The workdir is likewise left in place once a handler is abandoned
   (rather than deleted out from under it) — including when an injected or
   in-process `on_hard_exit` returns instead of terminating; whatever restarts
   the worker clears it. Cleanup that *blocks* the
