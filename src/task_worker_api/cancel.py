@@ -2,9 +2,10 @@
 
 Three canonical usage patterns:
 
-1. Pure async handler — the ``Worker`` races the handler against the guard's
-   ``cancelled`` event, so the handler is cancelled at its next ``await`` and
-   the attempt fails with TaskCancelled ("cancelled by user").
+1. Pure async handler — the guard flips ``ctx.progress.is_cancelled``; the
+   handler calls ``ctx.progress.raise_if_cancelled()`` between its awaits.
+   A handler parked in one long ``await`` with no check is *not* interrupted
+   — see "Cancellation is cooperative" on the guard below.
 2. Subprocess handler (Blender, colmap) — ``on_cancel`` calls ``proc.terminate()``;
    the handler's ``await proc.communicate()`` unblocks; the guard raises on
    the next poll tick.
@@ -107,16 +108,23 @@ async def CancelGuard(
       - Calls ``on_cancel()`` synchronously. This runs on the guard's
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
         lands immediately.
-      - Sets the yielded ``cancelled`` event, and raises ``TaskCancelled``
-        on the way out of the guarded block.
+      - Sets the yielded ``cancelled`` event — which the worker links into
+        the progress reporter, so ``ctx.progress.is_cancelled`` reads True —
+        then raises ``TaskCancelled`` on the way *out* of the guarded block.
       - Aborts whoever is *racing* that event at their next ``await``:
-        ``Worker._execute_one`` runs the handler through
-        ``_await_unless_cancelled``, and ``prepare_inputs`` /
-        ``upload_outputs`` pass the event down to each file transfer. That
-        race — not the guard itself — is what makes the pattern-1
-        "interrupted at the next ``await``" guarantee real; a pure-async
-        handler awaiting a long operation would otherwise run to completion
-        on a task the user already cancelled and only then fail.
+        ``prepare_inputs`` / ``upload_outputs`` pass it down to each file
+        transfer, so a cancel during staging or publishing lands at once.
+
+    Cancellation is cooperative — the guard never cancels the handler task,
+    and a handler parked in one long ``await`` runs to its next check. That
+    is deliberate: cancelling an ``await`` does not stop the work behind it
+    (a cancelled ``proc.communicate()`` leaves the child running, a
+    cancelled ``to_thread`` leaves the thread running), and it would tear
+    down the handler's own bridge task — the ``finally: killer.cancel()`` in
+    patterns 2/3 — which is the thing that actually terminates that child or
+    sets that stop event. Forcing it would report the task cancelled and
+    remove the workdir while the GPU/CLI work ran on. Handlers stop their
+    own work; the guard only tells them to.
 
     Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
     plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C

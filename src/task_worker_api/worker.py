@@ -37,12 +37,7 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from .cancel import CancelGuard
-from .client import (
-    BackendClient,
-    _await_unless_cancelled,
-    _DEFAULT_BACKOFF_MAX_S,
-    _JITTER_SPREAD,
-)
+from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -1424,20 +1419,7 @@ class Worker:
                 )
                 ctx = TaskContext(task=task, files=file_ctx, progress=progress)
 
-                # Race the handler against the guard's ``cancelled`` event —
-                # the same child-task-versus-event race the file transfers
-                # use — so a pure-async handler awaiting a long operation is
-                # aborted at that await instead of running to completion on a
-                # task the user already cancelled (the guard alone only
-                # raises on the way *out* of the block). The handler task is
-                # cancelled and drained before TaskCancelled is raised, so it
-                # is never left running detached; a worker shutdown
-                # cancelling *us* propagates as CancelledError, having
-                # drained the handler the same way.
-                result = await _await_unless_cancelled(
-                    handler(ctx, typed_params), cancelled,
-                    f"task {task.id} cancelled by user",
-                )
+                result = await handler(ctx, typed_params)
 
                 # Publish outputs *inside* the CancelGuard so a user cancel
                 # during the (potentially multi-minute) output upload is

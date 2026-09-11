@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 
 import pytest
 
@@ -133,8 +135,9 @@ async def test_worker_reports_cancel_as_fail_cooperative(
     fake_client.mark_cancelled(task.id)
 
     async def handler(ctx, params):
-        # The handler never explicitly checks; the CancelGuard raises
-        # TaskCancelled at the next await.
+        # The handler never explicitly checks, so it runs to completion —
+        # cancellation is cooperative — and the CancelGuard raises
+        # TaskCancelled on the way out of the guarded block.
         import asyncio
         for _ in range(20):
             await asyncio.sleep(0.1)
@@ -932,20 +935,11 @@ async def test_cancel_guard_propagates_to_progress_is_cancelled(
         # handler between blocking ops). The CancelGuard polls at 0.01s;
         # it should flip is_cancelled well before this loop exhausts.
         client.handler_running.set()
-        try:
-            for _ in range(100):
-                if ctx.progress.is_cancelled:
-                    saw_cancelled.set()
-                    raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
-                await asyncio.sleep(0.02)
-        except asyncio.CancelledError:
-            # The worker also races the handler against the guard's event
-            # now, and that cancel lands on this sleep before the loop's next
-            # is_cancelled check — the linked flag must be visible from here
-            # too, which is what a cooperative handler's cleanup reads.
+        for _ in range(100):
             if ctx.progress.is_cancelled:
                 saw_cancelled.set()
-            raise
+                raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
+            await asyncio.sleep(0.02)
         return {}  # pragma: no cover — should never reach
 
     worker = make_worker(
@@ -1002,20 +996,23 @@ async def test_progress_is_cancelled_stays_false_without_cancel(
 
 
 @pytest.mark.asyncio
-async def test_cancel_interrupts_a_pure_async_handler(
+async def test_cancel_lets_the_handlers_own_bridge_stop_the_work(
     make_worker, tmp_path, monkeypatch,
 ):
-    """Pattern 1: a pure-async handler awaiting a long operation must be
-    aborted at that await. The CancelGuard only raises TaskCancelled on the
-    way *out* of the guarded block, so until the handler was raced against
-    the guard's ``cancelled`` event a handler awaiting a multi-minute
-    operation ran to completion on a task the user had already cancelled and
-    only then landed as cancelled."""
+    """Cancellation is cooperative: the worker must NOT cancel the handler
+    task. Patterns 2 and 3 park in an await (``proc.communicate()``,
+    ``to_thread``) whose *only* stopper is a bridge task the handler tears
+    down in its own ``finally``. Force-cancelling that await kills the
+    bridge before it fires, and cancelling the await does not stop the work
+    behind it — the child process keeps running, the thread keeps running —
+    while the worker reports "cancelled by user" and removes the workdir.
+
+    Modelled on pattern 3 (the Neural-Canvas shape) because a thread is
+    deterministic to observe; pattern 2's subprocess relies on exactly the
+    same guarantee."""
     monkeypatch.setitem(
         TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
     )
-    # Cancels only once the handler is running, and never reports cancelled
-    # on the heartbeat: the abort can only come from the guard's event.
     client = _CancelGuardPropagationClient()
     (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
     client.queue_task(
@@ -1023,13 +1020,35 @@ async def test_cancel_interrupts_a_pure_async_handler(
         params={"input_path": str(tmp_path / "fake.stl")},
     )
 
-    finished = []
+    cancel_event = threading.Event()
+    thread_stopped = threading.Event()
+
+    def run_inference():
+        # The synchronous inner loop, checking the stop event between work
+        # units exactly as docs/adding-a-worker.md pattern 3 prescribes.
+        for _ in range(500):
+            if cancel_event.is_set():
+                thread_stopped.set()
+                raise TaskCancelled("cancelled by user")
+            time.sleep(0.01)
+        raise AssertionError(  # pragma: no cover — cancel should land first
+            "stop event never reached the worker thread"
+        )
 
     async def handler(ctx, params):
+        async def _cancel_bridge():
+            while not cancel_event.is_set():
+                if ctx.progress.is_cancelled:
+                    cancel_event.set()
+                    return
+                await asyncio.sleep(0.05)
+
+        bridge = asyncio.create_task(_cancel_bridge())
         client.handler_running.set()
-        await asyncio.sleep(30)  # the "long operation"
-        finished.append(True)  # pragma: no cover — cancelled first
-        return {}
+        try:
+            return await asyncio.to_thread(run_inference)
+        finally:
+            bridge.cancel()
 
     worker = make_worker(
         client=client,
@@ -1037,12 +1056,13 @@ async def test_cancel_interrupts_a_pure_async_handler(
         cancel_poll_interval_s=0.01,
         heartbeat_interval_s=10.0,  # long: isolates the guard path
     )
-    loop = asyncio.get_running_loop()
-    started = loop.time()
     await worker.run_one()
 
-    assert finished == [], "handler ran to completion on a cancelled task"
-    assert loop.time() - started < 5, "handler was not interrupted at its await"
+    # The bridge got to run, and the thread saw the stop event and unwound
+    # itself before the worker moved on. Both are false if the handler is
+    # force-cancelled at its ``to_thread`` await.
+    assert cancel_event.is_set(), "bridge never observed the cancel"
+    assert thread_stopped.is_set(), "worker thread was abandoned still running"
     assert client.completed_tasks == []
     assert [f["error"] for f in client.failed_tasks] == ["cancelled by user"]
 

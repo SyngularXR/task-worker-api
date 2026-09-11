@@ -310,10 +310,18 @@ Don't swallow errors. Raising is the right signal.
 When the backend flips a task to CANCELLED (user hit cancel, or admin
 dashboard clicked stop), the SDK's `CancelGuard` polls
 `/tasks/{id}/cancel-status` every 2 seconds. It sets
-`ctx.progress.is_cancelled = True` and, if your handler awaits anywhere in
-the hot loop, the worker cancels it at the next await (a `CancelledError`,
-so clean up in `finally` / `except BaseException`, not `except Exception`)
-and reports the task as `TaskCancelled` — "cancelled by user".
+`ctx.progress.is_cancelled = True`, and raises `TaskCancelled` on the way
+*out* of your handler, so the attempt reports "cancelled by user".
+
+Cancellation is **cooperative**: the SDK never cancels your handler task, so
+a handler parked in one long `await` with no cancel check runs to
+completion. That is on purpose — cancelling an `await` would not stop the
+work behind it (a cancelled `proc.communicate()` leaves the child process
+running; a cancelled `to_thread` leaves the thread running), and it would
+kill the very bridge task in patterns 2 and 3 that does the stopping, while
+the worker reported the task cancelled and deleted the workdir underneath
+it. Notice the cancel and stop your own work — that is what all three
+shapes below do.
 
 Three canonical handler shapes, pick yours:
 

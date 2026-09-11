@@ -9,22 +9,23 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
-- A backend cancel now interrupts the running handler instead of only failing
-  the task after it finishes. `CancelGuard._poll` sets the `cancelled` event
-  and returns, and `TaskCancelled` was raised on the way *out* of the guarded
-  block — so the documented pattern-1 guarantee ("interrupted at the next
-  `await`") was unimplemented for pure-async handlers: one awaiting a
-  multi-minute operation ran to completion on a task the user had already
-  cancelled, and only then landed as cancelled. `Worker._execute_one` now runs
-  the handler through `_await_unless_cancelled` — the same child-task-versus-
-  event race the file transfers already use — so the handler is cancelled and
-  drained at its next `await` and the attempt reports "cancelled by user". A
-  handler that finishes before the cancel is detected still wins the tie, a
-  worker shutdown cancelling the worker task still propagates as
-  `CancelledError` (and still drains the handler rather than leaving it
-  running detached), and cooperative patterns 2/3 (`on_cancel`, the linked
-  `progress.is_cancelled` flag) plus the `prepare_inputs`/`upload_outputs`
-  aborts are unchanged.
+- Document that SDK cancellation is cooperative, and keep it that way. The
+  `CancelGuard` docstring and `docs/adding-a-worker.md` promised pattern-1
+  handlers were "interrupted at the next `await`"; nothing implemented that,
+  and it cannot be implemented safely. Cancelling an `await` does not stop
+  the work behind it — a cancelled `proc.communicate()` leaves the child
+  process running, a cancelled `to_thread` leaves the thread running — and
+  force-cancelling the handler kills the bridge task that patterns 2 and 3
+  tear down in their own `finally`, which is the thing that terminates that
+  child or sets that stop event. The worker would report "cancelled by user"
+  and delete the workdir while the GPU/CLI work ran on. Both docs now say
+  what actually happens: the guard flips `ctx.progress.is_cancelled`, the
+  handler notices and stops its own work, and `TaskCancelled` is raised on
+  the way *out* of the guarded block. A pure-async handler parked in one
+  long `await` with no cancel check runs to completion by design — call
+  `ctx.progress.raise_if_cancelled()` between awaits. The
+  `prepare_inputs`/`upload_outputs` aborts, which cancel transfers the SDK
+  itself owns, are unchanged. A regression test pins the bridge contract.
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are

@@ -539,13 +539,10 @@ async def _await_unless_cancelled(coro, cancelled: "asyncio.Event", message: str
     """Await ``coro``, aborting it as soon as ``cancelled`` is set.
 
     Used around each file transfer's complete retry loop, so cancellation
-    interrupts both an in-flight request and any retry backoff, and around
-    the handler in ``Worker._execute_one``, so a pure-async handler is
-    interrupted at its next ``await`` instead of running to completion on a
-    task the user already cancelled. The operation runs as a task and races
-    the event: whichever finishes first wins, and if the event wins the
-    operation is cancelled and :class:`TaskCancelled` is raised with
-    ``message``.
+    interrupts both an in-flight request and any retry backoff. The operation
+    runs as a task and races the event: whichever finishes first wins, and if
+    the event wins the operation is cancelled and :class:`TaskCancelled` is
+    raised with ``message``.
 
     An operation that has already completed wins the tie, matching the
     last-chunk-wins behaviour of ``download_file`` and ``_copyfile_async``:
