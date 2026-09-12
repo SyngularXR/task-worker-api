@@ -232,11 +232,13 @@ async def run(config_path):
             return SignedHostReport.model_validate_json(report_file.read_text())
 
         async with BackendClient(config["backend_url"], credential_file.read_text().strip()) as client:
-            if journal.pending() is None:
-                await client.resource_ready(journal, instance)
+            needs_ready = journal.pending() is None
             failures = 0
             while True:
                 try:
+                    if needs_ready:
+                        await client.resource_ready(journal, instance)
+                        needs_ready = False
                     delay = await run_cycle(client, journal, instance, task_types, supervisor, launch, read_report, key)
                     failures = 0
                 except ProtocolError:
