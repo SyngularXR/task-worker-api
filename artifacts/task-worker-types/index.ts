@@ -146,9 +146,6 @@ export interface ModelInitializingParams {
   convex_hull_smooth_iterations?: number;
   preview_max_triangles?: number;
   remove_interior?: boolean;
-  preview_remesher?: 'auto' | 'qremeshify' | 'none';
-  qremeshify_scale_factor?: number;
-  qremeshify_time_limit?: number;
   yup?: boolean;
 }
 
