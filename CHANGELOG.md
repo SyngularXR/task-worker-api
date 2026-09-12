@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.19.0.dev42
+
+- Map a retired worker protocol (410/426) on the v2 progress call to
+  `ProtocolError`, so `AttemptLease.update` expires the lease instead of
+  swallowing a raw `HTTPStatusError` and letting the worker keep executing an
+  attempt the backend no longer honours. Progress stays one-shot — like v1's
+  `report_progress_once`, it runs on the handler's critical path, so it does not
+  take the retry loop's backoff (~74s on defaults) or an uncapped `Retry-After`
+  sleep; the lease's background heartbeat still retries.
+
 ## 0.19.0.dev41
 
 - Expose the immutable admission-granted resource profile as `TaskContext.profile`

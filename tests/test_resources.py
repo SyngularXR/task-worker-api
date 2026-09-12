@@ -239,3 +239,138 @@ async def test_v2_fail_replays_the_capped_body_after_a_lost_response(tmp_path):
     assert len(sent) == 1 and len(sent[0]) <= _MAX_FAIL_ERROR_BYTES + 4096
     assert "bytes truncated]..." in json.loads(sent[0])["error"]
     assert journal.unresolved_operations() == []
+
+
+# ---------------------------------------------------------------------------
+# v2 progress() — one-shot on the handler's critical path
+# ---------------------------------------------------------------------------
+
+
+def _running_state(claim):
+    now = datetime.now(timezone.utc)
+    return {
+        "task_id": claim.task_id, "attempt_id": str(claim.ownership.attempt_id),
+        "state": "running", "task_status": 2, "cancelled": False,
+        "server_time": now.isoformat(),
+        "lease_expires_at": (now + timedelta(seconds=60)).isoformat(),
+        "execution_deadline": None, "progress": {},
+    }
+
+
+@pytest.fixture
+def no_blocking_sleep(monkeypatch):
+    """Records every backoff sleep the call under test starts, and never waits."""
+    slept: list = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    return slept
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [410, 426])
+async def test_v2_progress_maps_a_retired_protocol_to_protocol_error(status, no_blocking_sleep):
+    """A bare HTTPStatusError here is swallowed by ``AttemptLease.update``'s
+    generic handler, so the worker keeps executing an attempt the backend has
+    stopped honouring; ProtocolError is what expires the lease."""
+    from task_worker_api.errors import ProtocolError
+
+    claim = _admitted_claim(uuid4())
+    sent: list = []
+
+    def handle(request):
+        sent.append(request.content)
+        return httpx.Response(status)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        with pytest.raises(ProtocolError):
+            await backend.resource_progress(claim, {"stage": "compute"})
+
+    assert len(sent) == 1 and no_blocking_sleep == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "status"])
+async def test_v2_progress_stays_one_shot_under_a_degraded_backend(failure, no_blocking_sleep):
+    """Progress runs on the handler's critical path. Retrying it let a degraded
+    backend block the handler for max_retries x lifecycle_timeout_s plus backoff
+    (~74s on defaults) per update, while the work it describes sat idle. One
+    attempt, no backoff sleep, error straight back to ``AttemptLease.update``."""
+    claim = _admitted_claim(uuid4())
+    sent: list = []
+
+    def handle(request):
+        sent.append(request.content)
+        if failure == "transport":
+            raise httpx.ConnectError("blip")
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        with pytest.raises((httpx.TransportError, httpx.HTTPStatusError)):
+            await backend.resource_progress(claim, {"stage": "compute"})
+
+    assert len(sent) == 1, "progress must not spend the retry budget on the critical path"
+    assert no_blocking_sleep == [], "progress must not sleep on backoff"
+
+
+@pytest.mark.asyncio
+async def test_v2_progress_ignores_an_uncapped_retry_after(no_blocking_sleep):
+    """The v2 lifecycle path passes ``retry_after_max_s=None``, so a 429 on the
+    retried path can impose an arbitrary server-named sleep. One-shot progress
+    never honours it: a throttling backend cannot park the handler for an hour."""
+    claim = _admitted_claim(uuid4())
+    sent: list = []
+
+    def handle(request):
+        sent.append(request.content)
+        return httpx.Response(429, headers={"Retry-After": "3600"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            await backend.resource_progress(claim, {"stage": "compute"})
+
+    assert exc.value.response.status_code == 429
+    assert len(sent) == 1 and no_blocking_sleep == []
+
+
+@pytest.mark.asyncio
+async def test_v2_progress_returns_the_attempt_state_it_was_given():
+    claim = _admitted_claim(uuid4())
+    sent: list = []
+
+    def handle(request):
+        sent.append(request.content)
+        return httpx.Response(200, json=_running_state(claim))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        state = await backend.resource_progress(claim, {"stage": "compute", "current": 1, "total": 2})
+
+    assert len(sent) == 1 and state.attempt_id == claim.ownership.attempt_id
+    assert json.loads(sent[0])["progress"] == {"stage": "compute", "current": 1, "total": 2}
+
+
+@pytest.mark.asyncio
+async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sleep):
+    """The one-shot carve-out is progress only — heartbeat renews the lease from
+    a background task, where riding out a blip is worth the wait."""
+    claim = _admitted_claim(uuid4())
+    sent: list = []
+
+    def handle(request):
+        sent.append(request.content)
+        if len(sent) == 1:
+            raise httpx.ConnectError("blip")
+        return httpx.Response(200, json=_running_state(claim))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        state = await backend.resource_heartbeat(claim)
+
+    assert len(sent) == 2 and state.attempt_id == claim.ownership.attempt_id
+    assert no_blocking_sleep, "heartbeat keeps its backoff"

@@ -1038,15 +1038,28 @@ class BackendClient:
         journal.record_response(request.claim_request_id, result)
         return result, 0.0
 
-    async def _resource_request(self, method, path, **kwargs):
-        async def once():
-            response = await self._client.request(method, path, timeout=self._lifecycle_timeout, **kwargs)
-            if response.status_code in (410, 426):
-                raise ProtocolError("worker_protocol_unsupported: coordinated worker upgrade required")
-            response.raise_for_status()
-            return response
+    async def _resource_request_once(self, method, path, *, timeout=None, **kwargs):
+        """A single v2 lifecycle request — no retry, retired protocol mapped.
 
-        return await self._retry(once, method=method, path=path, retry_after_max_s=None)
+        410/426 becomes :class:`ProtocolError` rather than a raw
+        ``HTTPStatusError``, because that is the distinction the attempt lease
+        acts on: ``AttemptLease`` expires the lease on ``ProtocolError`` and
+        merely logs anything else. :meth:`_resource_request` layers the retry
+        loop on top; callers on a handler's critical path use this directly to
+        stay one-shot (see :meth:`resource_progress`).
+        """
+        response = await self._client.request(
+            method, path, timeout=self._lifecycle_timeout if timeout is None else timeout, **kwargs)
+        if response.status_code in (410, 426):
+            raise ProtocolError("worker_protocol_unsupported: coordinated worker upgrade required")
+        response.raise_for_status()
+        return response
+
+    async def _resource_request(self, method, path, **kwargs):
+        return await self._retry(
+            lambda: self._resource_request_once(method, path, **kwargs),
+            method=method, path=path, retry_after_max_s=None,
+        )
 
     async def resource_operation(self, journal, kind, payload, *, host_report=None, cleanup=None):
         """Persist operation UUID once, then reuse through all transport retries."""
@@ -1122,12 +1135,29 @@ class BackendClient:
         return state
 
     async def resource_progress(self, claim, progress):
-        """One-shot display update; lease renewal runs independently."""
+        """One-shot display update; lease renewal runs independently.
+
+        Deliberately *not* on the retried :meth:`_resource_request` path, for
+        the same reason as v1's :meth:`report_progress_once`: this runs on the
+        handler's critical path (``AttemptLease.update``), and the retry loop
+        would let a degraded backend block the handler for ``max_retries`` ×
+        ``lifecycle_timeout_s`` plus backoff (~74s on defaults) — or, since the
+        v2 path passes ``retry_after_max_s=None``, for however long a 429's
+        ``Retry-After`` names — while the work being described sits idle.
+        Dropping one display update is cheap: the lease's own background
+        ``_renew`` heartbeat is what refreshes the deadline, and it keeps its
+        retries.
+
+        It uses :meth:`_resource_request_once` rather than a bare request only
+        to map a retired protocol (410/426) to :class:`ProtocolError`, which is
+        what makes ``AttemptLease.update`` expire the lease instead of
+        swallowing the error in its generic handler and letting the worker keep
+        executing an attempt the backend no longer honours.
+        """
         from .resource_protocol import AttemptState
 
-        response = await self._client.request("PUT", f"/tasks/{claim.task_id}/progress", timeout=5,
+        response = await self._resource_request_once("PUT", f"/tasks/{claim.task_id}/progress", timeout=5,
             json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
-        response.raise_for_status()
         return AttemptState.model_validate(response.json())
 
     async def resource_status(self, claim):
