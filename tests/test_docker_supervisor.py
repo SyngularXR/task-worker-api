@@ -78,7 +78,8 @@ async def test_supervisor_renews_reservation_during_child_startup(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_path, monkeypatch):
+@pytest.mark.parametrize("startup_failures", [0, 5])
+async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_path, monkeypatch, startup_failures):
     from task_worker_api import admission_supervisor
 
     for name in ("private", "report", "publication", "artifacts", "credentials"):
@@ -96,6 +97,14 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
 
+    ready_calls = 0
+    retry_delays = []
+
+    async def sleep(delay):
+        retry_delays.append(delay)
+
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+
     class Client:
         def __init__(self, *args):
             pass
@@ -104,9 +113,13 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
         async def __aexit__(self, *args):
             pass
         async def resource_ready(self, *args):
-            pass
+            nonlocal ready_calls
+            ready_calls += 1
+            if ready_calls <= startup_failures:
+                raise httpx.ConnectError("Backend still starting")
 
     async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        assert ready_calls == startup_failures + 1
         assert types == ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep"]
         assert launch["command"][2] == "src.services.resource_finalizer_worker"
         assert launch["publication_directory"] == tmp_path / "publication"
@@ -124,6 +137,7 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
     monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(admission_supervisor.run(path), timeout=5)
+    assert retry_delays == [5, 10, 20, 40, 40][:startup_failures]
 
 
 def test_supervisor_singleton_releases_lock_on_exit(tmp_path):

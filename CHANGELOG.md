@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev39
+
+- Retry the supervisor's initial readiness request with the existing polling
+  backoff when the backend is still starting, so workers survive login before
+  Docker and the backend are available.
+
 ## Unreleased
 
 **Features:**
