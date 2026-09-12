@@ -1,15 +1,17 @@
 """Trust-boundary resource validation, without inventing production budgets."""
 import pytest
 import asyncio
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import httpx
 from pydantic import ValidationError
 
 from task_worker_api.claim_journal import ClaimJournal
-from task_worker_api.client import BackendClient
+from task_worker_api.client import BackendClient, _MAX_FAIL_ERROR_BYTES
 from task_worker_api.resources import AdmissionError
-from task_worker_api.resources import Capacity, ClaimRequest, ResourceProfile, HostSnapshot
+from task_worker_api.resources import (AttemptOwnership, Capacity, ClaimRequest, ClaimResult,
+                                        ResourceProfile, HostSnapshot)
 from task_worker_api.resource_protocol import SignedHostReport
 
 
@@ -123,3 +125,117 @@ async def test_v2_retry_after_is_not_shortened_by_jitter_or_legacy_cap(tmp_path,
     assert result is None and delay == 86400
     assert sleeps == [86401]
     assert len(calls) == 2 and calls[0].content == calls[1].content
+
+
+# ---------------------------------------------------------------------------
+# v2 fail() — error-string cap at the admission wire boundary
+# ---------------------------------------------------------------------------
+
+
+def _admitted_claim(instance):
+    now = datetime.now(timezone.utc)
+    return ClaimResult(
+        task_id=1,
+        task={"id": 1, "task_type": "finalize_segment", "case_id": None,
+              "item_key": "k", "params": {}, "inputs": {}},
+        ownership=AttemptOwnership(worker_instance_id=instance, attempt_id=uuid4(),
+                                   generation=1, token="t" * 32),
+        profile=cpu_profile(), input_digest="a" * 64, gpu_uuid=None,
+        host_id=uuid4(), boot_id=uuid4(), execution_scope="test-scope",
+        staging_deadline=now + timedelta(seconds=60),
+        lease_expires_at=now + timedelta(seconds=60), state="running",
+    )
+
+
+def _admitted_journal(tmp_path, instance):
+    journal = ClaimJournal(tmp_path / "claim.sqlite")
+    request = journal.prepare(instance, frozenset({"finalize_segment"}))
+    claim = _admitted_claim(instance)
+    journal.record_response(request.claim_request_id, claim)
+    return journal, claim
+
+
+def _admitted_backend(claim, sent):
+    def handle(request):
+        sent.append(request.content)
+        now = datetime.now(timezone.utc)
+        return httpx.Response(200, json={
+            "task_id": claim.task_id, "attempt_id": str(claim.ownership.attempt_id),
+            "state": "released", "task_status": 3, "cancelled": False,
+            "server_time": now.isoformat(),
+            "lease_expires_at": (now + timedelta(seconds=60)).isoformat(),
+            "execution_deadline": None, "progress": {},
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test")
+    return BackendClient("http://test", "test", client=client), client
+
+
+@pytest.mark.asyncio
+async def test_v2_fail_caps_a_giant_error_before_it_is_journaled(tmp_path):
+    """An uncapped traceback is worse on v2 than on v1: the durable request is
+    persisted before transmission and replayed forever, so a body nginx rejects
+    with 413 leaves the attempt unresolved and wedges the worker behind
+    previous_claim_unresolved instead of just losing one report."""
+    instance = uuid4()
+    journal, claim = _admitted_journal(tmp_path, instance)
+    sent: list = []
+    backend, transport = _admitted_backend(claim, sent)
+    error = ("RuntimeError: colmap failed\n" + "x" * 4_000_000
+             + "\nCalledProcessError: returned non-zero exit status 1")
+    await backend.resource_operation(journal, "fail", {"error": error, "failure_kind": "error"})
+    await transport.aclose()
+
+    assert len(sent) == 1 and len(sent[0]) <= _MAX_FAIL_ERROR_BYTES + 4096
+    body = json.loads(sent[0])
+    assert body["error"].startswith("RuntimeError: colmap failed")
+    assert body["error"].endswith("CalledProcessError: returned non-zero exit status 1")
+    assert "bytes truncated]..." in body["error"]
+    assert body["failure_kind"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_v2_fail_sanitizes_an_unencodable_error(tmp_path):
+    """A subprocess message decoded with ``surrogateescape`` carries lone
+    surrogates; httpx encodes strict UTF-8, so an unsanitized one raises while
+    *building* every replay of the stored request — the attempt never resolves."""
+    instance = uuid4()
+    journal, claim = _admitted_journal(tmp_path, instance)
+    sent: list = []
+    backend, transport = _admitted_backend(claim, sent)
+    await backend.resource_operation(
+        journal, "fail", {"error": "boom \udcff", "failure_kind": "error"})
+    await transport.aclose()
+
+    assert json.loads(sent[0])["error"] == "boom \\udcff"
+
+
+@pytest.mark.asyncio
+async def test_v2_fail_replays_the_capped_body_after_a_lost_response(tmp_path):
+    """Recovery replays the durable request verbatim, so the capped body — not
+    the original — is what a restarted worker retransmits."""
+    instance = uuid4()
+    journal, claim = _admitted_journal(tmp_path, instance)
+    sent: list = []
+    backend, transport = _admitted_backend(claim, sent)
+    error = "RuntimeError: boom\n" + "\udcff" * 200_000
+
+    async def lost(*args, **kwargs):
+        raise httpx.ConnectError("response lost")
+
+    backend._resource_request = lost
+    with pytest.raises(httpx.ConnectError):
+        await backend.resource_operation(journal, "fail", {"error": error, "failure_kind": "error"})
+    unresolved = journal.unresolved_operations()
+    assert [kind for kind, _ in unresolved] == ["fail"]
+
+    # Restart: a fresh client replays the stored request and it must be deliverable.
+    replay, replay_transport = _admitted_backend(claim, sent)
+    states = await replay.resource_recover_operations(journal)
+    await transport.aclose()
+    await replay_transport.aclose()
+
+    assert [state.state for state in states] == ["released"]
+    assert len(sent) == 1 and len(sent[0]) <= _MAX_FAIL_ERROR_BYTES + 4096
+    assert "bytes truncated]..." in json.loads(sent[0])["error"]
+    assert journal.unresolved_operations() == []

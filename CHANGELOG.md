@@ -55,6 +55,18 @@
   reason — are transmitted byte-identical. Lone surrogates (a traceback quoting
   subprocess output decoded with `surrogateescape`) are escaped rather than left
   to raise `UnicodeEncodeError` inside the report call.
+- The v2 (admitted) terminal failure report now goes through the same cap.
+  `Worker.run_admitted_attempt` built `{"error": f"{type(exc).__name__}: {exc}"}`
+  uncapped and `BackendClient.resource_operation` persisted that body into the
+  durable journal *before* transmitting it, so a giant traceback or a
+  surrogate-escaped subprocess message made the report permanently
+  undeliverable: the journal replays the same stored request forever, the
+  attempt never resolves, and the worker stays wedged behind
+  `previous_claim_unresolved` ("previous attempt requires supervisor
+  reconciliation"). `resource_operation` now caps and sanitizes a `fail`
+  payload's `error` before `journal.prepare_operation`, so the durable body is
+  the deliverable one — covering the supervisor's own `fail` report too. No
+  change to the wire shape, the 16 KB cap, or which statuses retry.
 - The watchdog's last-resort `fail()` report no longer retries a permanent
   4xx. `_make_sync_fail` retried *any* exception 3× with 2s sleeps, so a
   definitive answer — 400 (bad body), 404 (task gone), 409 (already terminal)
