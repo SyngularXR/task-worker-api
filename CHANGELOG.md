@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev41
+
+- Expose the immutable admission-granted resource profile as `TaskContext.profile`
+  so handlers can select profiled execution methods without modifying task inputs,
+  their digest, or the claim wire schema. Unadmitted contexts retain `None`.
+
 ## 0.19.0.dev39
 
 - Retry the supervisor's initial readiness request with the existing polling
