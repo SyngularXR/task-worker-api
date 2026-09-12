@@ -15,7 +15,7 @@ from .enums import TaskStatus, TaskType
 
 if TYPE_CHECKING:  # pragma: no cover — avoids circular import at runtime
     from .progress import ProgressReporter
-    from .resources import ClaimResult
+    from .resources import ClaimResult, ResourceProfile
 
 
 @dataclass(frozen=True)
@@ -70,3 +70,4 @@ class TaskContext:
     task: ClaimedTask
     files: FileContext
     progress: "ProgressReporter"
+    profile: "ResourceProfile | None" = None

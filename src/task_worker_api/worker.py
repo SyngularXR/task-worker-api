@@ -1061,7 +1061,8 @@ class Worker:
                     handler = self.handlers[task.task_type]
                     files = await prepare_admitted_inputs(claim, client, self.work_dir)
                     await lease.start(await read_report(), claim.input_digest)
-                    result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease), params)
+                    result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease,
+                                                                 profile=claim.profile), params)
                     result = result or {}
                     if _result_encode_error(result) is not None:
                         raise ProtocolError("handler result cannot be encoded")
