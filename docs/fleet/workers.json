@@ -7,7 +7,7 @@
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
     "current_release": "v0.19.0.dev40",
-    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.16.0",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.19.0.dev40",
     "release_workflow": ".github/workflows/release.yml — publishes wheel + tag on every merge to main"
   },
   "workers": [
