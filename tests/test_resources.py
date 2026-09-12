@@ -239,3 +239,59 @@ async def test_v2_fail_replays_the_capped_body_after_a_lost_response(tmp_path):
     assert len(sent) == 1 and len(sent[0]) <= _MAX_FAIL_ERROR_BYTES + 4096
     assert "bytes truncated]..." in json.loads(sent[0])["error"]
     assert journal.unresolved_operations() == []
+
+
+# ---------------------------------------------------------------------------
+# v2 progress() — shared lifecycle transport
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [410, 426])
+async def test_v2_progress_maps_a_retired_protocol_to_protocol_error(status):
+    """A bare HTTPStatusError here is swallowed by ``AttemptLease.update``'s
+    generic handler, so the worker keeps executing an attempt the backend has
+    stopped honouring; ProtocolError is what expires the lease."""
+    from task_worker_api.errors import ProtocolError
+
+    claim = _admitted_claim(uuid4())
+
+    async def handle(request):
+        return httpx.Response(status)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        with pytest.raises(ProtocolError):
+            await backend.resource_progress(claim, {"stage": "compute"})
+
+
+@pytest.mark.asyncio
+async def test_v2_progress_retries_a_transport_blip(monkeypatch):
+    """The lease refreshes its deadline off this response, so one blip must not
+    drop the signal."""
+    async def sleep(seconds):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    claim = _admitted_claim(uuid4())
+    sent: list = []
+
+    def handle(request):
+        sent.append(request.content)
+        if len(sent) == 1:
+            raise httpx.ConnectError("blip")
+        now = datetime.now(timezone.utc)
+        return httpx.Response(200, json={
+            "task_id": claim.task_id, "attempt_id": str(claim.ownership.attempt_id),
+            "state": "running", "task_status": 2, "cancelled": False,
+            "server_time": now.isoformat(),
+            "lease_expires_at": (now + timedelta(seconds=60)).isoformat(),
+            "execution_deadline": None, "progress": {},
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        state = await backend.resource_progress(claim, {"stage": "compute", "current": 1, "total": 2})
+
+    assert len(sent) == 2 and state.attempt_id == claim.ownership.attempt_id
+    assert json.loads(sent[1])["progress"] == {"stage": "compute", "current": 1, "total": 2}

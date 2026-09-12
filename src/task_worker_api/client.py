@@ -1122,12 +1122,19 @@ class BackendClient:
         return state
 
     async def resource_progress(self, claim, progress):
-        """One-shot display update; lease renewal runs independently."""
+        """One-shot display update; lease renewal runs independently.
+
+        Goes through :meth:`_resource_request` like every other v2 lifecycle
+        call so a retired protocol (410/426) surfaces as :class:`ProtocolError`
+        — ``AttemptLease.update`` expires the lease on that, where a raw
+        ``HTTPStatusError`` is swallowed and the worker keeps executing an
+        attempt the backend no longer honours — and so a transport blip is
+        retried instead of dropping the signal the lease renews its deadline on.
+        """
         from .resource_protocol import AttemptState
 
-        response = await self._client.request("PUT", f"/tasks/{claim.task_id}/progress", timeout=5,
+        response = await self._resource_request("PUT", f"/tasks/{claim.task_id}/progress",
             json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
-        response.raise_for_status()
         return AttemptState.model_validate(response.json())
 
     async def resource_status(self, claim):

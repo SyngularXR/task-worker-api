@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0.dev40
+
+- Send v2 progress through the shared lifecycle request path, so a backend that
+  has retired the worker's protocol (410/426) raises `ProtocolError` and expires
+  the attempt lease instead of being swallowed, and a transient transport blip
+  is retried instead of dropping the signal the lease renews its deadline on.
+
 ## 0.19.0.dev39
 
 - Retry the supervisor's initial readiness request with the existing polling
