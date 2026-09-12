@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.19.0.dev43
+
+- Give the v2 terminal reports (`complete`/`fail`) the same retry hardness v1
+  already has: 500 joins the transient set and the attempt budget floors at
+  `_TERMINAL_MIN_ATTEMPTS` (6). They went through `_resource_request` on the
+  default 4 attempts with 500 fatal, so a backend dependency dying mid-write —
+  or a 502 blip outlasting 4 attempts — raised and left the attempt's durable
+  operation unresolved, wedging the worker behind `previous_claim_unresolved`
+  until a supervisor restart replayed it via `resource_recover_operations`.
+  Both kinds are idempotent journal-replayed operations, so re-PUTting is safe;
+  `start`/`release`/`decline` keep the default contract.
+
 ## 0.19.0.dev42
 
 - Map a retired worker protocol (410/426) on the v2 progress call to

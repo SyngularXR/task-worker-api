@@ -64,12 +64,14 @@ _RETRYABLE_EXCEPTIONS = (httpx.TransportError, httpx.TimeoutException)
 # won't help) — 408 is the exception because the server is reporting a
 # transport-level timeout rather than a defect in the request.
 #
-# Exception: terminal reports (``complete``/``fail``) opt in to retrying 500
-# via ``_retry``'s ``extra_transient`` parameter. A 500 there can also mean
-# the backend's own dependency died mid-write (e.g. Postgres I/O error), and
-# dropping the report orphans a fully computed outcome — the task stays
-# RUNNING until the sweeper reclaims it. Both terminal routes are idempotent
-# guarded transitions, so re-PUTting is safe.
+# Exception: terminal reports (``complete``/``fail``, on both v1 and the v2
+# resource protocol) opt in to retrying 500 via ``_retry``'s
+# ``extra_transient`` parameter. A 500 there can also mean the backend's own
+# dependency died mid-write (e.g. Postgres I/O error), and dropping the report
+# orphans a fully computed outcome — the task stays RUNNING until the sweeper
+# reclaims it (on v2 the attempt's durable operation also stays unresolved,
+# wedging the worker behind ``previous_claim_unresolved``). Every terminal
+# route is an idempotent guarded transition, so re-PUTting is safe.
 _TRANSIENT_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 
 # Extra transient set + attempt floor for terminal reports (see above).
@@ -1055,10 +1057,17 @@ class BackendClient:
         response.raise_for_status()
         return response
 
-    async def _resource_request(self, method, path, **kwargs):
+    async def _resource_request(self, method, path, *, extra_transient=frozenset(), attempts=None, **kwargs):
+        """Retried v2 lifecycle request.
+
+        ``extra_transient`` / ``attempts`` are forwarded to :meth:`_retry`, as
+        on v1's :meth:`_request` — terminal reports use them to widen the
+        transient set and raise the attempt budget.
+        """
         return await self._retry(
             lambda: self._resource_request_once(method, path, **kwargs),
             method=method, path=path, retry_after_max_s=None,
+            extra_transient=extra_transient, attempts=attempts,
         )
 
     async def resource_operation(self, journal, kind, payload, *, host_report=None, cleanup=None):
@@ -1114,9 +1123,21 @@ class BackendClient:
         from .resource_protocol import AttemptState
 
         body = journal.operation_request(kind, operation_id)
-        method = "PUT" if kind in ("complete", "fail") else "POST"
+        # Terminal reports retry harder here for the same reason v1's
+        # complete/fail do (see :meth:`complete`), and the cost of not doing so
+        # is higher: a 500 mid-write — or a 502 blip outlasting the default
+        # 4 attempts — leaves the durable operation unresolved, so the worker
+        # wedges behind ``previous_claim_unresolved`` until a supervisor
+        # restart replays it via :meth:`resource_recover_operations`. Both are
+        # idempotent journal-replayed operations, so re-PUTting is safe.
+        terminal = kind in ("complete", "fail")
+        method = "PUT" if terminal else "POST"
         try:
-            response = await self._resource_request(method, f"/tasks/{claim.task_id}/{kind}", json=body)
+            response = await self._resource_request(
+                method, f"/tasks/{claim.task_id}/{kind}", json=body,
+                extra_transient=_TERMINAL_EXTRA_TRANSIENT if terminal else frozenset(),
+                attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS) if terminal else None,
+            )
         except httpx.HTTPStatusError as exc:
             # These named precondition failures roll back the backend transaction.
             # Timeouts, 5xx, fencing and idempotency conflicts remain unresolved.
