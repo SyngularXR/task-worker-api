@@ -79,16 +79,14 @@
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
           "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S",
-          "QREMESHIFY_PATH",
-          "QREMESHIFY_MODE",
-          "QREMESHIFY_SCALE_FACTOR",
-          "QREMESHIFY_TIME_LIMIT"
+          "TRIFLOW_ROOT",
+          "TRIFLOW_PYTHON"
         ]
       },
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility,graphics",
-      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; Blender-CLI keeps compatible local schema extensions until the v0.12.0 wheel is pinned. QRemeshify is an optional GPL-3.0-or-later external runtime mounted read-only; it is not bundled in the MIT worker image. Basic admission is deployed on localhost and S4 with SDK dev35 and the documented host overlay: frozen inputs, owned uploads and verified cleanup. Further measurements use normal workloads. Blender-CLI PR #91 raises the default model_initializing preview/source budget to 500000 triangles; cinematic_baking projects AO/color onto a final target capped at 200000 triangles. Shipped cinematic settings keep 2048 textures with 256 samples. Current/bone uses the approved display curve and 0.8836 brightness factor; Bioform brightness is unchanged. External bake-config/sample overrides still apply."
+      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; Blender-CLI keeps compatible local schema extensions until the v0.12.0 wheel is pinned. TriFlow 120k trial replaces model-initializing simplification for over-budget meshes; pinned pretrained weights and an isolated Python 3.10/CUDA 11.8 runtime are bundled. CUDA admission and a coordinated parameter/profile migration are required before queued-worker rollout. Basic admission is deployed on localhost and S4 with SDK dev35 and the documented host overlay: frozen inputs, owned uploads and verified cleanup. Further measurements use normal workloads. Model-initializing preview default/ceiling and cinematic final ceiling are 120000 triangles; older larger previews are projected onto a bounded final target. Shipped cinematic settings keep 2048 textures with 256 samples. Current/bone uses the approved display curve and 0.8836 brightness factor; Bioform brightness is unchanged. External bake-config/sample overrides still apply."
     },
     {
       "id": "assetbundle-builder-worker",
