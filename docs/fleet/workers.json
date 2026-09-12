@@ -65,7 +65,7 @@
       ],
       "sdk_pin": {
         "style": "wheel_url",
-        "version": "v0.19.0.dev40",
+        "version": "v0.19.0.dev41",
         "file": "pyproject.toml",
         "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },
@@ -86,7 +86,7 @@
       "shared_volume_wired": true,
       "scaling": "single",
       "gpu": "compute,utility,graphics",
-      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; SDK dev40 shares the TriFlow 120k model-initializing contract with the backend and supervised worker. TriFlow 120k trial replaces model-initializing simplification for over-budget meshes; pinned pretrained weights and an isolated Python 3.10/CUDA 11.8 runtime are bundled. CUDA admission and a coordinated parameter/profile migration are required before queued-worker rollout. Basic admission is deployed on localhost and S4 with SDK dev35 and the documented host overlay: frozen inputs, owned uploads and verified cleanup. Further measurements use normal workloads. Model-initializing preview default/ceiling and cinematic final ceiling are 120000 triangles; older larger previews are projected onto a bounded final target. Shipped cinematic settings keep 2048 textures with 256 samples. Current/bone uses the approved display curve and 0.8836 brightness factor; Bioform brightness is unchanged. External bake-config/sample overrides still apply."
+      "notes": "graphics capability required for Blender OpenGL/Vulkan/EGL rendering. cinematic_baking accepts optional material_id, pattern_scale, and max_displacement_mm; SDK dev41 exposes the admission-granted profile to handlers without changing task payloads or digests. Model initialization selects TriFlow or Blender simplification from the granted profile, retains the 120k cap and reports optimization_method. Shared-worker priority and absence-grace fallback require opt-in backend profiles and one admission authority per resource pool; pinned pretrained weights and an isolated Python 3.10/CUDA 11.8 runtime are bundled. CUDA admission and a coordinated parameter/profile migration are required before queued-worker rollout. Basic admission is deployed on localhost and S4 with SDK dev35 and the documented host overlay: frozen inputs, owned uploads and verified cleanup. Further measurements use normal workloads. Model-initializing preview default/ceiling and cinematic final ceiling are 120000 triangles; older larger previews are projected onto a bounded final target. Shipped cinematic settings keep 2048 textures with 256 samples. Current/bone uses the approved display curve and 0.8836 brightness factor; Bioform brightness is unchanged. External bake-config/sample overrides still apply."
     },
     {
       "id": "assetbundle-builder-worker",
