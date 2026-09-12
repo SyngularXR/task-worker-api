@@ -1,11 +1,17 @@
 # Changelog
 
-## 0.19.0.dev40
+## 0.19.0.dev42
 
 - Send v2 progress through the shared lifecycle request path, so a backend that
   has retired the worker's protocol (410/426) raises `ProtocolError` and expires
   the attempt lease instead of being swallowed, and a transient transport blip
   is retried instead of dropping the signal the lease renews its deadline on.
+
+## 0.19.0.dev41
+
+- Expose the immutable admission-granted resource profile as `TaskContext.profile`
+  so handlers can select profiled execution methods without modifying task inputs,
+  their digest, or the claim wire schema. Unadmitted contexts retain `None`.
 
 ## 0.19.0.dev39
 

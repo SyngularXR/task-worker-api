@@ -5,8 +5,6 @@ services/backend/src/utils/extra_model_registry.py:_build_task_params.
 """
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import Field
 
 from ._base import TaskParamsBase
@@ -32,9 +30,6 @@ class ModelInitializingParams(TaskParamsBase):
     convex_hull_target_faces: int = Field(default=500, ge=1, le=2_000_000)
     convex_hull_margin: float = Field(default=1.6, ge=0.0, le=100.0, allow_inf_nan=False)
     convex_hull_smooth_iterations: int = Field(default=3, ge=0)
-    preview_max_triangles: int = Field(default=100_000, ge=1, le=5_000_000)
+    preview_max_triangles: int = Field(default=120_000, ge=1, le=120_000)
     remove_interior: bool = False
-    preview_remesher: Literal["auto", "qremeshify", "none"] | None = None
-    qremeshify_scale_factor: float | None = Field(default=None, ge=0.01, le=10.0, allow_inf_nan=False)
-    qremeshify_time_limit: int | None = Field(default=None, ge=1, le=3600)
     yup: bool = True
