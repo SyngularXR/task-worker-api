@@ -25,6 +25,7 @@ class CinematicBakingParams(TaskParamsBase):
             "keep the zero-copy input_path, foreign workers use only this."
         ),
     )
+    remove_interior: bool = False
     yup: bool = True
     material_id: StrictStr | None = Field(
         default=None,
