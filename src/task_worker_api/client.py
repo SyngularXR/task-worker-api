@@ -1057,51 +1057,18 @@ class BackendClient:
         response.raise_for_status()
         return response
 
-    async def _resource_request(self, method, path, *, extra_transient=frozenset(), attempts=None,
-                                deadline_s=None, **kwargs):
+    async def _resource_request(self, method, path, *, extra_transient=frozenset(), attempts=None, **kwargs):
         """Retried v2 lifecycle request.
 
         ``extra_transient`` / ``attempts`` are forwarded to :meth:`_retry`, as
         on v1's :meth:`_request` — terminal reports use them to widen the
         transient set and raise the attempt budget.
-
-        ``deadline_s`` bounds this call's *elapsed* time — every attempt and
-        every backoff sleep together — and surfaces as an
-        :class:`httpx.ReadTimeout`, the same failure a per-request deadline
-        already hands the caller. It is the one bound a lease-bound caller can
-        rely on, and it leaves the retry policy alone: attempts and the
-        client-wide ``retry_sleep_budget_s`` stay exactly as configured, so a
-        transient blip early in the lease still rides out its normal backoff,
-        and only the lease itself ends the call.
-
-        Neither of the bounds already here can stand in for it. A per-request
-        ``httpx.Timeout`` limits each connect/write/read operation
-        *separately*, and httpcore restarts the read deadline on every chunk
-        of the body — so a peer that keeps dribbling bytes outlives any finite
-        value; overriding it would also break ``lifecycle_timeout_s=None``'s
-        documented fallback to an injected client's own timeout. And
-        ``retry_sleep_budget_s`` bounds only the sleeps *between* attempts,
-        never an attempt that stalls on its own.
         """
-        import asyncio
-
-        call = self._retry(
+        return await self._retry(
             lambda: self._resource_request_once(method, path, **kwargs),
             method=method, path=path, retry_after_max_s=None,
             extra_transient=extra_transient, attempts=attempts,
         )
-        if deadline_s is None:
-            return await call
-        # ponytail: the timer is an event-loop timer, so a handler that blocks
-        # this loop delays it by however long it blocks — the same ceiling
-        # _retry's sleep budget documents, and unfixable from inside the
-        # blocked loop. Upgrade path is identical: keep handler work off it.
-        try:
-            return await asyncio.wait_for(call, deadline_s)
-        except asyncio.TimeoutError as exc:
-            raise httpx.ReadTimeout(
-                f"{method} {path} gave up at its {deadline_s:.1f}s deadline"
-            ) from exc
 
     async def resource_operation(self, journal, kind, payload, *, host_report=None, cleanup=None):
         """Persist operation UUID once, then reuse through all transport retries."""
@@ -1199,8 +1166,9 @@ class BackendClient:
         v2 path passes ``retry_after_max_s=None``, for however long a 429's
         ``Retry-After`` names — while the work being described sits idle.
         Dropping one display update is cheap: the lease's own background
-        ``_renew`` heartbeat is what refreshes the deadline, and it keeps its
-        retries.
+        ``_renew`` heartbeat is what refreshes the deadline, and it is one-shot
+        for the same reason — it retries on its own cadence instead (see
+        ``once`` on :meth:`resource_heartbeat`).
 
         It runs on the configured ``lifecycle_timeout_s`` deadline, like every
         other v2 lifecycle call; it used to hardcode 5s, which silently ignored
@@ -1219,43 +1187,38 @@ class BackendClient:
             json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
         return AttemptState.model_validate(response.json())
 
-    async def resource_status(self, claim, *, remaining_lease_s=None):
-        """Cancel-status poll.
-
-        ``remaining_lease_s`` is what the lease has left; past it this call's
-        answer is worthless, so it caps the whole call (see
-        ``deadline_s`` on :meth:`_resource_request`). ``None`` — the default —
-        leaves the call under the client-wide retry policy alone.
-        """
+    async def resource_status(self, claim):
         from .resource_protocol import AttemptState
 
         params = claim.ownership.model_dump(mode="json", exclude={"token"})
         response = await self._resource_request("GET", f"/tasks/{claim.task_id}/cancel-status",
-                                                params=params, headers={"X-Attempt-Token": claim.ownership.token},
-                                                deadline_s=remaining_lease_s)
+                                                params=params, headers={"X-Attempt-Token": claim.ownership.token})
         return AttemptState.model_validate(response.json())
 
-    async def resource_heartbeat(self, claim, *, remaining_lease_s=None):
-        """Lease renewal — the v2 caller whose retries have a hard deadline.
+    async def resource_heartbeat(self, claim, *, once=False):
+        """Heartbeat; ``once`` drops the retry loop for a lease-bound caller.
 
-        The v2 path passes ``retry_after_max_s=None``, so server guidance is
-        never shortened: one 429 carrying ``Retry-After: 3600``, or a full
-        backoff chain, parks the renewal well past the lease it is renewing.
-        By the time it returns the lease has expired, ``AttemptLease`` has
-        cancelled the owner task mid-work and its watchdog has hard-exited the
-        worker. ``remaining_lease_s`` — what the lease has left, read off the
-        monotonic deadline the backend's own clock deltas built — caps the
-        whole call instead (see ``deadline_s`` on :meth:`_resource_request`).
-        Giving up early costs nothing the caller doesn't already handle:
-        ``AttemptLease._renew`` loops and tries again on its own cadence, well
-        inside the window it just declined to sleep past. ``None`` — the
-        default — leaves the call under the client-wide retry policy alone.
+        Retried, the default, is what the supervisor's reservation heartbeat
+        wants: no deadline of its own to honour, so riding out a blip in place
+        costs nothing.
+
+        ``AttemptLease._renew`` passes ``once=True``, for the same reason
+        :meth:`resource_progress` is one-shot. The v2 path never shortens server
+        guidance (``retry_after_max_s=None``), so one 429 naming
+        ``Retry-After: 3600`` parks the retry loop far past the lease it was
+        renewing — and by the time it returns the owner task has been cancelled
+        mid-work and the watchdog has hard-exited the worker. Capping that
+        parked call is no fix either: one request that spends the whole lease
+        waiting loses it just as surely. A renewal rides out a blip by *retrying
+        sooner*, which is what ``_renew``'s cadence already does, so a shot's
+        job is to fail fast and hand the loop back the lease time it did not
+        spend.
         """
         from .resource_protocol import AttemptState
 
-        response = await self._resource_request("POST", "/workers/heartbeat", params={"task_id": claim.task_id},
-                                                json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json")},
-                                                deadline_s=remaining_lease_s)
+        send = self._resource_request_once if once else self._resource_request
+        response = await send("POST", "/workers/heartbeat", params={"task_id": claim.task_id},
+                              json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json")})
         return AttemptState.model_validate(response.json())
 
     async def resource_ready(self, journal, worker_instance_id):

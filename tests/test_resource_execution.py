@@ -8,22 +8,16 @@ from uuid import uuid4
 import pytest
 
 from task_worker_api.errors import ProtocolError
-from task_worker_api.resource_execution import AttemptLease, _MAX_LEASE_RUNWAY_S
+from task_worker_api.resource_execution import AttemptLease
 from task_worker_api.resource_protocol import AttemptState
 
 
 class Client:
-    def __init__(self, lease_seconds=30, skew=timedelta(0)):
-        now = datetime.now(timezone.utc)
-        # ``skew`` ages the claim's own lease stamp the way a worker clock out
-        # of step with the backend's would read it. Nothing in AttemptLease may
-        # subtract local wall time from it, so nothing here may depend on it.
+    def __init__(self, lease_seconds=30):
         self.claim = SimpleNamespace(task_id=1, ownership=SimpleNamespace(attempt_id=uuid4()),
-                                     staging_deadline=now + timedelta(seconds=60),
-                                     lease_expires_at=now + timedelta(seconds=45) - skew)
+                                     staging_deadline=datetime.now(timezone.utc) + timedelta(seconds=60))
         self.seconds = lease_seconds
         self.state = "reserved"
-        self.budgets = []
 
     def response(self):
         now = datetime.now(timezone.utc)
@@ -32,8 +26,7 @@ class Client:
             lease_expires_at=now + timedelta(seconds=self.seconds), progress={},
             execution_deadline=now + timedelta(seconds=10) if self.state == "running" else None)
 
-    async def resource_status(self, claim, *, remaining_lease_s=None):
-        self.budgets.append(remaining_lease_s)
+    async def resource_status(self, claim):
         return self.response()
 
     async def resource_operation(self, journal, kind, payload, **kwargs):
@@ -146,7 +139,7 @@ async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
     renewed = asyncio.Event()
     exited = threading.Event()
 
-    async def heartbeat(claim, *, remaining_lease_s=None):
+    async def heartbeat(claim, *, once=False):
         renewed.set()
         if revoked:
             return client.response().model_copy(update={"cancelled": True})
@@ -166,47 +159,76 @@ async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
 
 
 @pytest.mark.asyncio
-async def test_renewal_bounds_client_retries_by_the_remaining_lease(monkeypatch):
-    """A renewal that outlives the lease it renews is worse than no renewal:
-    the client's v2 path never shortens a 429's Retry-After, so an unbounded
-    heartbeat returns to an expired lease, a cancelled owner task and a hard
-    exit. The lease hands the client the time it actually has left."""
-    monkeypatch.setattr('task_worker_api.resource_execution.time.monotonic', lambda: 100.0)
-    client = Client()
-    lease = AttemptLease(client, None, client.claim)
-    lease._deadline = 108.0
-    budgets = []
+@pytest.mark.parametrize("degraded", ["fails", "stalls"])
+async def test_renewal_keeps_heartbeating_until_one_lands_inside_the_lease(degraded):
+    """A renewal must ride out a degraded backend by retrying *sooner*, never by
+    waiting longer than the lease it is renewing.
 
-    async def heartbeat(claim, *, remaining_lease_s=None):
-        budgets.append(remaining_lease_s)
-        raise asyncio.CancelledError
+    Sent down the client's retry loop, one 429's ``Retry-After`` parks the
+    heartbeat for the hour it names — the v2 path never shortens server
+    guidance — so the renewal comes back to an expired lease: ``_watch`` has
+    cancelled the owner task mid-work and hard-exited the worker. Bounding that
+    parked call is no fix either, which is why the allowance here is only *half*
+    the remaining lease: spend the whole lease on one request that never answers
+    (``stalls``) and the loop is handed back no time to try again with, so the
+    lease dies just the same.
+
+    Asserted on what actually matters, and what a bounded single call cannot
+    show: whichever way the first shot fails, a later one lands *before* expiry
+    and the owner runs on untouched past the lease it started with."""
+    client = Client(lease_seconds=3)
+    exited = threading.Event()
+    shots = []
+
+    async def heartbeat(claim, *, once=False):
+        shots.append(once)
+        if not once:
+            await asyncio.sleep(3600)  # a retried shot parks here, as the client's would
+        if len(shots) == 1:
+            if degraded == "stalls":
+                await asyncio.sleep(3600)  # ...and here if the request never answers
+            raise RuntimeError("degraded backend")
+        return client.response()
 
     client.resource_heartbeat = heartbeat
+    lease = AttemptLease(client, None, client.claim, grace_s=0.1, on_hard_exit=exited.set)
 
-    async def sleep(delay):
-        pass
+    async def owner():
+        async with lease:
+            await asyncio.sleep(3.5)
 
-    monkeypatch.setattr('task_worker_api.resource_execution.asyncio.sleep', sleep)
-    with pytest.raises(asyncio.CancelledError):
-        await lease._renew()
-    assert budgets == [8.0]
+    task = asyncio.create_task(owner())
+    done, _ = await asyncio.wait([task], timeout=8)
+    assert task in done and not task.cancelled(), \
+        "the watchdog cancelled the owner mid-work: no renewal landed inside the 3s lease"
+    task.result()
+    assert shots[:2] == [True, True], "a lease renewal must not be retried in place"
+    assert len(shots) >= 2 and not exited.is_set()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("skew", [timedelta(0), timedelta(hours=1), timedelta(hours=-1)])
-async def test_entry_bounds_its_poll_without_trusting_the_worker_clock(skew):
-    """Entry is the other lease-bound poll: parked on a server-named retry it
-    returns to a reservation the backend has already reclaimed.
+async def test_entry_poll_cannot_outlive_the_runway_it_could_be_granted(monkeypatch):
+    """Entry is the other lease-bound poll, and the one with no acknowledged
+    deadline yet: parked on a server-named retry it returns to a reservation the
+    backend has already reclaimed. Its bound cannot come from
+    ``claim.lease_expires_at`` minus local wall time — that reads the worker's
+    clock error as lease time — so it is _accept's own cap, which dates every
+    acknowledgement from the monotonic send time and grants at most
+    _MAX_LEASE_RUNWAY_S past it. A reply later than that is rejected anyway.
 
-    Its allowance must not come from ``claim.lease_expires_at`` minus local
-    wall time, because that subtraction reads the worker's clock error as
-    lease time. A clock running ahead (``skew`` positive, the stamp already
-    looks past) fails a perfectly valid reservation on the spot; one running
-    behind (negative) hands the poll a window the backend never granted.
-    _accept instead dates every acknowledgement from the monotonic send time
-    and grants at most _MAX_LEASE_RUNWAY_S past it, so that is the bound — the
-    same one whichever way the clock is wrong."""
-    client = Client(skew=skew)
-    async with AttemptLease(client, None, client.claim):
-        pass
-    assert client.budgets == [_MAX_LEASE_RUNWAY_S]
+    Asserted on elapsed time: a per-request timeout is not an end-to-end bound
+    (httpcore restarts the read deadline on every chunk), and the park this
+    interrupts happens between attempts, where no request timeout reaches."""
+    monkeypatch.setattr('task_worker_api.resource_execution._MAX_LEASE_RUNWAY_S', 0.2)
+    client = Client()
+
+    async def parked(claim):
+        await asyncio.sleep(5)
+        return client.response()
+
+    client.resource_status = parked
+    started = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        async with AttemptLease(client, None, client.claim):
+            pass
+    assert time.monotonic() - started < 1.0, "entry outlived the runway it could be granted"

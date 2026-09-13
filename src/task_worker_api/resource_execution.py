@@ -19,9 +19,8 @@ from .errors import ProtocolError
 log = logging.getLogger(__name__)
 
 # The most monotonic runway any single acknowledgement can grant, however long
-# a lease the backend names. _accept clamps to it and then rejects an
-# acknowledgement already older than the deadline it computes, so it is also
-# the longest a lease-bound poll can usefully run for (see __aenter__).
+# a lease the backend names. _accept clamps to it, so it is also the longest an
+# entry poll can usefully run for — past it no reply yields a usable lease.
 _MAX_LEASE_RUNWAY_S = 30
 
 
@@ -72,19 +71,15 @@ class AttemptLease:
         self._loop = asyncio.get_running_loop()
         self._owner = asyncio.current_task()
         sent = time.monotonic()
-        # Unbounded, one 429's Retry-After parks entry until the reservation
-        # the supervisor is still heartbeating has been reclaimed. Entry is the
-        # one lease-bound call with no acknowledged deadline to bound it by
-        # yet, and the claim's timestamps cannot supply one: subtracting the
-        # worker's wall clock from them turns a skewed clock into a lease this
-        # attempt was never granted (or rejects one it was). _accept's own cap
-        # gives the honest bound without a clock to trust — it dates every
-        # acknowledgement from `sent` and grants at most _MAX_LEASE_RUNWAY_S
-        # past it, so a reply that arrives later than that is rejected below
-        # whatever the backend says. Retrying past it cannot produce a usable
-        # lease, so that is exactly how long this poll may run.
-        state = self._accept(await self.client.resource_status(
-            self.claim, remaining_lease_s=_MAX_LEASE_RUNWAY_S), sent)
+        # Unbounded, one 429's Retry-After parks entry until the reservation has
+        # been reclaimed. Entry has no acknowledged deadline yet, and
+        # claim.lease_expires_at cannot supply one — subtracting local wall time
+        # from it reads worker clock error as lease time. _accept's own cap is
+        # the bound with no clock to trust: a reply later than that is rejected
+        # anyway. Retries stay on; unlike _renew there is no next pass to save
+        # time for, so giving up here is the outcome rather than a deferral.
+        state = self._accept(await asyncio.wait_for(
+            self.client.resource_status(self.claim), _MAX_LEASE_RUNWAY_S), sent)
         if state.state != "reserved":
             raise ProtocolError("previous execution requires supervisor reconciliation")
         threading.Thread(target=self._watch, name="attempt-lease", daemon=True).start()
@@ -116,14 +111,18 @@ class AttemptLease:
             await asyncio.sleep(min(5, remaining / 4))
             sent = time.monotonic()
             with self._lock:
-                # What this lease has left, on the monotonic clock _accept
-                # built it from — no wall clock involved. Retrying past it
-                # cannot renew it (see BackendClient.resource_heartbeat), and a
-                # renewal that gives up early is retried by the next pass of
-                # this loop, still inside the acknowledged window.
-                budget = self._deadline - sent
+                # Half of what the lease has left, off the monotonic deadline
+                # _accept built from the backend's own server_time deltas. Half,
+                # so one stalled shot cannot spend the whole lease: the rest is
+                # this loop's, to sleep its cadence and renew inside the
+                # acknowledged window. Elapsed, because the request's own
+                # timeout is not an end-to-end bound — httpcore restarts the
+                # read deadline on every chunk, so a dribbling peer outlives any
+                # finite value.
+                allowance = (self._deadline - sent) / 2
             try:
-                self._accept(await self.client.resource_heartbeat(self.claim, remaining_lease_s=budget), sent)
+                self._accept(await asyncio.wait_for(
+                    self.client.resource_heartbeat(self.claim, once=True), allowance), sent)
             except ProtocolError:
                 with self._lock:
                     self._expired.set()

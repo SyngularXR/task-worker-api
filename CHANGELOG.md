@@ -2,33 +2,38 @@
 
 ## 0.19.0.dev44
 
-- Bound v2 attempt-lease renewal to the lease's own remaining time.
-  `AttemptLease._renew` and the entry cancel-status poll went through the
-  retried `_resource_request` path, which passes `retry_after_max_s=None`, so a
-  single 429 carrying a large `Retry-After` (or a full backoff chain) parked
-  the renewal past the acknowledged deadline: the lease expired silently, the
-  owner task was cancelled mid-work and the `_watch` thread `os._exit(75)`-ed
-  the worker after the grace window. Both calls now take `remaining_lease_s`
-  (`resource_heartbeat`/`resource_status`), which caps the *elapsed* time of
-  the whole call — every attempt and every backoff sleep together. The retry
-  policy itself is untouched: attempts and the client-wide
-  `retry_sleep_budget_s` stay as configured, so a transient blip early in the
-  lease still rides out its normal backoff and only the lease ends the call.
-  The cap is a deadline on the call rather than a per-request `httpx.Timeout`
-  because a `Timeout` limits each connect/write/read operation separately — and
-  httpcore restarts the read deadline on every chunk of the body, so a backend
-  that keeps dribbling bytes outlives any finite value. A renewal that gives up
-  early is retried by the next pass of `_renew`, still inside the acknowledged
-  window.
+- Stop v2 attempt-lease renewal from outliving the lease it renews.
+  `AttemptLease._renew` heartbeats through the retried `_resource_request`
+  path, which passes `retry_after_max_s=None`, so a single 429 carrying a large
+  `Retry-After` (or a full backoff chain) parked the renewal past the
+  acknowledged deadline: the lease expired silently, the owner task was
+  cancelled mid-work and the `_watch` thread `os._exit(75)`-ed the worker once
+  the grace window closed. Renewal now uses the one-shot lifecycle request, as
+  `resource_progress` already does (`resource_heartbeat(..., once=True)`), and
+  `_renew`'s own cadence is the retry — a renewal rides out a blip by trying
+  *sooner*, not by sleeping longer. Capping the parked call instead would not
+  have fixed it: one request can spend the entire lease waiting and hand the
+  loop back no time to try again with. So the shot gets at most *half* the
+  remaining lease; the other half is the loop's, to sleep its cadence and
+  renew inside the window. The allowance is elapsed time (`asyncio.wait_for`),
+  not a per-request `httpx.Timeout`, because a `Timeout` limits each
+  connect/write/read operation separately and httpcore restarts the read
+  deadline on every chunk of the body — a peer that keeps dribbling bytes
+  outlives any finite value. The request's own deadline is left as the consumer
+  configured it.
 
-  Both allowances are read off the monotonic clock, never the worker's wall
-  clock: `_renew` uses the deadline `_accept` built from the backend's own
-  `server_time` deltas, and entry — which has no acknowledged deadline yet —
-  uses the `_MAX_LEASE_RUNWAY_S` cap `_accept` applies to every
-  acknowledgement, since a reply arriving later than that is rejected anyway.
-  Subtracting local wall time from `claim.lease_expires_at` instead would let a
-  worker clock an hour behind grant itself lease time the backend never issued,
-  and a clock an hour ahead reject a perfectly valid reservation.
+  The supervisor's reservation heartbeat (`resource_heartbeat()`, the default)
+  keeps its retries: it has no lease deadline of its own to honour, so riding
+  out a blip in place is exactly what it wants.
+- Bound the v2 attempt-lease entry poll, the other call a server-named retry
+  could park until the reservation had been reclaimed. Entry has no
+  acknowledged deadline yet and `claim.lease_expires_at` cannot supply one —
+  subtracting local wall time from it reads worker clock error as lease time,
+  so a clock an hour behind grants itself a window the backend never issued and
+  one an hour ahead rejects a valid reservation. It uses the
+  `_MAX_LEASE_RUNWAY_S` cap `_accept` already applies to every acknowledgement,
+  since a reply later than that is rejected anyway. Retries stay on there:
+  unlike `_renew` there is no next pass to save time for.
 - Run the v2 progress call on the configured `lifecycle_timeout_s` instead of a
   hardcoded 5s deadline, so a consumer that tuned that knob for its backend
   gets it on progress too. It stays one-shot.
