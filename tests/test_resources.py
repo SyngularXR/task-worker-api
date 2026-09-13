@@ -457,15 +457,18 @@ async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bounded", [False, True])
-async def test_v2_heartbeat_retries_are_bounded_by_the_remaining_lease(bounded, no_blocking_sleep):
+async def test_v2_heartbeat_retry_after_park_stops_at_the_remaining_lease():
     """Renewal is the one v2 caller whose retries have a hard deadline. The v2
     path passes ``retry_after_max_s=None``, so one 429 can name an hour-long
     sleep: unbounded, the renewal returns long after the lease it was renewing
     expired — by which time ``AttemptLease`` has cancelled the owner task
-    mid-work and hard-exited the worker. Given the lease's remaining time, the
-    call gives up instead of sleeping past it, and ``_renew`` tries again on
-    its own cadence."""
+    mid-work and hard-exited the worker. The lease's remaining time caps the
+    whole call, backoff included, and ``_renew`` tries again on its own
+    cadence.
+
+    Real sleeps, and asserted on elapsed time: a fake ``asyncio.sleep`` skips
+    the very park this bound exists to interrupt, so it could not tell a
+    bounded call from an unbounded one."""
     claim = _admitted_claim(uuid4())
     sent: list = []
 
@@ -475,19 +478,22 @@ async def test_v2_heartbeat_retries_are_bounded_by_the_remaining_lease(bounded, 
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
         backend = BackendClient("http://test", "test", client=client, lifecycle_timeout_s=15.0)
-        with pytest.raises(httpx.HTTPStatusError):
-            await backend.resource_heartbeat(claim, **({"remaining_lease_s": 30.0} if bounded else {}))
+        started = time.monotonic()
+        with pytest.raises(httpx.TimeoutException):
+            await backend.resource_heartbeat(claim, remaining_lease_s=0.3)
+        elapsed = time.monotonic() - started
 
-    if bounded:
-        assert len(sent) == 1 and no_blocking_sleep == []
-    else:
-        assert sum(no_blocking_sleep) > 3600, "the unbounded path is what parks the renewal"
+    assert len(sent) == 1 and elapsed < 1.0, f"parked {elapsed:.1f}s on a 0.3s lease"
 
 
 @pytest.mark.asyncio
-async def test_v2_heartbeat_still_rides_out_a_blip_inside_a_long_lease(no_blocking_sleep):
-    """The budget bounds retries, it doesn't disable them: a lease with room to
-    spare still spends attempts and backoff on a transient failure."""
+@pytest.mark.parametrize("remaining_lease_s", [30.0, 300.0])
+async def test_v2_heartbeat_still_rides_out_a_blip_inside_the_lease(remaining_lease_s, no_blocking_sleep):
+    """The deadline bounds retries, it doesn't ration them: the attempt budget
+    and the client-wide sleep budget stay exactly as configured, so the first
+    transient failure still retries with its normal backoff. Deriving a
+    per-call attempt count from the lease instead spent the whole 30s case on
+    reserving request time and left nothing to retry with."""
     claim = _admitted_claim(uuid4())
     sent: list = []
 
@@ -499,10 +505,10 @@ async def test_v2_heartbeat_still_rides_out_a_blip_inside_a_long_lease(no_blocki
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
         backend = BackendClient("http://test", "test", client=client, lifecycle_timeout_s=15.0)
-        state = await backend.resource_heartbeat(claim, remaining_lease_s=300.0)
+        state = await backend.resource_heartbeat(claim, remaining_lease_s=remaining_lease_s)
 
     assert len(sent) == 2 and state.attempt_id == claim.ownership.attempt_id
-    assert no_blocking_sleep and sum(no_blocking_sleep) <= 240, no_blocking_sleep
+    assert no_blocking_sleep, "the blip must still cost a backoff sleep"
 
 
 @pytest.mark.asyncio
@@ -529,11 +535,10 @@ async def test_v2_progress_uses_the_configured_lifecycle_timeout(lifecycle_timeo
 @pytest.mark.parametrize("call", ["resource_heartbeat", "resource_status"])
 @pytest.mark.parametrize("remaining_lease_s", [0.2, 0.0])
 async def test_v2_lease_bound_calls_stop_when_the_lease_runs_out(call, remaining_lease_s):
-    """Bounding sleeps and attempts left the call itself unbounded. Under one
-    ``lifecycle_timeout_s`` of lease the attempt budget floors at one, and that
-    single request is then what stalls past expiry — by which time
-    ``AttemptLease`` has cancelled the owner task mid-work and its watchdog has
-    hard-exited the worker: the precise stall the budget exists to prevent.
+    """A single request that stalls is the other way past the lease — by the
+    time it returns ``AttemptLease`` has cancelled the owner task mid-work and
+    its watchdog has hard-exited the worker: the precise stall the deadline
+    exists to prevent.
 
     Asserted on the clock, not on the configured deadline, because a
     per-request ``httpx.Timeout`` is not an end-to-end bound — it limits each
@@ -565,8 +570,8 @@ async def test_v2_lease_bound_call_keeps_inheriting_an_injected_clients_timeout(
     client's own timeout", which for an injected client is *that* client's
     timeout — not this SDK's ``timeout_s``, which never governed it. Bounding
     the lease on the call rather than overriding each request's ``timeout=``
-    keeps that opt-out intact; the lease deadline (300s here) stays inert above
-    the floor."""
+    keeps that opt-out intact; the lease deadline (300s here) never comes into
+    it."""
     claim = _admitted_claim(uuid4())
     deadlines: list = []
 

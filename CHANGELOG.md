@@ -8,15 +8,27 @@
   single 429 carrying a large `Retry-After` (or a full backoff chain) parked
   the renewal past the acknowledged deadline: the lease expired silently, the
   owner task was cancelled mid-work and the `_watch` thread `os._exit(75)`-ed
-  the worker after the grace window. Both calls now hand the client the time
-  the lease has left (`resource_heartbeat`/`resource_status` take
-  `remaining_lease_s`), which caps the attempts, the inter-attempt sleeps, and
-  the elapsed time of the call itself. That last one is a wall-clock deadline
-  rather than a per-request `httpx.Timeout`, because a `Timeout` limits each
-  connect/write/read operation separately — and httpcore restarts the read
-  deadline on every chunk of the body, so a backend that keeps dribbling bytes
-  outlives any finite value. A renewal that gives up early is retried by the
-  next pass of `_renew`, still inside the acknowledged window.
+  the worker after the grace window. Both calls now take `remaining_lease_s`
+  (`resource_heartbeat`/`resource_status`), which caps the *elapsed* time of
+  the whole call — every attempt and every backoff sleep together. The retry
+  policy itself is untouched: attempts and the client-wide
+  `retry_sleep_budget_s` stay as configured, so a transient blip early in the
+  lease still rides out its normal backoff and only the lease ends the call.
+  The cap is a deadline on the call rather than a per-request `httpx.Timeout`
+  because a `Timeout` limits each connect/write/read operation separately — and
+  httpcore restarts the read deadline on every chunk of the body, so a backend
+  that keeps dribbling bytes outlives any finite value. A renewal that gives up
+  early is retried by the next pass of `_renew`, still inside the acknowledged
+  window.
+
+  Both allowances are read off the monotonic clock, never the worker's wall
+  clock: `_renew` uses the deadline `_accept` built from the backend's own
+  `server_time` deltas, and entry — which has no acknowledged deadline yet —
+  uses the `_MAX_LEASE_RUNWAY_S` cap `_accept` applies to every
+  acknowledgement, since a reply arriving later than that is rejected anyway.
+  Subtracting local wall time from `claim.lease_expires_at` instead would let a
+  worker clock an hour behind grant itself lease time the backend never issued,
+  and a clock an hour ahead reject a perfectly valid reservation.
 - Run the v2 progress call on the configured `lifecycle_timeout_s` instead of a
   hardcoded 5s deadline, so a consumer that tuned that knob for its backend
   gets it on progress too. It stays one-shot.

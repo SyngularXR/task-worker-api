@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime, timezone
 import logging
 import math
 import os
@@ -18,6 +17,12 @@ import time
 from .errors import ProtocolError
 
 log = logging.getLogger(__name__)
+
+# The most monotonic runway any single acknowledgement can grant, however long
+# a lease the backend names. _accept clamps to it and then rejects an
+# acknowledgement already older than the deadline it computes, so it is also
+# the longest a lease-bound poll can usefully run for (see __aenter__).
+_MAX_LEASE_RUNWAY_S = 30
 
 
 class AttemptLease:
@@ -43,7 +48,7 @@ class AttemptLease:
             raise ProtocolError("attempt is no longer executable")
         # Request-send time subtracts all transport latency and avoids trusting
         # the worker wall clock. A delayed response cannot extend an expired lease.
-        deadline = sent + min(30, (state.lease_expires_at - state.server_time).total_seconds())
+        deadline = sent + min(_MAX_LEASE_RUNWAY_S, (state.lease_expires_at - state.server_time).total_seconds())
         phase = state.execution_deadline or self.claim.staging_deadline
         with self._lock:
             if self._expired.is_set() or (self._deadline and time.monotonic() >= self._deadline):
@@ -67,16 +72,19 @@ class AttemptLease:
         self._loop = asyncio.get_running_loop()
         self._owner = asyncio.current_task()
         sent = time.monotonic()
-        # Bounds this call three ways: its attempts, the sleeps between them,
-        # and its own elapsed time. The acknowledgement is still validated
-        # against server-clock deltas below — so the worker clock this is read
-        # from can cost the attempt a retry it could have afforded, but can
-        # never buy the lease time it has not been granted.
         # Unbounded, one 429's Retry-After parks entry until the reservation
-        # the supervisor is still heartbeating has been reclaimed.
-        granted = min(self.claim.lease_expires_at, self.claim.staging_deadline)
+        # the supervisor is still heartbeating has been reclaimed. Entry is the
+        # one lease-bound call with no acknowledged deadline to bound it by
+        # yet, and the claim's timestamps cannot supply one: subtracting the
+        # worker's wall clock from them turns a skewed clock into a lease this
+        # attempt was never granted (or rejects one it was). _accept's own cap
+        # gives the honest bound without a clock to trust — it dates every
+        # acknowledgement from `sent` and grants at most _MAX_LEASE_RUNWAY_S
+        # past it, so a reply that arrives later than that is rejected below
+        # whatever the backend says. Retrying past it cannot produce a usable
+        # lease, so that is exactly how long this poll may run.
         state = self._accept(await self.client.resource_status(
-            self.claim, remaining_lease_s=(granted - datetime.now(timezone.utc)).total_seconds()), sent)
+            self.claim, remaining_lease_s=_MAX_LEASE_RUNWAY_S), sent)
         if state.state != "reserved":
             raise ProtocolError("previous execution requires supervisor reconciliation")
         threading.Thread(target=self._watch, name="attempt-lease", daemon=True).start()
@@ -108,10 +116,9 @@ class AttemptLease:
             await asyncio.sleep(min(5, remaining / 4))
             sent = time.monotonic()
             with self._lock:
-                # Retrying past the deadline cannot renew it: a renewal parked
-                # in backoff (or on one 429's Retry-After) returns to an
-                # expired lease, a cancelled owner task and a hard exit. Bound
-                # the client's retries by the time this lease has left; a
+                # What this lease has left, on the monotonic clock _accept
+                # built it from — no wall clock involved. Retrying past it
+                # cannot renew it (see BackendClient.resource_heartbeat), and a
                 # renewal that gives up early is retried by the next pass of
                 # this loop, still inside the acknowledged window.
                 budget = self._deadline - sent

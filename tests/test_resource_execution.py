@@ -8,16 +8,19 @@ from uuid import uuid4
 import pytest
 
 from task_worker_api.errors import ProtocolError
-from task_worker_api.resource_execution import AttemptLease
+from task_worker_api.resource_execution import AttemptLease, _MAX_LEASE_RUNWAY_S
 from task_worker_api.resource_protocol import AttemptState
 
 
 class Client:
-    def __init__(self, lease_seconds=30):
+    def __init__(self, lease_seconds=30, skew=timedelta(0)):
         now = datetime.now(timezone.utc)
+        # ``skew`` ages the claim's own lease stamp the way a worker clock out
+        # of step with the backend's would read it. Nothing in AttemptLease may
+        # subtract local wall time from it, so nothing here may depend on it.
         self.claim = SimpleNamespace(task_id=1, ownership=SimpleNamespace(attempt_id=uuid4()),
                                      staging_deadline=now + timedelta(seconds=60),
-                                     lease_expires_at=now + timedelta(seconds=45))
+                                     lease_expires_at=now + timedelta(seconds=45) - skew)
         self.seconds = lease_seconds
         self.state = "reserved"
         self.budgets = []
@@ -190,10 +193,20 @@ async def test_renewal_bounds_client_retries_by_the_remaining_lease(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_entry_bounds_client_retries_by_the_reserved_window():
+@pytest.mark.parametrize("skew", [timedelta(0), timedelta(hours=1), timedelta(hours=-1)])
+async def test_entry_bounds_its_poll_without_trusting_the_worker_clock(skew):
     """Entry is the other lease-bound poll: parked on a server-named retry it
-    returns to a reservation the backend has already reclaimed."""
-    client = Client()
+    returns to a reservation the backend has already reclaimed.
+
+    Its allowance must not come from ``claim.lease_expires_at`` minus local
+    wall time, because that subtraction reads the worker's clock error as
+    lease time. A clock running ahead (``skew`` positive, the stamp already
+    looks past) fails a perfectly valid reservation on the spot; one running
+    behind (negative) hands the poll a window the backend never granted.
+    _accept instead dates every acknowledgement from the monotonic send time
+    and grants at most _MAX_LEASE_RUNWAY_S past it, so that is the bound — the
+    same one whichever way the clock is wrong."""
+    client = Client(skew=skew)
     async with AttemptLease(client, None, client.claim):
         pass
-    assert client.budgets and 0 < client.budgets[0] <= 45
+    assert client.budgets == [_MAX_LEASE_RUNWAY_S]
