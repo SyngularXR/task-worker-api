@@ -14,10 +14,13 @@ from task_worker_api.resource_protocol import AttemptState
 
 class Client:
     def __init__(self, lease_seconds=30):
+        now = datetime.now(timezone.utc)
         self.claim = SimpleNamespace(task_id=1, ownership=SimpleNamespace(attempt_id=uuid4()),
-                                     staging_deadline=datetime.now(timezone.utc) + timedelta(seconds=60))
+                                     staging_deadline=now + timedelta(seconds=60),
+                                     lease_expires_at=now + timedelta(seconds=45))
         self.seconds = lease_seconds
         self.state = "reserved"
+        self.budgets = []
 
     def response(self):
         now = datetime.now(timezone.utc)
@@ -26,7 +29,8 @@ class Client:
             lease_expires_at=now + timedelta(seconds=self.seconds), progress={},
             execution_deadline=now + timedelta(seconds=10) if self.state == "running" else None)
 
-    async def resource_status(self, claim):
+    async def resource_status(self, claim, *, remaining_lease_s=None):
+        self.budgets.append(remaining_lease_s)
         return self.response()
 
     async def resource_operation(self, journal, kind, payload, **kwargs):
@@ -139,7 +143,7 @@ async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
     renewed = asyncio.Event()
     exited = threading.Event()
 
-    async def heartbeat(claim):
+    async def heartbeat(claim, *, remaining_lease_s=None):
         renewed.set()
         if revoked:
             return client.response().model_copy(update={"cancelled": True})
@@ -156,3 +160,40 @@ async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 7)
     assert renewed.is_set() and not exited.is_set()
+
+
+@pytest.mark.asyncio
+async def test_renewal_bounds_client_retries_by_the_remaining_lease(monkeypatch):
+    """A renewal that outlives the lease it renews is worse than no renewal:
+    the client's v2 path never shortens a 429's Retry-After, so an unbounded
+    heartbeat returns to an expired lease, a cancelled owner task and a hard
+    exit. The lease hands the client the time it actually has left."""
+    monkeypatch.setattr('task_worker_api.resource_execution.time.monotonic', lambda: 100.0)
+    client = Client()
+    lease = AttemptLease(client, None, client.claim)
+    lease._deadline = 108.0
+    budgets = []
+
+    async def heartbeat(claim, *, remaining_lease_s=None):
+        budgets.append(remaining_lease_s)
+        raise asyncio.CancelledError
+
+    client.resource_heartbeat = heartbeat
+
+    async def sleep(delay):
+        pass
+
+    monkeypatch.setattr('task_worker_api.resource_execution.asyncio.sleep', sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await lease._renew()
+    assert budgets == [8.0]
+
+
+@pytest.mark.asyncio
+async def test_entry_bounds_client_retries_by_the_reserved_window():
+    """Entry is the other lease-bound poll: parked on a server-named retry it
+    returns to a reservation the backend has already reclaimed."""
+    client = Client()
+    async with AttemptLease(client, None, client.claim):
+        pass
+    assert client.budgets and 0 < client.budgets[0] <= 45

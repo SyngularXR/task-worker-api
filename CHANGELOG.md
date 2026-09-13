@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.19.0.dev44
+
+- Bound v2 attempt-lease renewal to the lease's own remaining time.
+  `AttemptLease._renew` and the entry cancel-status poll went through the
+  retried `_resource_request` path, which passes `retry_after_max_s=None`, so a
+  single 429 carrying a large `Retry-After` (or a full backoff chain) parked
+  the renewal past the acknowledged deadline: the lease expired silently, the
+  owner task was cancelled mid-work and the `_watch` thread `os._exit(75)`-ed
+  the worker after the grace window. Both calls now hand the client the time
+  the lease has left (`resource_heartbeat`/`resource_status` take
+  `remaining_lease_s`), which caps the attempts and the inter-attempt sleeps;
+  a renewal that gives up early is retried by the next pass of `_renew`, still
+  inside the acknowledged window.
+- Run the v2 progress call on the configured `lifecycle_timeout_s` instead of a
+  hardcoded 5s deadline, so a consumer that tuned that knob for its backend
+  gets it on progress too. It stays one-shot.
+
 ## 0.19.0.dev43
 
 - Give the v2 terminal reports (`complete`/`fail`) the same retry hardness v1

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import datetime, timezone
 import logging
 import math
 import os
@@ -66,7 +67,16 @@ class AttemptLease:
         self._loop = asyncio.get_running_loop()
         self._owner = asyncio.current_task()
         sent = time.monotonic()
-        state = self._accept(await self.client.resource_status(self.claim), sent)
+        # A retry budget, not a deadline: it bounds only how long the client
+        # may sleep between retries of this call, and the acknowledgement is
+        # still validated against server-clock deltas below — so the worker
+        # clock this is read from can cost the attempt a retry it could have
+        # afforded, but can never buy the lease time it has not been granted.
+        # Unbounded, one 429's Retry-After parks entry until the reservation
+        # the supervisor is still heartbeating has been reclaimed.
+        granted = min(self.claim.lease_expires_at, self.claim.staging_deadline)
+        state = self._accept(await self.client.resource_status(
+            self.claim, remaining_lease_s=(granted - datetime.now(timezone.utc)).total_seconds()), sent)
         if state.state != "reserved":
             raise ProtocolError("previous execution requires supervisor reconciliation")
         threading.Thread(target=self._watch, name="attempt-lease", daemon=True).start()
@@ -97,8 +107,16 @@ class AttemptLease:
                 return
             await asyncio.sleep(min(5, remaining / 4))
             sent = time.monotonic()
+            with self._lock:
+                # Retrying past the deadline cannot renew it: a renewal parked
+                # in backoff (or on one 429's Retry-After) returns to an
+                # expired lease, a cancelled owner task and a hard exit. Bound
+                # the client's retries by the time this lease has left; a
+                # renewal that gives up early is retried by the next pass of
+                # this loop, still inside the acknowledged window.
+                budget = self._deadline - sent
             try:
-                self._accept(await self.client.resource_heartbeat(self.claim), sent)
+                self._accept(await self.client.resource_heartbeat(self.claim, remaining_lease_s=budget), sent)
             except ProtocolError:
                 with self._lock:
                     self._expired.set()
