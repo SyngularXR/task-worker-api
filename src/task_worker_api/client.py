@@ -1166,9 +1166,9 @@ class BackendClient:
         v2 path passes ``retry_after_max_s=None``, for however long a 429's
         ``Retry-After`` names — while the work being described sits idle.
         Dropping one display update is cheap: the lease's own background
-        ``_renew`` heartbeat is what refreshes the deadline, and it is one-shot
-        for the same reason — it retries on its own cadence instead (see
-        ``once`` on :meth:`resource_heartbeat`).
+        ``_renew`` heartbeat is what refreshes the deadline, and it keeps its
+        retries — bounded, there, by the lease they are renewing (see
+        ``AttemptLease._renew``).
 
         It runs on the configured ``lifecycle_timeout_s`` deadline, like every
         other v2 lifecycle call; it used to hardcode 5s, which silently ignored
@@ -1195,30 +1195,11 @@ class BackendClient:
                                                 params=params, headers={"X-Attempt-Token": claim.ownership.token})
         return AttemptState.model_validate(response.json())
 
-    async def resource_heartbeat(self, claim, *, once=False):
-        """Heartbeat; ``once`` drops the retry loop for a lease-bound caller.
-
-        Retried, the default, is what the supervisor's reservation heartbeat
-        wants: no deadline of its own to honour, so riding out a blip in place
-        costs nothing.
-
-        ``AttemptLease._renew`` passes ``once=True``, for the same reason
-        :meth:`resource_progress` is one-shot. The v2 path never shortens server
-        guidance (``retry_after_max_s=None``), so one 429 naming
-        ``Retry-After: 3600`` parks the retry loop far past the lease it was
-        renewing — and by the time it returns the owner task has been cancelled
-        mid-work and the watchdog has hard-exited the worker. Capping that
-        parked call is no fix either: one request that spends the whole lease
-        waiting loses it just as surely. A renewal rides out a blip by *retrying
-        sooner*, which is what ``_renew``'s cadence already does, so a shot's
-        job is to fail fast and hand the loop back the lease time it did not
-        spend.
-        """
+    async def resource_heartbeat(self, claim):
         from .resource_protocol import AttemptState
 
-        send = self._resource_request_once if once else self._resource_request
-        response = await send("POST", "/workers/heartbeat", params={"task_id": claim.task_id},
-                              json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json")})
+        response = await self._resource_request("POST", "/workers/heartbeat", params={"task_id": claim.task_id},
+                                                json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json")})
         return AttemptState.model_validate(response.json())
 
     async def resource_ready(self, journal, worker_instance_id):

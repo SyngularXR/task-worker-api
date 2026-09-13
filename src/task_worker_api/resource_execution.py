@@ -111,18 +111,25 @@ class AttemptLease:
             await asyncio.sleep(min(5, remaining / 4))
             sent = time.monotonic()
             with self._lock:
+                # The renewal keeps the client's retry policy — riding out a
+                # blip in place is what a heartbeat wants — but not for longer
+                # than the lease it is renewing: unbounded, one 429's
+                # Retry-After parks it for the hour it names (the v2 path never
+                # shortens server guidance) and it returns to an expired lease,
+                # an owner task cancelled mid-work and a hard-exited worker.
+                #
                 # Half of what the lease has left, off the monotonic deadline
                 # _accept built from the backend's own server_time deltas. Half,
-                # so one stalled shot cannot spend the whole lease: the rest is
-                # this loop's, to sleep its cadence and renew inside the
-                # acknowledged window. Elapsed, because the request's own
-                # timeout is not an end-to-end bound — httpcore restarts the
-                # read deadline on every chunk, so a dribbling peer outlives any
-                # finite value.
+                # so one stalled attempt cannot spend the whole lease: the rest
+                # is this loop's, to sleep its cadence and renew inside the
+                # acknowledged window. Elapsed, because a per-request timeout is
+                # not an end-to-end bound — it neither spans the retry loop's
+                # inter-attempt sleeps nor survives a dribbling peer, since
+                # httpcore restarts the read deadline on every chunk.
                 allowance = (self._deadline - sent) / 2
             try:
                 self._accept(await asyncio.wait_for(
-                    self.client.resource_heartbeat(self.claim, once=True), allowance), sent)
+                    self.client.resource_heartbeat(self.claim), allowance), sent)
             except ProtocolError:
                 with self._lock:
                     self._expired.set()

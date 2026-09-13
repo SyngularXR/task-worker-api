@@ -436,10 +436,9 @@ async def test_v2_progress_returns_the_attempt_state_it_was_given():
 
 @pytest.mark.asyncio
 async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sleep):
-    """A heartbeat still retries by default — that is the supervisor's
-    reservation heartbeat, which has no deadline of its own to honour, so
-    riding out a blip in place is exactly what it wants. Only the lease-bound
-    renewal opts out, via ``once``."""
+    """The one-shot carve-out is progress only — heartbeat renews the lease from
+    a background task, where riding out a blip is worth the wait (bounded, there,
+    by ``AttemptLease._renew``'s half-remaining-lease allowance)."""
     claim = _admitted_claim(uuid4())
     sent: list = []
 
@@ -455,34 +454,6 @@ async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sl
 
     assert len(sent) == 2 and state.attempt_id == claim.ownership.attempt_id
     assert no_blocking_sleep, "heartbeat keeps its backoff"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["retry_after", "transport"])
-async def test_v2_heartbeat_once_stays_one_shot_under_a_degraded_backend(failure, no_blocking_sleep):
-    """``once`` is what keeps a lease renewal from outliving its own lease.
-
-    Retried, the v2 path passes ``retry_after_max_s=None``, so this 429 parks
-    the call for the hour it names — and ``AttemptLease._renew`` returns to an
-    expired lease, a cancelled owner task and a hard-exited worker. One attempt,
-    no backoff sleep, error straight back to ``_renew``, which retries on its
-    own cadence while the lease still has time to spend."""
-    claim = _admitted_claim(uuid4())
-    sent: list = []
-
-    def handle(request):
-        sent.append(request.content)
-        if failure == "transport":
-            raise httpx.ConnectError("blip")
-        return httpx.Response(429, headers={"Retry-After": "3600"})
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
-        backend = BackendClient("http://test", "test", client=client)
-        with pytest.raises((httpx.TransportError, httpx.HTTPStatusError)):
-            await backend.resource_heartbeat(claim, once=True)
-
-    assert len(sent) == 1, "a renewal must not spend the retry budget inside the lease"
-    assert no_blocking_sleep == [], "a renewal must not sleep out a server-named park"
 
 
 @pytest.mark.asyncio
@@ -503,26 +474,3 @@ async def test_v2_progress_uses_the_configured_lifecycle_timeout(lifecycle_timeo
         await backend.resource_progress(claim, {"stage": "compute"})
 
     assert deadlines == [lifecycle_timeout_s]
-
-
-@pytest.mark.asyncio
-async def test_v2_heartbeat_once_keeps_the_configured_request_deadline():
-    """Dropping the retry loop must not also redefine the request's deadline.
-    ``lifecycle_timeout_s=None`` is documented as "falls back to the client's
-    own timeout", which for an injected client is *that* client's timeout (90s
-    here) and never this SDK's ``timeout_s``. ``_renew`` bounds its own elapsed
-    allowance on the lease clock; the request keeps what the consumer set."""
-    claim = _admitted_claim(uuid4())
-    deadlines: list = []
-
-    def handle(request):
-        deadlines.append(request.extensions["timeout"]["read"])
-        return httpx.Response(200, json=_running_state(claim))
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handle),
-                                 base_url="http://test", timeout=90.0) as client:
-        backend = BackendClient("http://test", "test", client=client,
-                                timeout_s=30.0, lifecycle_timeout_s=None)
-        await backend.resource_heartbeat(claim, once=True)
-
-    assert deadlines == [90.0], "an injected client's own timeout must survive"

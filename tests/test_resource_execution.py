@@ -139,7 +139,7 @@ async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
     renewed = asyncio.Event()
     exited = threading.Event()
 
-    async def heartbeat(claim, *, once=False):
+    async def heartbeat(claim):
         renewed.set()
         if revoked:
             return client.response().model_copy(update={"cancelled": True})
@@ -159,34 +159,31 @@ async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("degraded", ["fails", "stalls"])
-async def test_renewal_keeps_heartbeating_until_one_lands_inside_the_lease(degraded):
-    """A renewal must ride out a degraded backend by retrying *sooner*, never by
-    waiting longer than the lease it is renewing.
+@pytest.mark.parametrize("degraded", ["parks", "fails"])
+async def test_renewal_cannot_spend_the_whole_lease_on_one_retried_heartbeat(degraded):
+    """A renewal keeps the client's retry policy, but never for longer than the
+    lease it is renewing.
 
-    Sent down the client's retry loop, one 429's ``Retry-After`` parks the
-    heartbeat for the hour it names — the v2 path never shortens server
-    guidance — so the renewal comes back to an expired lease: ``_watch`` has
-    cancelled the owner task mid-work and hard-exited the worker. Bounding that
-    parked call is no fix either, which is why the allowance here is only *half*
-    the remaining lease: spend the whole lease on one request that never answers
-    (``stalls``) and the loop is handed back no time to try again with, so the
-    lease dies just the same.
+    Unbounded, one 429's ``Retry-After`` parks that retry loop for the hour it
+    names — the v2 path never shortens server guidance — so the renewal comes
+    back to an expired lease: ``_watch`` has cancelled the owner task mid-work
+    and hard-exited the worker. Bounding it at the *whole* remaining lease is no
+    fix either, which is why the allowance is only half: spend it all on one
+    attempt that never answers (``parks``) and the loop is handed back no time
+    to try again with, so the lease dies just the same.
 
-    Asserted on what actually matters, and what a bounded single call cannot
-    show: whichever way the first shot fails, a later one lands *before* expiry
-    and the owner runs on untouched past the lease it started with."""
+    Asserted on what a single bounded call cannot show: whichever way the first
+    renewal fails, a later one lands *before* expiry and the owner runs on
+    untouched past the lease it started with."""
     client = Client(lease_seconds=3)
     exited = threading.Event()
     shots = []
 
-    async def heartbeat(claim, *, once=False):
-        shots.append(once)
-        if not once:
-            await asyncio.sleep(3600)  # a retried shot parks here, as the client's would
+    async def heartbeat(claim):
+        shots.append(time.monotonic())
         if len(shots) == 1:
-            if degraded == "stalls":
-                await asyncio.sleep(3600)  # ...and here if the request never answers
+            if degraded == "parks":
+                await asyncio.sleep(3600)  # the client's retry loop, parked on Retry-After
             raise RuntimeError("degraded backend")
         return client.response()
 
@@ -202,7 +199,6 @@ async def test_renewal_keeps_heartbeating_until_one_lands_inside_the_lease(degra
     assert task in done and not task.cancelled(), \
         "the watchdog cancelled the owner mid-work: no renewal landed inside the 3s lease"
     task.result()
-    assert shots[:2] == [True, True], "a lease renewal must not be retried in place"
     assert len(shots) >= 2 and not exited.is_set()
 
 
