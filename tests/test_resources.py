@@ -8,7 +8,7 @@ import httpx
 from pydantic import ValidationError
 
 from task_worker_api.claim_journal import ClaimJournal
-from task_worker_api.client import BackendClient, _MAX_FAIL_ERROR_BYTES
+from task_worker_api.client import BackendClient, _MAX_FAIL_ERROR_BYTES, _TERMINAL_MIN_ATTEMPTS
 from task_worker_api.resources import AdmissionError
 from task_worker_api.resources import (AttemptOwnership, Capacity, ClaimRequest, ClaimResult,
                                         ResourceProfile, HostSnapshot)
@@ -239,6 +239,85 @@ async def test_v2_fail_replays_the_capped_body_after_a_lost_response(tmp_path):
     assert len(sent) == 1 and len(sent[0]) <= _MAX_FAIL_ERROR_BYTES + 4096
     assert "bytes truncated]..." in json.loads(sent[0])["error"]
     assert journal.unresolved_operations() == []
+
+
+# ---------------------------------------------------------------------------
+# v2 terminal reports — retry hardness parity with v1 complete/fail
+# ---------------------------------------------------------------------------
+
+
+def _flaky_backend(claim, statuses, calls, **options):
+    """Backend whose lifecycle route returns ``statuses`` in order, then 200.
+
+    ``retry_backoff_s=0`` keeps the retry loop's sleeps instant; the delay
+    schedule itself is covered in ``test_client_retry``.
+    """
+    def handle(request):
+        calls.append(request)
+        status = statuses[len(calls) - 1] if len(calls) <= len(statuses) else 200
+        if status != 200:
+            return httpx.Response(status)
+        now = datetime.now(timezone.utc)
+        return httpx.Response(200, json={
+            "task_id": claim.task_id, "attempt_id": str(claim.ownership.attempt_id),
+            "state": "released", "task_status": 2, "cancelled": False,
+            "server_time": now.isoformat(),
+            "lease_expires_at": (now + timedelta(seconds=60)).isoformat(),
+            "execution_deadline": None, "progress": {},
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test")
+    return BackendClient("http://test", "test", client=client, retry_backoff_s=0, **options), client
+
+
+def _terminal_payload(kind):
+    return {"result": {}} if kind == "complete" else {"error": "boom", "failure_kind": "error"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["complete", "fail"])
+async def test_v2_terminal_report_retries_a_500_instead_of_orphaning_the_attempt(tmp_path, kind):
+    """A 500 mid-write (the backend's own dependency dying) must not leave the
+    durable operation unresolved — that wedges the worker behind
+    previous_claim_unresolved until a supervisor restart replays it."""
+    journal, claim = _admitted_journal(tmp_path, uuid4())
+    calls: list = []
+    backend, transport = _flaky_backend(claim, [500], calls)
+    state = await backend.resource_operation(journal, kind, _terminal_payload(kind))
+    await transport.aclose()
+
+    assert len(calls) == 2 and state.attempt_id == claim.ownership.attempt_id
+    assert journal.unresolved_operations() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["complete", "fail"])
+async def test_v2_terminal_report_holds_the_six_attempt_floor(tmp_path, kind):
+    """The floor rides out a backend restart that outlasts the default budget,
+    even when the worker is configured with fewer attempts."""
+    journal, claim = _admitted_journal(tmp_path, uuid4())
+    calls: list = []
+    backend, transport = _flaky_backend(claim, [502] * _TERMINAL_MIN_ATTEMPTS, calls, max_retries=2)
+    with pytest.raises(httpx.HTTPStatusError):
+        await backend.resource_operation(journal, kind, _terminal_payload(kind))
+    await transport.aclose()
+
+    assert len(calls) == _TERMINAL_MIN_ATTEMPTS
+    assert [k for k, _ in journal.unresolved_operations()] == [kind]
+
+
+@pytest.mark.asyncio
+async def test_v2_non_terminal_operation_keeps_the_default_retry_contract(tmp_path):
+    """Only the idempotent journal-replayed terminal kinds widen the set: a 500
+    on ``start`` still surfaces immediately, without consuming retry budget."""
+    journal, claim = _admitted_journal(tmp_path, uuid4())
+    calls: list = []
+    backend, transport = _flaky_backend(claim, [500], calls, max_retries=2)
+    with pytest.raises(httpx.HTTPStatusError):
+        await backend.resource_operation(journal, "start", {})
+    await transport.aclose()
+
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
