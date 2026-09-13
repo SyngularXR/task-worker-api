@@ -1066,22 +1066,44 @@ class BackendClient:
         return response
 
     async def _resource_request(self, method, path, *, extra_transient=frozenset(), attempts=None,
-                                sleep_budget_s=None, **kwargs):
+                                sleep_budget_s=None, deadline_s=None, **kwargs):
         """Retried v2 lifecycle request.
 
         ``extra_transient`` / ``attempts`` / ``sleep_budget_s`` are forwarded
         to :meth:`_retry`, as on v1's :meth:`_request` — terminal reports use
         them to widen the transient set and raise the attempt budget, lease
-        renewal to bound both by the time the lease has left. Anything else
-        (``timeout`` included) rides ``**kwargs`` down to every attempt's
-        :meth:`_resource_request_once`.
+        renewal to bound both by the time the lease has left.
+
+        ``deadline_s`` bounds this call's *elapsed* time — every attempt and
+        every backoff sleep together — and surfaces as an
+        :class:`httpx.ReadTimeout`, the same failure a per-request deadline
+        already hands the caller. An ``httpx.Timeout`` cannot express this:
+        it limits each connect/write/read operation *separately*, and
+        httpcore restarts the read deadline on every chunk of the body — so a
+        peer that keeps dribbling bytes outlives any finite value. It is the
+        only bound a lease-bound caller can rely on to stop at the lease; see
+        :meth:`_lease_retry_bounds`.
         """
-        return await self._retry(
+        import asyncio
+
+        call = self._retry(
             lambda: self._resource_request_once(method, path, **kwargs),
             method=method, path=path, retry_after_max_s=None,
             extra_transient=extra_transient, attempts=attempts,
             sleep_budget_s=sleep_budget_s,
         )
+        if deadline_s is None:
+            return await call
+        # ponytail: the timer is an event-loop timer, so a handler that blocks
+        # this loop delays it by however long it blocks — the same ceiling
+        # _retry's sleep budget documents, and unfixable from inside the
+        # blocked loop. Upgrade path is identical: keep handler work off it.
+        try:
+            return await asyncio.wait_for(call, deadline_s)
+        except asyncio.TimeoutError as exc:
+            raise httpx.ReadTimeout(
+                f"{method} {path} gave up at its {deadline_s:.1f}s deadline"
+            ) from exc
 
     def _lease_retry_bounds(self, remaining_lease_s):
         """Retry bounds for a call that is worthless once the lease expires.
@@ -1099,14 +1121,23 @@ class BackendClient:
           *not* charged to the sleep budget, so that much per attempt is
           reserved out of the remaining time first;
         - whatever is left over is what this call may sleep between attempts;
-        - and the request itself runs on the shorter of ``lifecycle_timeout_s``
-          and the remaining time. Bounding only the sleeps left the last hole:
-          with less than one ``lifecycle_timeout_s`` left the attempt budget
-          floors at one, and that single request — still on the full 15s
-          deadline — is then itself what stalls past expiry, cancelling the
-          owner task and tripping the watchdog. Above that floor the cap is
-          inert, because the attempt arithmetic has already reserved a whole
-          ``lifecycle_timeout_s`` per attempt out of the remaining time.
+        - and the elapsed time of the whole call — attempts and sleeps
+          together — is capped at what the lease has left. Bounding only the
+          sleeps left the last hole: with less than one ``lifecycle_timeout_s``
+          left the attempt budget floors at one, and that single request is
+          then itself what stalls past expiry, cancelling the owner task and
+          tripping the watchdog. Capping the *request* instead does not close
+          it — ``httpx.Timeout`` limits each connect/write/read operation
+          separately and httpcore restarts the read deadline on every chunk of
+          the body, so a backend that keeps dribbling bytes runs past the lease
+          under any finite value — which is why this is a wall-clock deadline
+          on the call (see :meth:`_resource_request`) and not a ``timeout=``
+          override. Leaving the request's own deadline alone also keeps
+          ``lifecycle_timeout_s=None`` inheriting the client's timeout, as
+          documented, rather than substituting ``timeout_s`` for it. Above the
+          floor the deadline is inert, because the attempt arithmetic has
+          already reserved a whole ``lifecycle_timeout_s`` per attempt out of
+          the remaining time.
 
         All three floor at one attempt / no sleeping / no waiting: a renewal
         with no time left still gets its one shot — it just can't wait around,
@@ -1123,7 +1154,7 @@ class BackendClient:
         return {
             "attempts": attempts,
             "sleep_budget_s": max(0.0, remaining_lease_s - attempts * self._lifecycle_timeout_s),
-            "timeout": min(self._lifecycle_timeout_s, max(0.0, remaining_lease_s)),
+            "deadline_s": max(0.0, remaining_lease_s),
         }
 
     async def resource_operation(self, journal, kind, payload, *, host_report=None, cleanup=None):

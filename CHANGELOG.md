@@ -10,9 +10,13 @@
   owner task was cancelled mid-work and the `_watch` thread `os._exit(75)`-ed
   the worker after the grace window. Both calls now hand the client the time
   the lease has left (`resource_heartbeat`/`resource_status` take
-  `remaining_lease_s`), which caps the attempts and the inter-attempt sleeps;
-  a renewal that gives up early is retried by the next pass of `_renew`, still
-  inside the acknowledged window.
+  `remaining_lease_s`), which caps the attempts, the inter-attempt sleeps, and
+  the elapsed time of the call itself. That last one is a wall-clock deadline
+  rather than a per-request `httpx.Timeout`, because a `Timeout` limits each
+  connect/write/read operation separately — and httpcore restarts the read
+  deadline on every chunk of the body, so a backend that keeps dribbling bytes
+  outlives any finite value. A renewal that gives up early is retried by the
+  next pass of `_renew`, still inside the acknowledged window.
 - Run the v2 progress call on the configured `lifecycle_timeout_s` instead of a
   hardcoded 5s deadline, so a consumer that tuned that knob for its backend
   gets it on progress too. It stays one-shot.

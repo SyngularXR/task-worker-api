@@ -2,6 +2,7 @@
 import pytest
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import httpx
@@ -526,16 +527,46 @@ async def test_v2_progress_uses_the_configured_lifecycle_timeout(lifecycle_timeo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("call", ["resource_heartbeat", "resource_status"])
-@pytest.mark.parametrize("remaining_lease_s, deadline", [(5.0, 5.0), (300.0, 15.0), (0.0, 0.0)])
-async def test_v2_lease_bound_calls_cap_the_request_deadline_at_the_remaining_lease(
-        call, remaining_lease_s, deadline):
-    """Bounding sleeps and attempts left the request itself unbounded. With 5s
-    of lease and ``lifecycle_timeout_s=15``, the attempt budget floors at one
-    and that one request was still sent on a 15s deadline — so a stalled
-    heartbeat or cancel-status poll ran 10s past expiry, by which time
+@pytest.mark.parametrize("remaining_lease_s", [0.2, 0.0])
+async def test_v2_lease_bound_calls_stop_when_the_lease_runs_out(call, remaining_lease_s):
+    """Bounding sleeps and attempts left the call itself unbounded. Under one
+    ``lifecycle_timeout_s`` of lease the attempt budget floors at one, and that
+    single request is then what stalls past expiry — by which time
     ``AttemptLease`` has cancelled the owner task mid-work and its watchdog has
-    hard-exited the worker: the precise stall the budget is meant to prevent.
-    Above the floor the cap is inert (300s of lease keeps the full 15s)."""
+    hard-exited the worker: the precise stall the budget exists to prevent.
+
+    Asserted on the clock, not on the configured deadline, because a
+    per-request ``httpx.Timeout`` is not an end-to-end bound — it limits each
+    connect/write/read operation separately and the read deadline restarts on
+    every chunk of the body, so a backend still sending bytes holds the request
+    open past any finite value. Only elapsed time proves the lease is honoured:
+    here the peer holds the response for 2s against 0.2s of lease, and against
+    a lease that is already gone (0.0), which must fail fast rather than run
+    on."""
+    claim = _admitted_claim(uuid4())
+
+    async def handle(request):
+        await asyncio.sleep(2.0)
+        return httpx.Response(200, json=_running_state(claim))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client, lifecycle_timeout_s=15.0)
+        started = time.monotonic()
+        with pytest.raises(httpx.TimeoutException):
+            await getattr(backend, call)(claim, remaining_lease_s=remaining_lease_s)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, f"{call} ran {elapsed:.1f}s on a {remaining_lease_s}s lease"
+
+
+@pytest.mark.asyncio
+async def test_v2_lease_bound_call_keeps_inheriting_an_injected_clients_timeout():
+    """``lifecycle_timeout_s=None`` is documented as "falls back to the
+    client's own timeout", which for an injected client is *that* client's
+    timeout — not this SDK's ``timeout_s``, which never governed it. Bounding
+    the lease on the call rather than overriding each request's ``timeout=``
+    keeps that opt-out intact; the lease deadline (300s here) stays inert above
+    the floor."""
     claim = _admitted_claim(uuid4())
     deadlines: list = []
 
@@ -543,8 +574,10 @@ async def test_v2_lease_bound_calls_cap_the_request_deadline_at_the_remaining_le
         deadlines.append(request.extensions["timeout"]["read"])
         return httpx.Response(200, json=_running_state(claim))
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
-        backend = BackendClient("http://test", "test", client=client, lifecycle_timeout_s=15.0)
-        await getattr(backend, call)(claim, remaining_lease_s=remaining_lease_s)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle),
+                                 base_url="http://test", timeout=90.0) as client:
+        backend = BackendClient("http://test", "test", client=client,
+                                timeout_s=30.0, lifecycle_timeout_s=None)
+        await backend.resource_heartbeat(claim, remaining_lease_s=300.0)
 
-    assert deadlines == [deadline], "a lease-bound request must not outlive the lease"
+    assert deadlines == [90.0], "an injected client's own timeout must survive"

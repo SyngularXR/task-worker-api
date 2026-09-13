@@ -67,11 +67,11 @@ class AttemptLease:
         self._loop = asyncio.get_running_loop()
         self._owner = asyncio.current_task()
         sent = time.monotonic()
-        # A retry budget, not a deadline: it bounds only how long the client
-        # may sleep between retries of this call, and the acknowledgement is
-        # still validated against server-clock deltas below — so the worker
-        # clock this is read from can cost the attempt a retry it could have
-        # afforded, but can never buy the lease time it has not been granted.
+        # Bounds this call three ways: its attempts, the sleeps between them,
+        # and its own elapsed time. The acknowledgement is still validated
+        # against server-clock deltas below — so the worker clock this is read
+        # from can cost the attempt a retry it could have afforded, but can
+        # never buy the lease time it has not been granted.
         # Unbounded, one 429's Retry-After parks entry until the reservation
         # the supervisor is still heartbeating has been reclaimed.
         granted = min(self.claim.lease_expires_at, self.claim.staging_deadline)
