@@ -38,6 +38,7 @@ def test_cinematic_baking_roundtrip():
         "pattern_scale": None,
         "yup": True,
         "max_displacement_mm": None,
+        "remove_interior": False,
     }
 
 
@@ -178,3 +179,11 @@ def test_gs4d_build_stages_match_backend_queue():
 def test_gs4d_build_rejects_training_params():
     with pytest.raises(ValidationError):
         Gs4dBuildParams(stage="render", warm_start_ply="seed.ply")
+
+
+@pytest.mark.parametrize("material_id", ["original_texture", "cinematic_texture"])
+def test_cinematic_texture_cleanup_survives_shared_validation(material_id):
+    schema = TASK_PARAMS_SCHEMAS[TaskType.CINEMATIC_BAKING]
+    params = schema(job_id="job", input_path="scan.glb", base_name="scan",
+                    material_id=material_id, remove_interior=True)
+    assert schema.model_validate(params.model_dump()).remove_interior is True
