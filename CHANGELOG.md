@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.19.0.dev44
+
+- Stop v2 attempt-lease renewal from outliving the lease it renews.
+  `AttemptLease._renew` heartbeats through the retried `_resource_request`
+  path, which passes `retry_after_max_s=None`, so a single 429 carrying a large
+  `Retry-After` (or a full backoff chain) parked the renewal past the
+  acknowledged deadline: the lease expired silently, the owner task was
+  cancelled mid-work and the `_watch` thread `os._exit(75)`-ed the worker once
+  the grace window closed. The renewal keeps that retry policy — bounded and
+  jittered, it is what a heartbeat wants to ride out a blip — but now under a
+  deadline taken from the lease itself: at most *half* the remaining
+  acknowledged time. Half, because spending all of it on one attempt that never
+  answers hands the loop back no time to try again with, and the lease dies just
+  the same; the other half is the loop's, to sleep its cadence and renew inside
+  the window. The allowance is elapsed time (`asyncio.wait_for`), not a
+  per-request `httpx.Timeout`, because a `Timeout` neither spans the retry
+  loop's inter-attempt sleeps nor survives a dribbling peer — it limits each
+  connect/write/read operation separately and httpcore restarts the read
+  deadline on every chunk of the body. The request's own deadline is left as
+  the consumer configured it, and `resource_heartbeat`'s signature is unchanged.
+- Bound the v2 attempt-lease entry poll, the other call a server-named retry
+  could park until the reservation had been reclaimed. Entry has no
+  acknowledged deadline yet and `claim.lease_expires_at` cannot supply one —
+  subtracting local wall time from it reads worker clock error as lease time,
+  so a clock an hour behind grants itself a window the backend never issued and
+  one an hour ahead rejects a valid reservation. It uses the
+  `_MAX_LEASE_RUNWAY_S` cap `_accept` already applies to every acknowledgement,
+  since a reply later than that is rejected anyway. Retries stay on there:
+  unlike `_renew` there is no next pass to save time for.
+- Run the v2 progress call on the configured `lifecycle_timeout_s` instead of a
+  hardcoded 5s deadline, so a consumer that tuned that knob for its backend
+  gets it on progress too. It stays one-shot.
+
 ## 0.19.0.dev43
 
 - Give the v2 terminal reports (`complete`/`fail`) the same retry hardness v1

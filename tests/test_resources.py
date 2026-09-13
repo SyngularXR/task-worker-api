@@ -437,7 +437,8 @@ async def test_v2_progress_returns_the_attempt_state_it_was_given():
 @pytest.mark.asyncio
 async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sleep):
     """The one-shot carve-out is progress only — heartbeat renews the lease from
-    a background task, where riding out a blip is worth the wait."""
+    a background task, where riding out a blip is worth the wait (bounded, there,
+    by ``AttemptLease._renew``'s half-remaining-lease allowance)."""
     claim = _admitted_claim(uuid4())
     sent: list = []
 
@@ -453,3 +454,23 @@ async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sl
 
     assert len(sent) == 2 and state.attempt_id == claim.ownership.attempt_id
     assert no_blocking_sleep, "heartbeat keeps its backoff"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle_timeout_s", [3.0, 40.0])
+async def test_v2_progress_uses_the_configured_lifecycle_timeout(lifecycle_timeout_s):
+    """Progress hardcoded a 5s deadline, so a consumer that widened (or
+    tightened) ``lifecycle_timeout_s`` for its backend got neither."""
+    claim = _admitted_claim(uuid4())
+    deadlines: list = []
+
+    def handle(request):
+        deadlines.append(request.extensions["timeout"]["read"])
+        return httpx.Response(200, json=_running_state(claim))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client,
+                                lifecycle_timeout_s=lifecycle_timeout_s)
+        await backend.resource_progress(claim, {"stage": "compute"})
+
+    assert deadlines == [lifecycle_timeout_s]

@@ -156,3 +156,75 @@ async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 7)
     assert renewed.is_set() and not exited.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("degraded", ["parks", "fails"])
+async def test_renewal_cannot_spend_the_whole_lease_on_one_retried_heartbeat(degraded):
+    """A renewal keeps the client's retry policy, but never for longer than the
+    lease it is renewing.
+
+    Unbounded, one 429's ``Retry-After`` parks that retry loop for the hour it
+    names — the v2 path never shortens server guidance — so the renewal comes
+    back to an expired lease: ``_watch`` has cancelled the owner task mid-work
+    and hard-exited the worker. Bounding it at the *whole* remaining lease is no
+    fix either, which is why the allowance is only half: spend it all on one
+    attempt that never answers (``parks``) and the loop is handed back no time
+    to try again with, so the lease dies just the same.
+
+    Asserted on what a single bounded call cannot show: whichever way the first
+    renewal fails, a later one lands *before* expiry and the owner runs on
+    untouched past the lease it started with."""
+    client = Client(lease_seconds=3)
+    exited = threading.Event()
+    shots = []
+
+    async def heartbeat(claim):
+        shots.append(time.monotonic())
+        if len(shots) == 1:
+            if degraded == "parks":
+                await asyncio.sleep(3600)  # the client's retry loop, parked on Retry-After
+            raise RuntimeError("degraded backend")
+        return client.response()
+
+    client.resource_heartbeat = heartbeat
+    lease = AttemptLease(client, None, client.claim, grace_s=0.1, on_hard_exit=exited.set)
+
+    async def owner():
+        async with lease:
+            await asyncio.sleep(3.5)
+
+    task = asyncio.create_task(owner())
+    done, _ = await asyncio.wait([task], timeout=8)
+    assert task in done and not task.cancelled(), \
+        "the watchdog cancelled the owner mid-work: no renewal landed inside the 3s lease"
+    task.result()
+    assert len(shots) >= 2 and not exited.is_set()
+
+
+@pytest.mark.asyncio
+async def test_entry_poll_cannot_outlive_the_runway_it_could_be_granted(monkeypatch):
+    """Entry is the other lease-bound poll, and the one with no acknowledged
+    deadline yet: parked on a server-named retry it returns to a reservation the
+    backend has already reclaimed. Its bound cannot come from
+    ``claim.lease_expires_at`` minus local wall time — that reads the worker's
+    clock error as lease time — so it is _accept's own cap, which dates every
+    acknowledgement from the monotonic send time and grants at most
+    _MAX_LEASE_RUNWAY_S past it. A reply later than that is rejected anyway.
+
+    Asserted on elapsed time: a per-request timeout is not an end-to-end bound
+    (httpcore restarts the read deadline on every chunk), and the park this
+    interrupts happens between attempts, where no request timeout reaches."""
+    monkeypatch.setattr('task_worker_api.resource_execution._MAX_LEASE_RUNWAY_S', 0.2)
+    client = Client()
+
+    async def parked(claim):
+        await asyncio.sleep(5)
+        return client.response()
+
+    client.resource_status = parked
+    started = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        async with AttemptLease(client, None, client.claim):
+            pass
+    assert time.monotonic() - started < 1.0, "entry outlived the runway it could be granted"
