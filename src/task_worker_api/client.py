@@ -1072,7 +1072,9 @@ class BackendClient:
         ``extra_transient`` / ``attempts`` / ``sleep_budget_s`` are forwarded
         to :meth:`_retry`, as on v1's :meth:`_request` — terminal reports use
         them to widen the transient set and raise the attempt budget, lease
-        renewal to bound both by the time the lease has left.
+        renewal to bound both by the time the lease has left. Anything else
+        (``timeout`` included) rides ``**kwargs`` down to every attempt's
+        :meth:`_resource_request_once`.
         """
         return await self._retry(
             lambda: self._resource_request_once(method, path, **kwargs),
@@ -1096,15 +1098,24 @@ class BackendClient:
         - one attempt costs up to ``lifecycle_timeout_s``, and request time is
           *not* charged to the sleep budget, so that much per attempt is
           reserved out of the remaining time first;
-        - whatever is left over is what this call may sleep between attempts.
+        - whatever is left over is what this call may sleep between attempts;
+        - and the request itself runs on the shorter of ``lifecycle_timeout_s``
+          and the remaining time. Bounding only the sleeps left the last hole:
+          with less than one ``lifecycle_timeout_s`` left the attempt budget
+          floors at one, and that single request — still on the full 15s
+          deadline — is then itself what stalls past expiry, cancelling the
+          owner task and tripping the watchdog. Above that floor the cap is
+          inert, because the attempt arithmetic has already reserved a whole
+          ``lifecycle_timeout_s`` per attempt out of the remaining time.
 
-        Both floor at one attempt / no sleeping: a renewal with no time left
-        still gets its one shot — it just can't wait around. Giving up early
-        costs nothing the caller doesn't already handle: ``_renew`` loops and
-        tries again on its own cadence, well before the deadline it just
-        declined to sleep past. ``None`` means no known deadline (the
-        supervisor's first call, before any acknowledged state) and leaves the
-        client-wide budget in charge.
+        All three floor at one attempt / no sleeping / no waiting: a renewal
+        with no time left still gets its one shot — it just can't wait around,
+        and a zero deadline fails it fast rather than running on past a lease
+        that is already gone. Giving up early costs nothing the caller doesn't
+        already handle: ``_renew`` loops and tries again on its own cadence,
+        well before the deadline it just declined to sleep past. ``None`` means
+        no known deadline (the supervisor's first call, before any acknowledged
+        state) and leaves the client-wide budget in charge.
         """
         if remaining_lease_s is None:
             return {}
@@ -1112,6 +1123,7 @@ class BackendClient:
         return {
             "attempts": attempts,
             "sleep_budget_s": max(0.0, remaining_lease_s - attempts * self._lifecycle_timeout_s),
+            "timeout": min(self._lifecycle_timeout_s, max(0.0, remaining_lease_s)),
         }
 
     async def resource_operation(self, journal, kind, payload, *, host_report=None, cleanup=None):

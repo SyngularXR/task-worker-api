@@ -522,3 +522,29 @@ async def test_v2_progress_uses_the_configured_lifecycle_timeout(lifecycle_timeo
         await backend.resource_progress(claim, {"stage": "compute"})
 
     assert deadlines == [lifecycle_timeout_s]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["resource_heartbeat", "resource_status"])
+@pytest.mark.parametrize("remaining_lease_s, deadline", [(5.0, 5.0), (300.0, 15.0), (0.0, 0.0)])
+async def test_v2_lease_bound_calls_cap_the_request_deadline_at_the_remaining_lease(
+        call, remaining_lease_s, deadline):
+    """Bounding sleeps and attempts left the request itself unbounded. With 5s
+    of lease and ``lifecycle_timeout_s=15``, the attempt budget floors at one
+    and that one request was still sent on a 15s deadline — so a stalled
+    heartbeat or cancel-status poll ran 10s past expiry, by which time
+    ``AttemptLease`` has cancelled the owner task mid-work and its watchdog has
+    hard-exited the worker: the precise stall the budget is meant to prevent.
+    Above the floor the cap is inert (300s of lease keeps the full 15s)."""
+    claim = _admitted_claim(uuid4())
+    deadlines: list = []
+
+    def handle(request):
+        deadlines.append(request.extensions["timeout"]["read"])
+        return httpx.Response(200, json=_running_state(claim))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client, lifecycle_timeout_s=15.0)
+        await getattr(backend, call)(claim, remaining_lease_s=remaining_lease_s)
+
+    assert deadlines == [deadline], "a lease-bound request must not outlive the lease"
