@@ -30,6 +30,6 @@ class ModelInitializingParams(TaskParamsBase):
     convex_hull_target_faces: int = Field(default=500, ge=1, le=2_000_000)
     convex_hull_margin: float = Field(default=1.6, ge=0.0, le=100.0, allow_inf_nan=False)
     convex_hull_smooth_iterations: int = Field(default=3, ge=0)
-    preview_max_triangles: int = Field(default=120_000, ge=1, le=120_000)
+    preview_max_triangles: int = Field(default=300_000, ge=300_000, le=300_000)
     remove_interior: bool = False
     yup: bool = True
