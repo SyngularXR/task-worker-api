@@ -161,6 +161,7 @@ export interface CinematicBakingParams {
   base_name: string;
   /** Remote-worker inputs: {filename: filename}, served via GET /tasks/{id}/files/{filename}. Emitted alongside input_path when the producing box enables cross-box files; home workers keep the zero-copy input_path, foreign workers use only this. */
   input_files?: Record<string, string>;
+  remove_interior?: boolean;
   yup?: boolean;
   /** Optional worker material registry id. Omit for the deployment's Current/default material. */
   material_id?: string;
