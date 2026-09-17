@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.19.0.dev43
+
+- Give the v2 terminal reports (`complete`/`fail`) the same retry hardness v1
+  already has: 500 joins the transient set and the attempt budget floors at
+  `_TERMINAL_MIN_ATTEMPTS` (6). They went through `_resource_request` on the
+  default 4 attempts with 500 fatal, so a backend dependency dying mid-write —
+  or a 502 blip outlasting 4 attempts — raised and left the attempt's durable
+  operation unresolved, wedging the worker behind `previous_claim_unresolved`
+  until a supervisor restart replayed it via `resource_recover_operations`.
+  Both kinds are idempotent journal-replayed operations, so re-PUTting is safe;
+  `start`/`release`/`decline` keep the default contract.
+
+## 0.19.0.dev42
+
+- Map a retired worker protocol (410/426) on the v2 progress call to
+  `ProtocolError`, so `AttemptLease.update` expires the lease instead of
+  swallowing a raw `HTTPStatusError` and letting the worker keep executing an
+  attempt the backend no longer honours. Progress stays one-shot — like v1's
+  `report_progress_once`, it runs on the handler's critical path, so it does not
+  take the retry loop's backoff (~74s on defaults) or an uncapped `Retry-After`
+  sleep; the lease's background heartbeat still retries.
+
+## 0.19.0.dev41
+
+- Expose the immutable admission-granted resource profile as `TaskContext.profile`
+  so handlers can select profiled execution methods without modifying task inputs,
+  their digest, or the claim wire schema. Unadmitted contexts retain `None`.
+
+## 0.19.0.dev39
+
+- Retry the supervisor's initial readiness request with the existing polling
+  backoff when the backend is still starting, so workers survive login before
+  Docker and the backend are available.
+
 ## Unreleased
 
 **Features:**
@@ -9,20 +43,28 @@
   `coordinate_fixture_v1.json` for cross-repo anchor-space verification.
 
 **Fixes:**
-- Document the cancel contract the SDK actually delivers. `CancelGuard`'s
-  docstring and `docs/adding-a-worker.md` both claimed `TaskCancelled` is
-  "raised at the next await" inside the guarded block; asyncio has no way to
-  raise into another coroutine, so the poller only *sets* the `cancelled`
-  event. A handler that doesn't check the signal runs to completion, and the
-  cancel is honoured at the `prepare_inputs` / `upload_outputs` boundaries and
-  on leaving the guarded block — the task is still reported `cancelled by
-  user`, never as a success, just no sooner than the handler returns. Stopping
-  the work stays cooperative on purpose: the SDK does not cancel the handler's
-  task, because cancelling an `await` ends the await and not the work behind
-  it, so a `to_thread` GPU job would keep running detached while the worker
-  deleted its workdir and claimed the next task on the same GPU. Handlers
-  needing unconditional termination should run the work in a subprocess they
-  can `terminate()` (Pattern 2).
+- Document that SDK cancellation is cooperative, and keep it that way. The
+  `CancelGuard` docstring and `docs/adding-a-worker.md` promised pattern-1
+  handlers were "interrupted at the next `await`"; nothing implemented that,
+  and it cannot be implemented safely. Cancelling an `await` does not stop
+  the work behind it — a cancelled `proc.communicate()` leaves the child
+  process running, a cancelled `to_thread` leaves the thread running — and
+  force-cancelling the handler kills the bridge task that patterns 2 and 3
+  tear down in their own `finally`, which is the thing that terminates that
+  child or sets that stop event. The worker would report "cancelled by user"
+  and delete the workdir while the GPU/CLI work ran on. Both docs now say
+  what actually happens: the guard flips `ctx.progress.is_cancelled`, the
+  handler notices and stops its own work, and `TaskCancelled` is raised on
+  the way *out* of the guarded block. A pure-async handler parked in one
+  long `await` with no cancel check runs to completion by design — call
+  `ctx.progress.raise_if_cancelled()` between awaits. The
+  `prepare_inputs`/`upload_outputs` aborts, which cancel transfers the SDK
+  itself owns, are unchanged: the cancel is honoured at those boundaries and
+  on leaving the guarded block, so a cancelled task is still reported
+  `cancelled by user` and never as a success — just no sooner than the
+  handler returns. Handlers needing unconditional termination should run the
+  work in a subprocess they can `terminate()` (Pattern 2). Regression tests
+  pin the bridge contract.
 - `prepare_inputs` and `upload_outputs` no longer transfer an aliased file
   twice. Both manifests are `{logical_key: filename}`, and two keys may name
   one file on purpose (`scene` and `warm_start` both `model.ply`): inputs are
@@ -52,6 +94,18 @@
   reason — are transmitted byte-identical. Lone surrogates (a traceback quoting
   subprocess output decoded with `surrogateescape`) are escaped rather than left
   to raise `UnicodeEncodeError` inside the report call.
+- The v2 (admitted) terminal failure report now goes through the same cap.
+  `Worker.run_admitted_attempt` built `{"error": f"{type(exc).__name__}: {exc}"}`
+  uncapped and `BackendClient.resource_operation` persisted that body into the
+  durable journal *before* transmitting it, so a giant traceback or a
+  surrogate-escaped subprocess message made the report permanently
+  undeliverable: the journal replays the same stored request forever, the
+  attempt never resolves, and the worker stays wedged behind
+  `previous_claim_unresolved` ("previous attempt requires supervisor
+  reconciliation"). `resource_operation` now caps and sanitizes a `fail`
+  payload's `error` before `journal.prepare_operation`, so the durable body is
+  the deliverable one — covering the supervisor's own `fail` report too. No
+  change to the wire shape, the 16 KB cap, or which statuses retry.
 - The watchdog's last-resort `fail()` report no longer retries a permanent
   4xx. `_make_sync_fail` retried *any* exception 3× with 2s sleeps, so a
   definitive answer — 400 (bad body), 404 (task gone), 409 (already terminal)

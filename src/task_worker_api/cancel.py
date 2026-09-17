@@ -2,15 +2,13 @@
 
 Three canonical usage patterns:
 
-1. Pure async handler — polls ``ctx.progress.is_cancelled`` between steps
-   and returns (or raises ``TaskCancelled``) itself. Nothing interrupts a
-   handler that doesn't: asyncio has no way to raise into another coroutine,
-   and the guard deliberately does not cancel the handler's task, because
-   cancelling an ``await`` does not stop the work behind it (pattern 3's
-   thread would keep running, detached, holding the GPU). A handler that
-   ignores the signal therefore runs to completion, and the cancel is
-   honoured at the ``prepare_inputs``/``upload_outputs`` boundaries and on
-   leaving the guarded block.
+1. Pure async handler — the guard flips ``ctx.progress.is_cancelled``; the
+   handler polls it between steps and returns (or calls
+   ``ctx.progress.raise_if_cancelled()``) itself. Nothing interrupts a
+   handler that doesn't: a handler parked in one long ``await`` with no
+   check runs to completion, and the cancel is then honoured at the
+   ``prepare_inputs``/``upload_outputs`` boundaries and on leaving the
+   guarded block — see "Cancellation is cooperative" on the guard below.
 2. Subprocess handler (Blender, colmap) — ``on_cancel`` calls ``proc.terminate()``;
    the handler's ``await proc.communicate()`` unblocks; its
    ``ctx.progress.raise_if_cancelled()`` then raises.
@@ -113,13 +111,27 @@ async def CancelGuard(
       - Calls ``on_cancel()`` synchronously. This runs on the guard's
         task, so a ``subprocess.terminate()`` or ``threading.Event.set()``
         lands immediately.
-      - Sets the yielded ``cancelled`` event. The guard does *not*
-        interrupt the guarded block — see pattern 1 above — so the block
-        must watch the event itself: ``prepare_inputs``/``upload_outputs``
-        abort on it, and the handler stops on its own terms
-        (``ctx.progress.is_cancelled``, or the ``on_cancel`` hook).
-      - Raises ``TaskCancelled`` on exit of the guarded block if nothing
-        inside it already did, so a cancel is never reported as a success.
+      - Sets the yielded ``cancelled`` event — which the worker links into
+        the progress reporter, so ``ctx.progress.is_cancelled`` reads True —
+        then raises ``TaskCancelled`` on the way *out* of the guarded block
+        if nothing inside it already did, so a cancel is never reported as
+        a success.
+      - Aborts whoever is *racing* that event at their next ``await``:
+        ``prepare_inputs`` / ``upload_outputs`` pass it down to each file
+        transfer, so a cancel during staging or publishing lands at once.
+
+    Cancellation is cooperative — the guard never cancels the handler task,
+    and a handler parked in one long ``await`` runs to its next check. That
+    is deliberate: asyncio has no way to raise into another coroutine, and
+    cancelling an ``await`` does not stop the work behind it (a cancelled
+    ``proc.communicate()`` leaves the child running, a cancelled
+    ``to_thread`` leaves the thread running), and it would tear down the
+    handler's own bridge task — the ``finally: killer.cancel()`` in patterns
+    2/3 — which is the thing that actually terminates that child or sets
+    that stop event. Forcing it would report the task cancelled, remove the
+    workdir and claim the next task onto the same GPU while the GPU/CLI work
+    ran on. Handlers stop their own work (``ctx.progress.is_cancelled``, or
+    the ``on_cancel`` hook); the guard only tells them to.
 
     Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
     plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C

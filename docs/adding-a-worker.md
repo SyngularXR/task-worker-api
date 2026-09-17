@@ -310,13 +310,19 @@ Don't swallow errors. Raising is the right signal.
 When the backend flips a task to CANCELLED (user hit cancel, or admin
 dashboard clicked stop), the SDK's `CancelGuard` polls
 `/tasks/{id}/cancel-status` every 2 seconds. It sets
-`ctx.progress.is_cancelled = True` — and that is the whole of it. Nothing
-interrupts your handler: asyncio has no way to raise into another
-coroutine, and the SDK deliberately does not cancel your handler's task,
-because cancelling an `await` ends the await, not the work behind it — a
-`to_thread` GPU job would keep running, detached, while the worker claimed
-its next task on the same GPU. Stopping the actual work is something only
-your handler can do, so every pattern below checks the signal itself.
+`ctx.progress.is_cancelled = True`, and raises `TaskCancelled` on the way
+*out* of your handler, so the attempt reports "cancelled by user".
+
+Cancellation is **cooperative**: the SDK never cancels your handler task, so
+a handler parked in one long `await` with no cancel check runs to
+completion. That is on purpose — asyncio has no way to raise into another
+coroutine, and cancelling an `await` would not stop the work behind it (a
+cancelled `proc.communicate()` leaves the child process running; a cancelled
+`to_thread` leaves the thread running, detached, while the worker claims its
+next task on the same GPU), and it would kill the very bridge task in
+patterns 2 and 3 that does the stopping, while the worker reported the task
+cancelled and deleted the workdir underneath it. Notice the cancel and stop
+your own work — that is what all three shapes below do.
 
 A handler that ignores it runs to completion; the cancel is then honoured
 at the `prepare_inputs` / `upload_outputs` boundaries and on the way out of
