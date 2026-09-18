@@ -168,12 +168,12 @@ A pins-only rollout — no worker code changed, every edit was a version-string 
 | PR | Repo | Outcome |
 |---|---|---|
 | [#104](https://github.com/SyngularXR/task-worker-api/pull/104) | task-worker-api (SDK) | merged 11:39:08Z, wheel published 11:39:24Z — v2 fix: attempt-lease renewal bounded by the lease's remaining time |
-| [#243](https://github.com/SyngularXR/Neural-Canvas/pull/243) | Neural-Canvas | open, CI green (~1 min) — 3 files, dev35 → dev47 |
-| [#73](https://github.com/SyngularXR/colmap-splat/pull/73) | colmap-splat | open, CI green (8 min) — 3 files, dev35 → dev47 |
-| [#88](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/pull/88) | syngar-ml-assetbundle-builder | open, CI green (~3.5 min) — 2 files, dev35 → dev47 |
-| [#120](https://github.com/SyngularXR/Blender-CLI/pull/120) | Blender-CLI | open, CI green (~15 min) — 1 file, dev45 → dev47 |
+| [#243](https://github.com/SyngularXR/Neural-Canvas/pull/243) | Neural-Canvas | merged 13:58Z (`295b27a`), 3 files, dev35 → dev47 — PR CI ~1 min; post-merge CUDA image build and push 15 min |
+| [#73](https://github.com/SyngularXR/colmap-splat/pull/73) | colmap-splat | merged 13:58Z (`109ba8d`), 3 files, dev35 → dev47 — PR CI 8 min; post-merge build 1 min (layers cached by the PR build) |
+| [#88](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/pull/88) | syngar-ml-assetbundle-builder | merged 13:58Z (`0fdc1a7`), 2 files, dev35 → dev47 — PR CI ~3.5 min; post-merge image build and push 2 min |
+| [#120](https://github.com/SyngularXR/Blender-CLI/pull/120) | Blender-CLI | merged 13:58Z (`bae280d`), 1 file, dev45 → dev47 — PR CI ~15 min; post-merge pytest, CUDA image and Bioform catalog publish 12 min |
 
-Worker PR states as of 2026-09-18 12:12Z: all four mergeable, none merged yet.
+All four worker PRs merged on 2026-09-18 and every post-merge build on `main` succeeded. The admission images had not been rebuilt at the time of writing, so admitted workers were still on dev35.
 
 What this one taught:
 - `workers.json` and this runbook each named one pin file per repo; the repos had up to three, and assetbundle-builder was missing here altogether. Grep `origin/main` (the quick check above) rather than trusting either.
