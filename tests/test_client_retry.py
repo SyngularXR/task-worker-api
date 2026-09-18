@@ -4278,3 +4278,141 @@ async def test_download_cleanup_survives_a_second_cancel(
 
     assert removed.is_set(), "the second cancel abandoned the partial-file cleanup"
     assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# v2 resource_download — buffered disk writes
+# ---------------------------------------------------------------------------
+
+
+def _download_claim(artifact):
+    """Minimal admitted claim declaring exactly ``artifact`` as its input."""
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
+    from task_worker_api.resources import (
+        AttemptOwnership, ClaimResult, ResourceProfile,
+    )
+
+    now = datetime.now(timezone.utc)
+    return ClaimResult(
+        task_id=1,
+        task={"id": 1, "task_type": "finalize_segment", "case_id": None,
+              "item_key": "k", "params": {}, "inputs": {"scene": artifact}},
+        ownership=AttemptOwnership(worker_instance_id=uuid4(), attempt_id=uuid4(),
+                                   generation=1, token="t" * 32),
+        profile=ResourceProfile(
+            profile_id="test-only", revision=1, task_type="finalize_segment",
+            required_capabilities=[], workload_bounds={"input_bytes": 100},
+            gpu_count=0, gpu_backend="none", gpu_vram_mib=0, host_ram_mib=100,
+            execution_ram_mib=100, cpu_millicores=100, scratch_mib=0,
+            scratch_pool="test-volume", execution_timeout_seconds=10,
+            staging_timeout_seconds=60, evidence="test fixture",
+            validation_state="unvalidated",
+        ),
+        input_digest="a" * 64, gpu_uuid=None, host_id=uuid4(), boot_id=uuid4(),
+        execution_scope="test-scope",
+        staging_deadline=now + timedelta(seconds=60),
+        lease_expires_at=now + timedelta(seconds=60), state="running",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resource_download_buffers_writes_to_1mb_chunks(tmp_path, monkeypatch):
+    """v2's admitted-input fetch must batch writes like download_file does.
+
+    ``aiter_bytes()`` yields the transport's ~64 KB chunks, and v2 used to push
+    every one through its own ``_to_thread_complete(file.write, ...)`` hop:
+    tens of thousands of thread dispatches per GB of admitted input, on exactly
+    the multi-GB artifacts this path exists to move. Buffering must not perturb
+    the digest/size verification, so the delivered file is checked too.
+    """
+    import hashlib
+    import threading
+
+    from task_worker_api import client as client_mod
+    from task_worker_api.resources import InputArtifact
+
+    wire_chunk = 64 * 1024
+    n_wire_chunks = 64  # 4 MB → four full 1 MB writes, no tail
+    payload = bytes(range(256)) * (wire_chunk // 256)
+    body_bytes = payload * n_wire_chunks
+
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(body_bytes).hexdigest(),
+        size_bytes=len(body_bytes),
+    )
+    claim = _download_claim(artifact)
+
+    async def body():
+        for _ in range(n_wire_chunks):
+            yield payload
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/inputs/scene.ply")
+        return httpx.Response(200, content=body())
+
+    loop_thread = threading.current_thread()
+    writes: list[tuple[int, threading.Thread]] = []
+    real_open = open
+
+    class _SpyFile:
+        def __init__(self, f):
+            self._f = f
+
+        def write(self, data):
+            writes.append((len(data), threading.current_thread()))
+            return self._f.write(data)
+
+        def close(self):
+            return self._f.close()
+
+    def spy_open(path, mode, *a, **kw):
+        return _SpyFile(real_open(path, mode, *a, **kw))
+
+    monkeypatch.setattr(client_mod, "open", spy_open, raising=False)
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    await client.resource_download(claim, artifact, dest)
+    await client.close()
+
+    assert all(t is not loop_thread for _, t in writes), (
+        "resource_download wrote to disk on the event-loop thread"
+    )
+    sizes = [n for n, _ in writes]
+    assert len(sizes) == n_wire_chunks * wire_chunk // _DOWNLOAD_CHUNK_BYTES, (
+        f"expected one write per {_DOWNLOAD_CHUNK_BYTES} B buffer, got {sizes}"
+    )
+    assert all(n >= _DOWNLOAD_CHUNK_BYTES for n in sizes)
+    # Buffering must not corrupt, reorder, or truncate the admitted bytes.
+    assert dest.read_bytes() == body_bytes
+
+
+@pytest.mark.asyncio
+async def test_resource_download_still_rejects_oversized_input(tmp_path):
+    """The buffer must not delay the admitted-size abort past the declared size."""
+    import hashlib
+
+    from task_worker_api.errors import ProtocolError
+    from task_worker_api.resources import InputArtifact
+
+    declared = b"x" * 1000
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(declared).hexdigest(), size_bytes=len(declared),
+    )
+    claim = _download_claim(artifact)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        # One wire chunk, well under the 1 MB write buffer, over the declared size.
+        return httpx.Response(200, content=declared + b"x")
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    with pytest.raises(ProtocolError, match="exceeds admitted size"):
+        await client.resource_download(claim, artifact, dest)
+    await client.close()
+
+    assert not dest.exists()
