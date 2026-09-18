@@ -228,3 +228,40 @@ async def test_entry_poll_cannot_outlive_the_runway_it_could_be_granted(monkeypa
         async with AttemptLease(client, None, client.claim):
             pass
     assert time.monotonic() - started < 1.0, "entry outlived the runway it could be granted"
+
+
+@pytest.mark.asyncio
+async def test_leaving_the_lease_stops_renewal_even_if_its_cancel_is_swallowed():
+    """``asyncio.wait_for`` on Python <= 3.11 swallows a cancel that lands in the
+    loop pass its inner call completes in (fixed in 3.12; the SDK supports 3.10).
+    An owner woken by the heartbeat's own completion leaves the lease in exactly
+    that pass: ``__aexit__`` cancels ``_renew``, the cancel is eaten, and the loop
+    renews on while ``__aexit__`` waits for it — until the phase deadline, 60s
+    here. The loop has to notice the exit itself.
+
+    Passes on 3.12+ with or without that check; on 3.11 it fails without it."""
+    client = Client(lease_seconds=2)
+    exited = threading.Event()
+    leave = asyncio.Event()
+    shots = []
+
+    async def heartbeat(claim):
+        shots.append(time.monotonic())
+        leave.set()  # wakes the owner in the pass this call completes in
+        return client.response()
+
+    client.resource_heartbeat = heartbeat
+    lease = AttemptLease(client, None, client.claim, on_hard_exit=exited.set)
+
+    async def owner():
+        async with lease:
+            await leave.wait()
+
+    task = asyncio.create_task(owner())
+    done, _ = await asyncio.wait([task], timeout=1.5)
+    try:
+        assert task in done, "__aexit__ is still waiting on a renewal loop that outlived its cancel"
+        assert len(shots) == 1 and not exited.is_set()
+    finally:
+        lease._heartbeat.cancel()
+        await asyncio.wait([task], timeout=1)

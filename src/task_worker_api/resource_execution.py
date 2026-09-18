@@ -137,6 +137,12 @@ class AttemptLease:
                 return
             except Exception:
                 log.warning("Attempt heartbeat failed; acknowledged lease still expires", exc_info=True)
+            if not self._active:
+                # __aexit__ cancelled this task and the cancel never arrived:
+                # wait_for on Python <= 3.11 swallows one that lands in the
+                # loop pass its inner call completes in. Unchecked, the loop
+                # renews on and __aexit__ waits on it until the phase deadline.
+                return
 
     async def start(self, host_report, input_digest):
         if not self._active or self._started or self._closed.is_set():

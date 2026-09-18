@@ -1170,11 +1170,6 @@ class BackendClient:
         retries — bounded, there, by the lease they are renewing (see
         ``AttemptLease._renew``).
 
-        It runs on the configured ``lifecycle_timeout_s`` deadline, like every
-        other v2 lifecycle call; it used to hardcode 5s, which silently ignored
-        a consumer that had widened (or tightened) that knob for a slow
-        backend.
-
         It uses :meth:`_resource_request_once` rather than a bare request only
         to map a retired protocol (410/426) to :class:`ProtocolError`, which is
         what makes ``AttemptLease.update`` expire the lease instead of
@@ -1183,7 +1178,7 @@ class BackendClient:
         """
         from .resource_protocol import AttemptState
 
-        response = await self._resource_request_once("PUT", f"/tasks/{claim.task_id}/progress",
+        response = await self._resource_request_once("PUT", f"/tasks/{claim.task_id}/progress", timeout=5,
             json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
         return AttemptState.model_validate(response.json())
 

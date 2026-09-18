@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.19.0.dev44
+## 0.19.0.dev47
 
 - Stop v2 attempt-lease renewal from outliving the lease it renews.
   `AttemptLease._renew` heartbeats through the retried `_resource_request`
@@ -29,9 +29,11 @@
   `_MAX_LEASE_RUNWAY_S` cap `_accept` already applies to every acknowledgement,
   since a reply later than that is rejected anyway. Retries stay on there:
   unlike `_renew` there is no next pass to save time for.
-- Run the v2 progress call on the configured `lifecycle_timeout_s` instead of a
-  hardcoded 5s deadline, so a consumer that tuned that knob for its backend
-  gets it on progress too. It stays one-shot.
+- `_renew` checks for the lease's exit after each heartbeat instead of relying
+  on its cancel alone. `asyncio.wait_for` on Python <= 3.11 (the SDK supports
+  3.10) swallows a cancel that lands in the loop pass its inner call completes
+  in, so an owner leaving the lease in that pass left the loop renewing and
+  `__aexit__` waiting on it until the phase deadline.
 
 ## 0.19.0.dev43
 
