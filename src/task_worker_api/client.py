@@ -1167,7 +1167,8 @@ class BackendClient:
         ``Retry-After`` names — while the work being described sits idle.
         Dropping one display update is cheap: the lease's own background
         ``_renew`` heartbeat is what refreshes the deadline, and it keeps its
-        retries.
+        retries — bounded, there, by the lease they are renewing (see
+        ``AttemptLease._renew``).
 
         It uses :meth:`_resource_request_once` rather than a bare request only
         to map a retired protocol (410/426) to :class:`ProtocolError`, which is

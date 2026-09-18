@@ -18,6 +18,11 @@ from .errors import ProtocolError
 
 log = logging.getLogger(__name__)
 
+# The most monotonic runway any single acknowledgement can grant, however long
+# a lease the backend names. _accept clamps to it, so it is also the longest an
+# entry poll can usefully run for — past it no reply yields a usable lease.
+_MAX_LEASE_RUNWAY_S = 30
+
 
 class AttemptLease:
     def __init__(self, client, journal, claim, *, grace_s=10, on_hard_exit=None):
@@ -42,7 +47,7 @@ class AttemptLease:
             raise ProtocolError("attempt is no longer executable")
         # Request-send time subtracts all transport latency and avoids trusting
         # the worker wall clock. A delayed response cannot extend an expired lease.
-        deadline = sent + min(30, (state.lease_expires_at - state.server_time).total_seconds())
+        deadline = sent + min(_MAX_LEASE_RUNWAY_S, (state.lease_expires_at - state.server_time).total_seconds())
         phase = state.execution_deadline or self.claim.staging_deadline
         with self._lock:
             if self._expired.is_set() or (self._deadline and time.monotonic() >= self._deadline):
@@ -66,7 +71,15 @@ class AttemptLease:
         self._loop = asyncio.get_running_loop()
         self._owner = asyncio.current_task()
         sent = time.monotonic()
-        state = self._accept(await self.client.resource_status(self.claim), sent)
+        # Unbounded, one 429's Retry-After parks entry until the reservation has
+        # been reclaimed. Entry has no acknowledged deadline yet, and
+        # claim.lease_expires_at cannot supply one — subtracting local wall time
+        # from it reads worker clock error as lease time. _accept's own cap is
+        # the bound with no clock to trust: a reply later than that is rejected
+        # anyway. Retries stay on; unlike _renew there is no next pass to save
+        # time for, so giving up here is the outcome rather than a deferral.
+        state = self._accept(await asyncio.wait_for(
+            self.client.resource_status(self.claim), _MAX_LEASE_RUNWAY_S), sent)
         if state.state != "reserved":
             raise ProtocolError("previous execution requires supervisor reconciliation")
         threading.Thread(target=self._watch, name="attempt-lease", daemon=True).start()
@@ -97,8 +110,26 @@ class AttemptLease:
                 return
             await asyncio.sleep(min(5, remaining / 4))
             sent = time.monotonic()
+            with self._lock:
+                # The renewal keeps the client's retry policy — riding out a
+                # blip in place is what a heartbeat wants — but not for longer
+                # than the lease it is renewing: unbounded, one 429's
+                # Retry-After parks it for the hour it names (the v2 path never
+                # shortens server guidance) and it returns to an expired lease,
+                # an owner task cancelled mid-work and a hard-exited worker.
+                #
+                # Half of what the lease has left, off the monotonic deadline
+                # _accept built from the backend's own server_time deltas. Half,
+                # so one stalled attempt cannot spend the whole lease: the rest
+                # is this loop's, to sleep its cadence and renew inside the
+                # acknowledged window. Elapsed, because a per-request timeout is
+                # not an end-to-end bound — it neither spans the retry loop's
+                # inter-attempt sleeps nor survives a dribbling peer, since
+                # httpcore restarts the read deadline on every chunk.
+                allowance = (self._deadline - sent) / 2
             try:
-                self._accept(await self.client.resource_heartbeat(self.claim), sent)
+                self._accept(await asyncio.wait_for(
+                    self.client.resource_heartbeat(self.claim), allowance), sent)
             except ProtocolError:
                 with self._lock:
                     self._expired.set()
@@ -106,6 +137,12 @@ class AttemptLease:
                 return
             except Exception:
                 log.warning("Attempt heartbeat failed; acknowledged lease still expires", exc_info=True)
+            if not self._active:
+                # __aexit__ cancelled this task and the cancel never arrived:
+                # wait_for on Python <= 3.11 swallows one that lands in the
+                # loop pass its inner call completes in. Unchecked, the loop
+                # renews on and __aexit__ waits on it until the phase deadline.
+                return
 
     async def start(self, host_report, input_digest):
         if not self._active or self._started or self._closed.is_set():

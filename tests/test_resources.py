@@ -437,7 +437,8 @@ async def test_v2_progress_returns_the_attempt_state_it_was_given():
 @pytest.mark.asyncio
 async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sleep):
     """The one-shot carve-out is progress only — heartbeat renews the lease from
-    a background task, where riding out a blip is worth the wait."""
+    a background task, where riding out a blip is worth the wait (bounded, there,
+    by ``AttemptLease._renew``'s half-remaining-lease allowance)."""
     claim = _admitted_claim(uuid4())
     sent: list = []
 
