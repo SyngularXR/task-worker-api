@@ -1230,12 +1230,25 @@ class BackendClient:
                 response.raise_for_status()
                 file = await _to_thread_complete(open, dest, "wb", cancel_cleanup=lambda opened: opened.close())
                 try:
+                    # Writes are batched into _DOWNLOAD_CHUNK_BYTES buffers for
+                    # the same reason as download_file: aiter_bytes() yields the
+                    # transport's ~64 KB chunks, and a blocking write per chunk
+                    # is tens of thousands of thread dispatches per GB of
+                    # admitted input. Size accounting and digest.update stay per
+                    # wire chunk, so "input exceeds admitted size" still aborts
+                    # at the same byte it did before.
+                    buf = bytearray()
                     async for chunk in response.aiter_bytes():
                         size += len(chunk)
                         if size > artifact.size_bytes:
                             raise ProtocolError("input exceeds admitted size")
                         digest.update(chunk)
-                        await _to_thread_complete(file.write, chunk)
+                        buf += chunk
+                        if len(buf) >= _DOWNLOAD_CHUNK_BYTES:
+                            await _to_thread_complete(file.write, buf)
+                            buf = bytearray()
+                    if buf:
+                        await _to_thread_complete(file.write, buf)
                     if size != artifact.size_bytes or digest.hexdigest() != artifact.sha256:
                         raise ProtocolError("input differs from admitted digest")
                 finally:
