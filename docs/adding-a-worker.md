@@ -333,8 +333,8 @@ Best for: I/O-bound handlers (HTTP calls, async DB, async file ops).
 async def run(ctx, params):
     async with httpx.AsyncClient() as http:
         for chunk_url in params.chunks:
-            ctx.progress.raise_if_cancelled()
-            chunk = await http.get(chunk_url)       # cancel lands here
+            ctx.progress.raise_if_cancelled()       # cancel lands here
+            chunk = await http.get(chunk_url)
             await asyncio.to_thread(process, chunk)
     return {...}
 ```
