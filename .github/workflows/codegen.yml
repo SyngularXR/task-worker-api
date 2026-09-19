@@ -12,13 +12,17 @@ on:
 
 jobs:
   check-ts-drift:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, docker]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install package
-        run: pip install -e .
+        # Own venv for the same reason as test.yml.
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python -m pip install -e .
       - name: Check TypeScript artifact is up to date
         run: python tools/gen_typescript.py --check

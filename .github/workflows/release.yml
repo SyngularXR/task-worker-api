@@ -7,7 +7,7 @@ on:
 jobs:
   release:
     name: Build wheel and publish release
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, docker]
     permissions:
       contents: write
     steps:
