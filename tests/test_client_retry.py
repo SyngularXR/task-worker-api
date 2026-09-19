@@ -3524,6 +3524,54 @@ def test_retry_after_delay_parses_both_rfc_forms():
     ) is None
 
 
+def test_retry_after_delay_unrepresentable_without_ceiling_is_no_guidance(caplog):
+    """Without a ceiling (every v2 call site) there is nothing to cap an
+    oversized delta-seconds against, and ``float()`` turns it into ``inf``.
+    That is not a wait we can honour — but raising here is fatal where it
+    lands: it escapes admission_supervisor.run's retry loop and host_reporter's
+    except block, and a dead reporter leaves every worker on the host with a
+    stale report. It degrades to the documented 'no usable guidance' answer
+    instead, with one WARNING so the header is still visible."""
+    from task_worker_api.client import _retry_after_delay
+
+    response = httpx.Response(429, headers={"Retry-After": "9" * 400})
+    with caplog.at_level("WARNING"):
+        assert _retry_after_delay(response, maximum_seconds=None) is None
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "Retry-After" in warnings[0]
+    # A ceiling still caps rather than discards — the finite branch is untouched.
+    assert _retry_after_delay(response) == 6 * 60 * 60
+
+
+@pytest.mark.asyncio
+async def test_v2_retries_on_own_schedule_when_retry_after_is_unrepresentable(
+    monkeypatch, caplog,
+):
+    """End to end on the v2 transport (retry_after_max_s=None): a 429 naming a
+    400-digit Retry-After must not abort the call — the retry loop falls back
+    to its exponential schedule, exactly as for an absent header."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "9" * 400})
+
+    client = _client_with_handler(handler, max_retries=3, retry_backoff_s=2.0)
+    with caplog.at_level("WARNING"):
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._resource_request("GET", "/tasks/x")
+    await client.close()
+
+    assert sleeps == [2.0 * 2**0, 2.0 * 2**1]
+    assert sum("Retry-After" in r.getMessage() for r in caplog.records
+               if r.levelname == "WARNING") == 2
+
+
 # -----------------------------------------------------------------------
 # Total retry budget — the per-delay caps bound each sleep in isolation, but
 # they multiply against the attempt budget. A persistently rate-limited

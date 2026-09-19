@@ -234,9 +234,13 @@ def _retry_after_delay(response: httpx.Response, *, maximum_seconds: Optional[in
     defined as a non-negative integer, so ``Retry-After: -5`` is malformed
     input rather than guidance, and falls back to the schedule.
 
-    The header is remote input. Oversized delta-seconds are capped before the
-    conversion to ``float``; malformed dates degrade to our schedule rather
-    than replacing the expected ``HTTPStatusError`` with a parser exception.
+    The header is remote input. Under a ceiling, oversized delta-seconds are
+    capped before the conversion to ``float``; with ``maximum_seconds=None``
+    there is nothing to cap against, so a value too large for a ``float``
+    (thousands of digits) is treated as no usable guidance and falls back to
+    our schedule. Malformed dates degrade the same way, rather than replacing
+    the expected ``HTTPStatusError`` with a parser exception: this parser only
+    ever answers "wait this long" or "no guidance", never raises.
     """
     raw = response.headers.get("retry-after")
     if raw is None:
@@ -253,7 +257,12 @@ def _retry_after_delay(response: httpx.Response, *, maximum_seconds: Optional[in
                 return float(maximum_seconds)
         delay = float(value)
         if not math.isfinite(delay):
-            raise ProtocolError("Retry-After exceeds a representable wait; refusing an early retry")
+            # Only reachable without a ceiling. Raising here would be fatal
+            # where it lands (it escapes the v2 supervisor's retry loop and
+            # the host reporter's except block), and a delay we cannot even
+            # represent is no more usable than a malformed one.
+            log.warning("Retry-After is too large to represent (%d digits); using our own schedule", len(value))
+            return None
         return delay
     try:
         when = parsedate_to_datetime(raw)
