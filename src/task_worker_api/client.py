@@ -7,6 +7,7 @@ the pre-SDK shape — this client consolidates three divergent copies
 """
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import random
@@ -1257,7 +1258,13 @@ class BackendClient:
         try:
             await self._retry(once, method="GET", path=path, retry_after_max_s=None)
         except BaseException:
-            dest.unlink(missing_ok=True)
+            # Unlinking a multi-GB partial on a network-mounted scratch pool
+            # blocks, so it goes off the loop like every other file operation
+            # here — through _to_thread_complete, because this runs on the
+            # cancel path and a bare to_thread would be abandoned by a second
+            # cancel (shutdown landing on a task timeout), leaving behind the
+            # truncated artifact the cleanup exists to remove.
+            await _to_thread_complete(functools.partial(dest.unlink, missing_ok=True))
             raise
 
     async def resource_upload(self, claim, filename, src: Path):
@@ -1666,8 +1673,15 @@ class BackendClient:
             # survives). Remove it so an unfinished download never leaves a
             # truncated/stale artifact behind. FileNotFoundError is an OSError,
             # so the one clause covers the already-absent case too.
+            #
+            # The unlink itself blocks — a multi-GB partial on a network mount
+            # stalls the loop exactly while a failure or a shutdown is being
+            # reported — so it runs off the loop. _to_thread_complete rather
+            # than a bare to_thread because this is the cancel path: a second
+            # cancel (shutdown on top of a task timeout) would abandon the
+            # dispatch and leave the partial behind.
             try:
-                dest.unlink()
+                await _to_thread_complete(dest.unlink)
             except OSError:
                 pass
             raise

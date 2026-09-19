@@ -4150,6 +4150,137 @@ async def test_fail_bounds_pathological_input_on_the_wire(error):
 
 
 # ---------------------------------------------------------------------------
+# Partial-file cleanup runs off the event loop, and survives a second cancel
+#
+# Both download paths unlink the partial destination from ``except
+# BaseException``. Unlinking a multi-GB partial on a network-mounted scratch
+# pool blocks, and it blocks precisely while a failure or a shutdown is being
+# reported — so the unlink is dispatched to a thread. It cannot be a bare
+# ``to_thread``: this runs on the cancel path, and a second cancel (a worker
+# shutdown landing on a task timeout) would abandon the dispatch and leave
+# behind the truncated artifact the cleanup exists to remove.
+# ---------------------------------------------------------------------------
+
+
+async def _download_partial_then_404(client, dest):
+    """Drive ``download_file`` into its cleanup path with a partial at dest."""
+    await client.download_file(5, "scene.ply", dest)
+
+
+async def _resource_download_partial_then_404(client, dest):
+    """Drive ``resource_download`` into its cleanup path with a partial at dest."""
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from task_worker_api.resources import AttemptOwnership, InputArtifact
+
+    artifact = InputArtifact(
+        filename="scene.ply", path="scene.ply", sha256="a" * 64, size_bytes=11,
+    )
+    claim = SimpleNamespace(
+        task_id=1,
+        task=SimpleNamespace(inputs={"scene": artifact}),
+        ownership=AttemptOwnership(
+            worker_instance_id=uuid4(), attempt_id=uuid4(),
+            generation=1, token="t" * 32,
+        ),
+    )
+    await client.resource_download(claim, artifact, dest)
+
+
+_DOWNLOADS = [_download_partial_then_404, _resource_download_partial_then_404]
+
+
+@pytest.mark.parametrize("download", _DOWNLOADS, ids=["v1", "v2"])
+@pytest.mark.asyncio
+async def test_download_unlinks_partial_off_the_event_loop(
+    tmp_path, monkeypatch, download,
+):
+    """The cleanup unlink must not run on the loop thread."""
+    import threading
+    from pathlib import Path
+
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    real_unlink = Path.unlink
+
+    def spy_unlink(self, *args, **kwargs):
+        threads.append(threading.get_ident())
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", spy_unlink)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="not found")
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "out.ply"
+    dest.write_bytes(b"STALE PARTIAL")
+    with pytest.raises(httpx.HTTPStatusError):
+        await download(client, dest)
+    await client.close()
+
+    assert threads, "cleanup never unlinked the partial file"
+    assert loop_thread not in threads, (
+        "unlinking a multi-GB partial on a network mount must not block the "
+        "event loop while a failure is being reported"
+    )
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize("download", _DOWNLOADS, ids=["v1", "v2"])
+@pytest.mark.asyncio
+async def test_download_cleanup_survives_a_second_cancel(
+    tmp_path, monkeypatch, download,
+):
+    """A second cancel landing on the awaiting task must not orphan the unlink.
+
+    The dispatched unlink is held mid-flight while the downloading task is
+    cancelled twice — a worker shutdown arriving on top of a task timeout.
+    A bare ``to_thread`` would be abandoned by the second cancel, leaving the
+    truncated artifact on disk.
+    """
+    import threading
+    from pathlib import Path
+
+    entered = threading.Event()
+    release = threading.Event()
+    removed = threading.Event()
+    real_unlink = Path.unlink
+
+    def slow_unlink(self, *args, **kwargs):
+        entered.set()
+        assert release.wait(2), "test never released the blocked unlink"
+        real_unlink(self, *args, **kwargs)
+        removed.set()
+
+    monkeypatch.setattr(Path, "unlink", slow_unlink)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="not found")
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "out.ply"
+    dest.write_bytes(b"STALE PARTIAL")
+    task = asyncio.create_task(download(client, dest))
+    assert await asyncio.to_thread(entered.wait, 2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()  # shutdown on top of the timeout that is already unwinding
+    await asyncio.sleep(0)
+    assert not removed.is_set()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await client.close()
+
+    assert removed.is_set(), "the second cancel abandoned the partial-file cleanup"
+    assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
 # v2 resource_download — buffered disk writes
 # ---------------------------------------------------------------------------
 
