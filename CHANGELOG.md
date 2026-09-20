@@ -2,6 +2,19 @@
 
 ## 0.19.0.dev47
 
+- Reject an oversized v2 `complete` body before it is journaled. The admitted
+  path pre-checked that a handler result was *encodable* but not that it was
+  *deliverable*: `ClaimJournal.prepare_operation` persists the complete request
+  before transmission and `_resource_replay_operation` replays it forever, so a
+  multi-MB result met a 413 — not a transient status — and the operation never
+  resolved, wedging the worker behind `previous_claim_unresolved` until an
+  operator intervened. The result body is now measured with the same httpx
+  request probe the encodability check uses and capped at 512 KiB, beside that
+  check and inside the try that converts a raise into the `fail` operation — so
+  an oversized result lands as a terminal fail the supervisor can release
+  instead of a durable wedge. `fail` already capped its error for this reason;
+  a result cannot be truncated without lying about the outcome, so it is
+  rejected rather than trimmed. v1 is unchanged.
 - Stop v2 attempt-lease renewal from outliving the lease it renews.
   `AttemptLease._renew` heartbeats through the retried `_resource_request`
   path, which passes `retry_after_max_s=None`, so a single 429 carrying a large
