@@ -14,7 +14,11 @@ import os
 import threading
 import time
 
-from .errors import ProtocolError
+# _await_unless_cancelled is the v1 transfer path's race-and-drain helper: it
+# cancels the loser, drains it so cleanup actually finishes, and raises
+# TaskCancelled. The admitted path needs exactly that around its handler.
+from .client import _await_unless_cancelled
+from .errors import ProtocolError, TaskCancelled
 
 log = logging.getLogger(__name__)
 
@@ -34,11 +38,26 @@ class AttemptLease:
         self._lock = threading.Lock()
         self._closed = threading.Event()
         self._expired = threading.Event()
+        self._lost = asyncio.Event()
+        self._loop = None
         self._deadline = 0.0
         self._execution_deadline = None
         self._started = False
         self._entered = False
         self._active = False
+
+    def _mark_lost(self):
+        """Record that this lease is dead and wake `run`; safe from any thread.
+
+        ``_lost`` is the event-loop mirror of ``_expired``. The handler race in
+        :meth:`run` wakes on the pass the loss is recorded in, ahead of
+        ``_watch``'s 50ms tick, so an interrupted attempt reports the cancel
+        rather than the watchdog's bare owner-task cancel.
+        """
+        self._expired.set()
+        if self._loop is not None:
+            with contextlib.suppress(RuntimeError):  # loop already closed
+                self._loop.call_soon_threadsafe(self._lost.set)
 
     def _accept(self, state, sent):
         if state.task_id != self.claim.task_id or state.attempt_id != self.claim.ownership.attempt_id:
@@ -92,7 +111,7 @@ class AttemptLease:
             with self._lock:
                 expired = time.monotonic() >= self._deadline
                 if expired:
-                    self._expired.set()
+                    self._mark_lost()
             if expired:
                 with contextlib.suppress(RuntimeError):
                     self._loop.call_soon_threadsafe(self._owner.cancel)
@@ -132,7 +151,7 @@ class AttemptLease:
                     self.client.resource_heartbeat(self.claim), allowance), sent)
             except ProtocolError:
                 with self._lock:
-                    self._expired.set()
+                    self._mark_lost()
                     self._deadline = 0
                 return
             except Exception:
@@ -158,7 +177,17 @@ class AttemptLease:
 
     async def run(self, handler, *args):
         self._require_running()
-        result = await handler(*args)
+        # The lease can die *during* the handler — the backend reports the
+        # attempt cancelled, the heartbeat gives up, the deadline lapses — and a
+        # handler parked on an await would otherwise run on until it returns on
+        # its own, hours later, only for the check below to call the stale lease
+        # a protocol error. Race it against the loss instead: the handler runs as
+        # a task, and on loss it is cancelled *and drained*, so its finally /
+        # async with cleanup finishes before TaskCancelled reaches
+        # run_admitted_attempt as the terminal reason. A handler that finished
+        # first still wins the tie and still faces _require_running.
+        result = await _await_unless_cancelled(
+            handler(*args), self._lost, "attempt lease no longer permits work")
         self._require_running()
         return result
 
@@ -168,7 +197,6 @@ class AttemptLease:
 
     def raise_if_cancelled(self):
         if self.is_cancelled:
-            from .errors import TaskCancelled
             raise TaskCancelled("attempt lease no longer permits work")
 
     async def update(self, stage, current=0, total=0):
@@ -177,7 +205,7 @@ class AttemptLease:
             self._accept(await self.client.resource_progress(self.claim,
                 {"stage": stage, "current": current, "total": total}), sent)
         except ProtocolError:
-            self._expired.set()
+            self._mark_lost()
             with self._lock:
                 self._deadline = 0
             raise
