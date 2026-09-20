@@ -14,6 +14,7 @@ Two modes of use:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
 import logging
@@ -1081,6 +1082,43 @@ class Worker:
 
                     await client.resource_operation(journal, "fail", {"error": f"{type(exc).__name__}: {exc}",
                         "failure_kind": "out_of_memory" if is_out_of_memory(exc) else "error"})
+                    raise
+                except BaseException as exc:
+                    # Everything that is not an Exception — in practice
+                    # asyncio.CancelledError, from the supervisor's graceful
+                    # SIGTERM or from AttemptLease._watch cancelling this task
+                    # on lease expiry — skipped the handler above entirely, so
+                    # an interrupted attempt journaled no terminal operation at
+                    # all. The lease is live and acknowledged at that instant:
+                    # the attempt stays ``running`` on the backend holding its
+                    # GPU/RAM/scratch reservation until the sweeper reclaims it
+                    # minutes later, and the restarted worker wedges behind
+                    # ``previous_claim_unresolved`` with nothing for
+                    # resource_recover_operations to replay. Same treatment v1
+                    # already gives an interrupted task (see _run_one): report a
+                    # reason that says *interrupted*, not attempted-and-failed,
+                    # so an operator reading the task row knows no handler ever
+                    # reached a verdict and a retry is worth it.
+                    reason = (
+                        f"attempt for task {claim.task_id} was interrupted by "
+                        f"{type(exc).__name__} before any verdict; the attempt "
+                        "was interrupted, not attempted-and-failed"
+                    )
+                    # One line at WARNING so the worker's own log says an
+                    # interrupt happened; without it the only trace is the
+                    # task row's failure reason.
+                    log.warning("%s", reason)
+                    if not lease.is_cancelled:
+                        # An expired lease means the token is dead and the
+                        # request cannot land, so there is nothing to report.
+                        # Otherwise report, and let nothing that goes wrong
+                        # while reporting mask the cancel we owe our caller —
+                        # the bare raise below re-raises the original either
+                        # way, which is also how CancelledError keeps
+                        # propagating.
+                        with contextlib.suppress(BaseException):
+                            await client.resource_operation(journal, "fail",
+                                {"error": reason, "failure_kind": "error"})
                     raise
                 await client.resource_operation(journal, "complete", {"result": result})
             finally:

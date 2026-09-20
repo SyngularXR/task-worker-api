@@ -93,3 +93,76 @@ async def test_publication_validation_does_not_block_the_event_loop(monkeypatch,
     await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
     assert observed == [True]
     assert client.resource_operation.call_args.args[1] == "complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_cancelled, expected", [(False, ["fail"]), (True, [])])
+async def test_interrupted_attempt_reports_a_terminal_fail(monkeypatch, tmp_path,
+                                                           lease_cancelled, expected):
+    """A cancel is not an Exception: without a report the attempt orphans running."""
+    task = AdmittedTask(id=1, task_type="model_initializing", case_id=None, item_key="mesh",
+                        params=dict(job_id="job", input_path="mesh.stl", base_name="mesh"), inputs={})
+    claim = _admitted_claim(uuid4()).model_copy(update={
+        "task": task, "profile": cpu_profile(profile_id="p", task_type=task.task_type),
+        "input_digest": input_snapshot_digest(task), "state": "reserved"})
+    journal = SimpleNamespace(pending=lambda: ("claim", {"claim": claim.model_dump(mode="json")}))
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+
+    class Lease:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def start(self, report, digest): pass
+        async def run(self, handler, ctx, params): return await handler(ctx, params)
+        is_cancelled = lease_cancelled
+
+    async def handler(ctx, params):
+        raise asyncio.CancelledError
+
+    client = FakeBackendClient()
+    client.resource_operation = AsyncMock()
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", Lease)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", AsyncMock(return_value=files))
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=client,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
+    assert [c.args[1] for c in client.resource_operation.call_args_list] == expected
+    if expected:
+        payload = client.resource_operation.call_args.args[2]
+        assert "interrupted" in payload["error"] and payload["failure_kind"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_interrupt_report_never_masks_the_cancel(monkeypatch, tmp_path):
+    task = AdmittedTask(id=1, task_type="model_initializing", case_id=None, item_key="mesh",
+                        params=dict(job_id="job", input_path="mesh.stl", base_name="mesh"), inputs={})
+    claim = _admitted_claim(uuid4()).model_copy(update={
+        "task": task, "profile": cpu_profile(profile_id="p", task_type=task.task_type),
+        "input_digest": input_snapshot_digest(task), "state": "reserved"})
+    journal = SimpleNamespace(pending=lambda: ("claim", {"claim": claim.model_dump(mode="json")}))
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+
+    class Lease:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def start(self, report, digest): pass
+        async def run(self, handler, ctx, params): return await handler(ctx, params)
+        is_cancelled = False
+
+    async def handler(ctx, params):
+        raise asyncio.CancelledError
+
+    client = FakeBackendClient()
+    client.resource_operation = AsyncMock(side_effect=RuntimeError("backend down"))
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", Lease)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", AsyncMock(return_value=files))
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=client,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
