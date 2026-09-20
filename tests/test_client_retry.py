@@ -23,6 +23,7 @@ import pytest
 
 from task_worker_api.client import (
     _DOWNLOAD_CHUNK_BYTES,
+    _HEARTBEAT_RETRY_AFTER_MAX_S,
     _MAX_FAIL_ERROR_BYTES,
     _UPLOAD_CHUNK_BYTES,
     BackendClient,
@@ -3463,6 +3464,73 @@ async def test_terminal_report_waits_out_rate_limit_window(monkeypatch):
 
     assert calls["n"] == 3
     assert sleeps == [20.0, 20.0]
+
+
+# The backend's stale-task sweeper reclaims a task whose ``updated_at`` has not
+# moved for its minimum threshold — five minutes. The periodic heartbeat is the
+# only thing that moves it, so a Retry-After long enough to park the heartbeat
+# loop hands a live worker's task to a second worker, which recomputes and
+# republishes the same outcome.
+_MIN_STALE_THRESHOLD_S = 5 * 60
+
+
+@pytest.mark.asyncio
+async def test_periodic_heartbeat_caps_retry_after(monkeypatch):
+    """A 429 naming an hour-long window must not park the heartbeat for it."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, headers={"Retry-After": "3600"}, text="Too Many Requests",
+        )
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.report_progress(7, stage="rendering", current=1, total=10)
+    await client.close()
+
+    assert sleeps == [_HEARTBEAT_RETRY_AFTER_MAX_S] * 3
+    # Not merely each sleep: the whole default retry chain has to finish
+    # inside the sweeper's window, or the cap buys nothing.
+    assert sum(sleeps) < _MIN_STALE_THRESHOLD_S
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_keeps_full_retry_after_ceiling(monkeypatch):
+    """The same response on complete() still waits the window out — nothing
+    else will ever re-send a terminal report."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, headers={"Retry-After": "3600"}, text="Too Many Requests",
+        )
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.complete(7, {"output": "done"})
+    await client.close()
+
+    assert sleeps and set(sleeps) == {3600.0}
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_cap_does_not_lengthen_a_short_retry_after(monkeypatch):
+    """The cap is a ceiling, not a replacement: guidance under it is kept."""
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "5"}, text="slow")
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    await client.report_progress(7, stage="rendering")
+    await client.close()
+
+    assert sleeps == [5.0]
 
 
 @pytest.mark.asyncio
