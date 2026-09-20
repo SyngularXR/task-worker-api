@@ -434,8 +434,17 @@ def _require_foreign_capable(task: ClaimedTask) -> None:
         )
 
 
-async def prepare_admitted_inputs(claim, client: "BackendClient", work_root: Path) -> FileContext:
-    """Stage a fresh attempt exclusively from its immutable backend manifest."""
+async def prepare_admitted_inputs(
+    claim, client: "BackendClient", work_root: Path,
+    *,
+    cancelled: Optional[asyncio.Event] = None,
+) -> FileContext:
+    """Stage a fresh attempt exclusively from its immutable backend manifest.
+
+    ``cancelled`` is the attempt lease's loss event, threaded into each
+    download so a retired lease aborts the transfer in flight instead of only
+    between files — same contract ``prepare_inputs`` has with a cancel guard.
+    """
     from .resources import input_snapshot_digest
 
     if input_snapshot_digest(claim.task) != claim.input_digest:
@@ -462,7 +471,7 @@ async def prepare_admitted_inputs(claim, client: "BackendClient", work_root: Pat
     for key, artifact in claim.task.inputs.items():
         destination = inputs.joinpath(*artifact.path.split("/"))
         await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
-        await client.resource_download(claim, artifact, destination)
+        await client.resource_download(claim, artifact, destination, cancelled=cancelled)
         paths[key] = destination
     primary = paths.get("mesh", next(iter(paths.values()), inputs))
     return FileContext(input_dir=inputs, output_dir=outputs, primary_path=primary, all_paths=paths)

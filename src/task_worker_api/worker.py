@@ -1088,7 +1088,7 @@ class Worker:
                     task = ClaimedTask.from_claim(claim)
                     params = TASK_PARAMS_SCHEMAS[task.task_type](**task.params)
                     handler = self.handlers[task.task_type]
-                    files = await prepare_admitted_inputs(claim, client, self.work_dir)
+                    files = await prepare_admitted_inputs(claim, client, self.work_dir, cancelled=lease.lost)
                     await lease.start(await read_report(), claim.input_digest)
                     started = True
                     result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease,
@@ -1109,7 +1109,7 @@ class Worker:
                     # heartbeat whose deadline is only ~30s from a hard exit.
                     sources = await asyncio.to_thread(_require_output_sources, files.output_dir, names)
                     for filename, source in sources.values():
-                        await client.resource_upload(claim, filename, source)
+                        await client.resource_upload(claim, filename, source, cancelled=lease.lost)
                 except Exception as exc:
                     # Only pre-publication failure selects fail. Once a terminal
                     # request is transmitted, its durable operation alone is replayed.

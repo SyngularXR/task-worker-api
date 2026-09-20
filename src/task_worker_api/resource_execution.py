@@ -192,6 +192,17 @@ class AttemptLease:
         return result
 
     @property
+    def lost(self):
+        """Event-loop signal that this lease is dead; set once, never cleared.
+
+        Handed to the bulk transfers on either side of :meth:`run` so staging
+        and publication race their in-flight request against the loss exactly
+        as ``run`` races the handler, rather than streaming multi-GB artifacts
+        on a token the backend has already retired.
+        """
+        return self._lost
+
+    @property
     def is_cancelled(self):
         return self._expired.is_set() or self._closed.is_set() or time.monotonic() >= self._deadline
 
