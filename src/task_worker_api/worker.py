@@ -1067,7 +1067,12 @@ class Worker:
                     if _result_encode_error(result) is not None:
                         raise ProtocolError("handler result cannot be encoded")
                     names = _require_safe_filenames(result.get("output_files") or {}, field="output_files")
-                    for filename, source in _require_output_sources(files.output_dir, names).values():
+                    # Same off-loop dispatch as the v1 publish path: the walk is one
+                    # ``resolve(strict=True)`` + ``lstat`` per declared output against
+                    # the scratch pool, and stalling it here would freeze the lease
+                    # heartbeat whose deadline is only ~30s from a hard exit.
+                    sources = await asyncio.to_thread(_require_output_sources, files.output_dir, names)
+                    for filename, source in sources.values():
                         await client.resource_upload(claim, filename, source)
                 except Exception as exc:
                     # Only pre-publication failure selects fail. Once a terminal
