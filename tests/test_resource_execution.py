@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from task_worker_api.errors import ProtocolError
+from task_worker_api.errors import ProtocolError, TaskCancelled
 from task_worker_api.resource_execution import AttemptLease
 from task_worker_api.resource_protocol import AttemptState
 
@@ -133,28 +133,60 @@ async def test_delayed_or_wrong_attempt_response_cannot_extend_lease():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("revoked", [False, True])
-async def test_heartbeat_failure_cannot_keep_work_alive(revoked):
+@pytest.mark.parametrize("loss", ["revoked", "unworkable", "parks"])
+async def test_lease_loss_interrupts_the_running_handler(loss):
+    """A lease lost mid-handler must interrupt the handler, not be noticed after
+    it returns.
+
+    ``_accept`` marks the lease dead the instant the backend reports the attempt
+    cancelled (``revoked``) or in a state no longer workable (``unworkable``),
+    and the acknowledged deadline lapses under a heartbeat that never answers
+    (``parks``). A handler parked on an await would otherwise run to the end of
+    a job the backend gave up on hours earlier, and the post-run check would
+    then call the dead lease a generic protocol error. It is cancelled and
+    *drained* instead — so its ``finally`` cleanup still runs — and the reason
+    that reaches the caller says cancelled.
+
+    Asserted on elapsed time for the two reported losses: landing inside the
+    heartbeat interval is what separates interrupting the handler from waiting
+    out the whole 5.2s lease and being cancelled by the watchdog.
+    """
     client = Client(lease_seconds=5.2)
     renewed = asyncio.Event()
     exited = threading.Event()
+    cleaned = threading.Event()
 
     async def heartbeat(claim):
         renewed.set()
-        if revoked:
+        if loss == "revoked":
             return client.response().model_copy(update={"cancelled": True})
+        if loss == "unworkable":
+            return client.response().model_copy(update={"state": "failed"})
         await asyncio.Future()  # transport retry never returns
 
     client.resource_heartbeat = heartbeat
 
+    async def compute():
+        try:
+            await asyncio.Event().wait()  # a handler parked on an await, forever
+        finally:
+            cleaned.set()
+
     async def work():
         async with AttemptLease(client, None, client.claim, on_hard_exit=exited.set) as lease:
             await lease.start(None, "staged-inputs")
-            await lease.run(asyncio.Event().wait)
+            await lease.run(compute)
 
     task = asyncio.create_task(work())
-    with pytest.raises(asyncio.CancelledError):
+    started = time.monotonic()
+    # The lapsed deadline is the watchdog's own cancel of the owner task, which
+    # can land before run sees the loss; either way the handler stops here.
+    expected = asyncio.CancelledError if loss == "parks" else TaskCancelled
+    with pytest.raises(expected):
         await asyncio.wait_for(task, 7)
+    assert cleaned.is_set(), "the handler was abandoned without running its cleanup"
+    if loss != "parks":
+        assert time.monotonic() - started < 4, "the handler outlived the lease it lost"
     assert renewed.is_set() and not exited.is_set()
 
 
