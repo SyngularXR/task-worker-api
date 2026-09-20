@@ -2,6 +2,19 @@
 
 ## 0.19.0.dev47
 
+- Enforce attempt identity on every v2 `AttemptState`, not only on the
+  journal-replayed operations. `_resource_replay_operation` rejected a state
+  whose `attempt_id`/`task_id` did not match the claim, but the sibling paths
+  that parse the same model — `resource_status` (the cancel poll behind
+  CancelGuard), `resource_heartbeat` (lease renewal) and `resource_progress`
+  (`AttemptLease.update`) — returned it as-is, so a stale, mis-routed or
+  backend-confused state drove a real decision: a foreign `cancelled` flag
+  killed a healthy in-flight task, and a foreign non-cancelled state masked a
+  genuine cancel or renewed a lease this worker no longer owned. All four call
+  sites now go through one `BackendClient._resource_state` helper that parses
+  and verifies the state, raising the existing `ProtocolError` — which
+  `AttemptLease` already acts on by expiring the lease — on mismatch. The
+  replayed operation's message and journal behaviour are unchanged.
 - Reject an oversized v2 `complete` body before it is journaled. The admitted
   path pre-checked that a handler result was *encodable* but not that it was
   *deliverable*: `ClaimJournal.prepare_operation` persists the complete request
