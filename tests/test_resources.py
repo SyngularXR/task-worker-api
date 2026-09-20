@@ -454,3 +454,85 @@ async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sl
 
     assert len(sent) == 2 and state.attempt_id == claim.ownership.attempt_id
     assert no_blocking_sleep, "heartbeat keeps its backoff"
+
+
+# ---------------------------------------------------------------------------
+# v2 attempt identity — every AttemptState, not only the journalled ones
+# ---------------------------------------------------------------------------
+
+
+async def _call(backend, name, claim):
+    if name == "resource_progress":
+        return await backend.resource_progress(claim, {"stage": "compute"})
+    return await getattr(backend, name)(claim)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["resource_status", "resource_heartbeat", "resource_progress"])
+@pytest.mark.parametrize("foreign", [{"attempt_id": str(uuid4())}, {"task_id": 2}])
+async def test_v2_state_for_another_attempt_is_refused_on_every_path(name, foreign, no_blocking_sleep):
+    """The cancel poll, the lease renewal and the progress update all act on the
+    state they are handed: a foreign ``cancelled`` kills a healthy attempt, and a
+    foreign clean state masks a real cancel or renews a lease this worker no
+    longer owns. Only the journalled operations used to check."""
+    from task_worker_api.errors import ProtocolError
+
+    claim = _admitted_claim(uuid4())
+
+    def handle(request):
+        return httpx.Response(200, json={**_running_state(claim), **foreign, "cancelled": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        with pytest.raises(ProtocolError, match="another attempt"):
+            await _call(backend, name, claim)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["resource_status", "resource_heartbeat", "resource_progress"])
+async def test_v2_state_for_this_attempt_is_returned_unchanged(name):
+    claim = _admitted_claim(uuid4())
+
+    async with httpx.AsyncClient(base_url="http://test",
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, json=_running_state(claim)))) as client:
+        state = await _call(BackendClient("http://test", "test", client=client), name, claim)
+
+    assert state.attempt_id == claim.ownership.attempt_id and state.task_id == claim.task_id
+    assert state.state == "running" and state.cancelled is False
+
+
+@pytest.mark.asyncio
+async def test_v2_foreign_progress_state_expires_the_lease():
+    """ProtocolError is the signal ``AttemptLease`` acts on; anything else is
+    swallowed by its generic handler and the worker keeps executing."""
+    import time
+    from task_worker_api.errors import ProtocolError
+    from task_worker_api.resource_execution import AttemptLease
+
+    claim = _admitted_claim(uuid4())
+
+    async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={**_running_state(claim), "attempt_id": str(uuid4())}))) as client:
+        lease = AttemptLease(BackendClient("http://test", "test", client=client), None, claim)
+        lease._deadline = time.monotonic() + 60
+        with pytest.raises(ProtocolError):
+            await lease.update("compute")
+
+    assert lease.is_cancelled
+
+
+@pytest.mark.asyncio
+async def test_v2_replayed_operation_keeps_its_own_rejection(tmp_path):
+    """The journalled path's message and behaviour are unchanged: a foreign
+    state is refused before it is recorded, so the operation stays unresolved."""
+    from task_worker_api.errors import ProtocolError
+
+    journal, claim = _admitted_journal(tmp_path, uuid4())
+
+    async with httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={**_running_state(claim), "task_id": 2}))) as client:
+        backend = BackendClient("http://test", "test", client=client)
+        with pytest.raises(ProtocolError, match="operation response belongs to another attempt"):
+            await backend.resource_operation(journal, "start", {})
+
+    assert [k for k, _ in journal.unresolved_operations()] == ["start"]

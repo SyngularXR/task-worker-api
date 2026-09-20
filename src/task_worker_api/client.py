@@ -1144,8 +1144,6 @@ class BackendClient:
         return states
 
     async def _resource_replay_operation(self, journal, claim, kind, operation_id):
-        from .resource_protocol import AttemptState
-
         body = journal.operation_request(kind, operation_id)
         # Terminal reports retry harder here for the same reason v1's
         # complete/fail do (see :meth:`complete`), and the cost of not doing so
@@ -1173,10 +1171,25 @@ class BackendClient:
                 if code in ("hardware_report_stale", "hardware_report_replayed", "cleanup_evidence_stale"):
                     journal.record_operation(kind, operation_id, {"rejected": code})
             raise
+        state = self._resource_state(claim, response, "operation response")
+        journal.record_operation(kind, operation_id, state.model_dump(mode="json"))
+        return state
+
+    def _resource_state(self, claim, response, what="response"):
+        """Parse an AttemptState and refuse one that is not this attempt's.
+
+        Every v2 state drives a real decision, so identity is checked here for
+        every path that parses the model rather than only on the journalled
+        ones: a stale or mis-routed ``cancelled`` flag kills a healthy
+        in-flight task, and a foreign non-cancelled state masks a genuine
+        cancel or renews a lease this worker no longer owns. ProtocolError is
+        what makes ``AttemptLease`` expire the lease instead of carrying on.
+        """
+        from .resource_protocol import AttemptState
+
         state = AttemptState.model_validate(response.json())
         if state.attempt_id != claim.ownership.attempt_id or state.task_id != claim.task_id:
-            raise ProtocolError("operation response belongs to another attempt")
-        journal.record_operation(kind, operation_id, state.model_dump(mode="json"))
+            raise ProtocolError(f"{what} belongs to another attempt")
         return state
 
     async def resource_progress(self, claim, progress):
@@ -1200,26 +1213,20 @@ class BackendClient:
         swallowing the error in its generic handler and letting the worker keep
         executing an attempt the backend no longer honours.
         """
-        from .resource_protocol import AttemptState
-
         response = await self._resource_request_once("PUT", f"/tasks/{claim.task_id}/progress", timeout=5,
             json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
-        return AttemptState.model_validate(response.json())
+        return self._resource_state(claim, response)
 
     async def resource_status(self, claim):
-        from .resource_protocol import AttemptState
-
         params = claim.ownership.model_dump(mode="json", exclude={"token"})
         response = await self._resource_request("GET", f"/tasks/{claim.task_id}/cancel-status",
                                                 params=params, headers={"X-Attempt-Token": claim.ownership.token})
-        return AttemptState.model_validate(response.json())
+        return self._resource_state(claim, response)
 
     async def resource_heartbeat(self, claim):
-        from .resource_protocol import AttemptState
-
         response = await self._resource_request("POST", "/workers/heartbeat", params={"task_id": claim.task_id},
                                                 json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json")})
-        return AttemptState.model_validate(response.json())
+        return self._resource_state(claim, response)
 
     async def resource_ready(self, journal, worker_instance_id):
         from .resources import AdmissionError
