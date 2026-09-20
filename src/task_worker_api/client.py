@@ -94,6 +94,17 @@ _DEFAULT_BACKOFF_MAX_S = 60.0
 # accepting an effectively infinite sleep.
 _MAX_RETRY_AFTER_S = 6 * 60 * 60
 
+# Ceiling on ``Retry-After`` for the *periodic* v1 heartbeat. A periodic call
+# gains nothing by waiting out a rate-limit window: the next tick re-sends the
+# same state, so the only thing honouring the window buys is a frozen
+# ``updated_at`` — which is exactly what the backend's stale-task sweeper
+# reclaims and re-queues, handing the task to a second worker that recomputes
+# and republishes the same outcome. Terminal reports (complete/fail) keep the
+# six-hour ceiling: nothing else will ever re-send them. ``int`` because
+# ``_retry_after_delay`` compares delta-seconds as decimal *text* against
+# ``str(maximum_seconds)``, which a float's ``.0`` suffix would corrupt.
+_HEARTBEAT_RETRY_AFTER_MAX_S = int(_DEFAULT_BACKOFF_MAX_S)
+
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
 # band — enough to decorrelate the fleet (Neural-Canvas, Blender-CLI,
@@ -997,6 +1008,7 @@ class BackendClient:
         *,
         extra_transient: frozenset = frozenset(),
         attempts: Optional[int] = None,
+        retry_after_max_s: Optional[int] = _MAX_RETRY_AFTER_S,
         **kwargs,
     ) -> httpx.Response:
         """Request with exponential-backoff retry on transient errors.
@@ -1006,9 +1018,10 @@ class BackendClient:
         errors surface immediately. Uses no third-party retry library to keep
         SDK dependencies minimal.
 
-        ``extra_transient`` / ``attempts`` are forwarded to :meth:`_retry`
-        (terminal reports widen the transient set to include 500 and raise
-        the attempt budget); all other kwargs go to httpx.
+        ``extra_transient`` / ``attempts`` / ``retry_after_max_s`` are
+        forwarded to :meth:`_retry` (terminal reports widen the transient set
+        to include 500 and raise the attempt budget; the periodic heartbeat
+        lowers the ``Retry-After`` ceiling); all other kwargs go to httpx.
 
         ``raise_for_status()`` runs *inside* the retry closure so a transient
         5xx is seen by ``_retry`` and retried. ``claim_next`` does not use this
@@ -1024,6 +1037,7 @@ class BackendClient:
         return await self._retry(
             _do_request, method=method, path=path,
             extra_transient=extra_transient, attempts=attempts,
+            retry_after_max_s=retry_after_max_s,
         )
 
     # ----- task lifecycle --------------------------------------------
@@ -1399,12 +1413,23 @@ class BackendClient:
         so the polling loop stays responsive and the next heartbeat fires on
         schedule, rather than blocking the worker for up to 120s (30s × 4
         retries) on a single slow progress call.
+
+        A 429's ``Retry-After`` is capped at ``_HEARTBEAT_RETRY_AFTER_MAX_S``
+        (60s) here for the same reason: this is the call
+        :meth:`ProgressReporter._heartbeat_loop
+        <task_worker_api.progress.ProgressReporter._heartbeat_loop>` makes on
+        a timer, and parking it for the window a rate-limited backend names
+        would freeze ``updated_at`` long enough for the stale-task sweeper to
+        reclaim a task whose worker is demonstrably alive. Re-sending the same
+        state a minute later costs one request; losing the task to a second
+        worker costs the whole attempt. Terminal reports keep the full ceiling.
         """
         resp = await self._request(
             "PUT", f"/tasks/{task_id}/progress",
             json=_progress_body(stage, current, total, kill_handle),
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
+            retry_after_max_s=_HEARTBEAT_RETRY_AFTER_MAX_S,
         )
         return resp.json() or {}
 
