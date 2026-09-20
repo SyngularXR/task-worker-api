@@ -2,6 +2,22 @@
 
 ## 0.19.0.dev47
 
+- Interrupt the running v2 handler when the backend cancels the attempt or the
+  lease is lost. `AttemptLease._accept` already marked the lease dead the
+  moment the backend reported the attempt cancelled or in a non-workable state,
+  and the heartbeat did the same when it gave up — but `AttemptLease.run` just
+  awaited the handler and only re-checked the lease *after* it returned, so a
+  handler parked on an await ran to the end of a job the backend had abandoned
+  hours earlier, and the cancel then surfaced as a generic
+  `ProtocolError("execution requires a live acknowledged start")`. The handler
+  now runs as a task raced against that loss, through the same
+  `_await_unless_cancelled` helper v1 file transfers use: on loss it is
+  cancelled *and drained*, so its `finally`/`async with` cleanup still runs,
+  and `TaskCancelled` reaches `run_admitted_attempt` — which reports an honest
+  terminal reason instead of a misleading protocol error. A handler that
+  finished first still wins the tie and still faces the post-run check, so
+  uncancelled attempts are unchanged. v1 already had this treatment
+  (`CancelGuard` interrupts its guarded block).
 - Enforce attempt identity on every v2 `AttemptState`, not only on the
   journal-replayed operations. `_resource_replay_operation` rejected a state
   whose `attempt_id`/`task_id` did not match the claim, but the sibling paths
