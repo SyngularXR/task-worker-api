@@ -2,6 +2,20 @@
 
 ## 0.19.0.dev47
 
+- Never journal a terminal `fail` for a v2 attempt that cannot be failed. The
+  admitted path's `except Exception` arm reported one unconditionally, but
+  `TaskCancelled` — what a lost lease raises out of staging, the handler race
+  and publication — is an ordinary `Exception`, so it landed there too: before
+  `start` is acknowledged the attempt is still `reserved`, whose resolution is
+  the supervisor's `decline`, and after the token is retired nothing can land
+  at all. `resource_operation` journals the request before transmitting it, so
+  the backend's rejection was not the end of it: recovery replayed a rejected
+  operation, raised, and wedged the worker behind `previous_claim_unresolved`
+  ahead of the decline and the release behind it. The fail arm now applies the
+  same `started and not lease.is_cancelled` rule the interrupt arm already
+  applies (it holds for every exception, not only a cancel) and logs one
+  WARNING when it defers to reconciliation. A handler failure on a live,
+  started attempt still reports fail exactly as before.
 - Race the v2 admitted path's bulk transfers against the attempt lease being
   lost. `AttemptLease.run` already interrupts the handler the moment the lease
   dies, but the two slowest phases around it were unguarded:

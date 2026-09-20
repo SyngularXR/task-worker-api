@@ -1113,6 +1113,32 @@ class Worker:
                 except Exception as exc:
                     # Only pre-publication failure selects fail. Once a terminal
                     # request is transmitted, its durable operation alone is replayed.
+                    # And only a *started* attempt whose lease is still live may be
+                    # failed at all — the same rule the interrupt arm below states,
+                    # which holds for every exception and not just a cancel. Lease
+                    # loss reaches here as ``TaskCancelled``, an ordinary
+                    # ``Exception``: staging raises it before ``start`` is
+                    # acknowledged, where the attempt is still ``reserved`` and the
+                    # resolution is the supervisor's ``decline``, and publication
+                    # raises it after the token was retired, where nothing can land.
+                    # The backend's rejection is not the end of an invalid fail:
+                    # resource_operation journals the request before transmitting
+                    # it, so recovery replays a rejected operation, raises, and
+                    # wedges the worker behind ``previous_claim_unresolved``
+                    # instead of reaching that decline and the release behind it.
+                    lost = lease.is_cancelled
+                    if not started or lost:
+                        # One line at WARNING for the same reason the interrupt arm
+                        # logs one: otherwise the only trace is an attempt the
+                        # supervisor resolves with no worker-side explanation.
+                        log.warning(
+                            "attempt for task %s raised %s: %s, but %s, so the terminal "
+                            "operation belongs to supervisor reconciliation",
+                            claim.task_id, type(exc).__name__, exc,
+                            "the attempt lease is no longer live" if lost
+                            else "start was never acknowledged",
+                        )
+                        raise
                     from .resources import is_out_of_memory
 
                     await client.resource_operation(journal, "fail", {"error": f"{type(exc).__name__}: {exc}",
