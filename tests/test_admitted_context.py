@@ -98,10 +98,20 @@ async def test_publication_validation_does_not_block_the_event_loop(monkeypatch,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lease_cancelled, expected", [(False, ["fail"]), (True, [])])
-async def test_interrupted_attempt_reports_a_terminal_fail(monkeypatch, tmp_path,
-                                                           lease_cancelled, expected):
-    """A cancel is not an Exception: without a report the attempt orphans running."""
+@pytest.mark.parametrize("interrupt_staging, lease_cancelled, expected", [
+    # Interrupted after start: the attempt is running and owes a verdict.
+    (False, False, ["fail"]),
+    # Expired lease: the token is dead, so no report can land.
+    (False, True, []),
+    # Interrupted while inputs stage, before start: the attempt is still
+    # reserved, where the resolution is the supervisor's decline. A fail
+    # journaled here is replayed by recovery, rejected, and aborts it before
+    # that decline.
+    (True, False, []),
+])
+async def test_interrupted_attempt_reports_a_terminal_fail_only_after_start(
+        monkeypatch, tmp_path, interrupt_staging, lease_cancelled, expected):
+    """A cancel is not an Exception: without a report a running attempt orphans."""
     task = AdmittedTask(id=1, task_type="model_initializing", case_id=None, item_key="mesh",
                         params=dict(job_id="job", input_path="mesh.stl", base_name="mesh"), inputs={})
     claim = _admitted_claim(uuid4()).model_copy(update={
@@ -121,11 +131,16 @@ async def test_interrupted_attempt_reports_a_terminal_fail(monkeypatch, tmp_path
     async def handler(ctx, params):
         raise asyncio.CancelledError
 
+    async def stage(*args):
+        if interrupt_staging:
+            raise asyncio.CancelledError
+        return files
+
     client = FakeBackendClient()
     client.resource_operation = AsyncMock()
     monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
     monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", Lease)
-    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", AsyncMock(return_value=files))
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", stage)
     monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
     worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=client,
                     work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})

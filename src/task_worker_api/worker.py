@@ -1083,12 +1083,14 @@ class Worker:
         async with AttemptLease(client, journal, claim, grace_s=self.timeout_grace_s,
                                 on_hard_exit=self._on_hard_exit) as lease:
             try:
+                started = False
                 try:
                     task = ClaimedTask.from_claim(claim)
                     params = TASK_PARAMS_SCHEMAS[task.task_type](**task.params)
                     handler = self.handlers[task.task_type]
                     files = await prepare_admitted_inputs(claim, client, self.work_dir)
                     await lease.start(await read_report(), claim.input_digest)
+                    started = True
                     result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease,
                                                                  profile=claim.profile), params)
                     result = result or {}
@@ -1141,7 +1143,21 @@ class Worker:
                     # interrupt happened; without it the only trace is the
                     # task row's failure reason.
                     log.warning("%s", reason)
-                    if not lease.is_cancelled:
+                    if started and not lease.is_cancelled:
+                        # Only a started attempt may be failed. Until ``start``
+                        # is acknowledged — staging inputs is the slow stretch
+                        # ahead of it — the attempt is still ``reserved``, the
+                        # state whose resolution is a ``decline`` and whose
+                        # decline belongs to supervisor reconciliation (see
+                        # admission_supervisor). A ``fail`` journaled here is
+                        # durable, so the backend's rejection is not the end of
+                        # it: resource_recover_operations replays the request,
+                        # raises on the rejection, and aborts recovery before
+                        # it reaches that decline and the release behind it —
+                        # the reservation this handler exists to free is held
+                        # instead. A pre-start interrupt leaves no terminal
+                        # operation for exactly that reason.
+                        #
                         # An expired lease means the token is dead and the
                         # request cannot land, so there is nothing to report.
                         # Otherwise report, and let nothing that goes wrong
