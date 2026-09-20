@@ -1115,8 +1115,20 @@ class Worker:
                     # request is transmitted, its durable operation alone is replayed.
                     from .resources import is_out_of_memory
 
-                    await client.resource_operation(journal, "fail", {"error": f"{type(exc).__name__}: {exc}",
-                        "failure_kind": "out_of_memory" if is_out_of_memory(exc) else "error"})
+                    if started and not lease.is_cancelled:
+                        # Same invariant the interrupt branch below enforces:
+                        # only a ``started`` attempt may be failed. Staging
+                        # inputs, an unknown task type and params validation all
+                        # raise here while the attempt is still ``reserved``,
+                        # whose resolution is a ``decline`` that belongs to
+                        # supervisor reconciliation. Journaling a ``fail`` for
+                        # one is durable, so the backend's rejection wedges
+                        # resource_recover_operations before it reaches that
+                        # decline and the release behind it, holding the very
+                        # reservation this path exists to free. An expired lease
+                        # means the token is dead and the report cannot land.
+                        await client.resource_operation(journal, "fail", {"error": f"{type(exc).__name__}: {exc}",
+                            "failure_kind": "out_of_memory" if is_out_of_memory(exc) else "error"})
                     raise
                 except BaseException as exc:
                     # Everything that is not an Exception — in practice
