@@ -503,6 +503,33 @@ def _result_encode_error(result: object) -> Optional[str]:
     return None if exc is None else f"{type(exc).__name__}: {exc}"
 
 
+# Cap on the serialized v2 ``complete`` body, the deliverability half of the
+# encodability check above. Same wire constraint (and same rationale) as
+# ``client._MAX_FAIL_ERROR_BYTES``, but it bites harder on the admitted path:
+# ``ClaimJournal.prepare_operation`` persists the complete request *before* it
+# is transmitted and ``_resource_replay_operation`` replays it forever, so a
+# body nginx rejects with 413 — not a transient status — is an operation that
+# never resolves, and the worker wedges behind ``previous_claim_unresolved``
+# until an operator intervenes. ``fail`` truncates to stay deliverable; a
+# result cannot be truncated without lying about the outcome, so an oversized
+# one becomes a terminal fail the supervisor can release. 512 KiB is far above
+# any real result dict and still half of nginx's 1 MB default body limit.
+_MAX_RESULT_BODY_BYTES = 512 * 1024
+
+
+def _result_body_bytes(result: object) -> int:
+    """Exact size of the ``complete`` body httpx will put on the wire.
+
+    Asks httpx itself, for the same reason as :func:`_result_encode_exc` and
+    ``client._fail_body_bytes``: the encoder's flags moved across the declared
+    httpx range, so a re-implementation here drifts from the installed encoder.
+    ``result`` must already be encodable.
+    """
+    return len(httpx.Request(
+        "PUT", "http://encode-check.invalid/", json={"result": result},
+    ).content)
+
+
 class Worker:
     """Glues everything together. One instance per worker process.
 
@@ -1066,6 +1093,12 @@ class Worker:
                     result = result or {}
                     if _result_encode_error(result) is not None:
                         raise ProtocolError("handler result cannot be encoded")
+                    size = _result_body_bytes(result)
+                    if size > _MAX_RESULT_BODY_BYTES:
+                        raise ProtocolError(
+                            f"handler result serializes to {size} bytes, over the "
+                            f"{_MAX_RESULT_BODY_BYTES}-byte complete limit"
+                        )
                     names = _require_safe_filenames(result.get("output_files") or {}, field="output_files")
                     # Same off-loop dispatch as the v1 publish path: the walk is one
                     # ``resolve(strict=True)`` + ``lstat`` per declared output against
