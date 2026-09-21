@@ -2,6 +2,19 @@
 
 ## 0.19.0.dev47
 
+- De-duplicate v2 attempt outputs by filename during publication. A handler
+  manifest may alias one artifact under two keys (`{"scene": "model.ply",
+  "warm_start": "model.ply"}`), the shape v1's `upload_outputs` explicitly
+  supports on both its remote and shared-volume branches, but
+  `Worker.run_admitted_attempt` PUT every entry of `_require_output_sources`:
+  the same multi-GB file streamed twice to the attempt's output endpoint. That
+  endpoint is an immutable attempt output, so the second PUT either burned a
+  full duplicate transfer or was rejected non-transiently, failing an attempt
+  whose handler had already succeeded and whose GPU work was done. The
+  publication loop now skips a filename it has already uploaded, matching the
+  `uploaded`/`copied` guards both v1 branches use, so the aliasing contract
+  holds on both protocol paths; the completed result still carries every key.
+
 - Bound the serialized `complete` body on the v1 terminal path too, not just
   its encodability. `Worker._run_one` pre-checked the handler result with
   `_result_encode_error` and converted an unencodable one into a terminal

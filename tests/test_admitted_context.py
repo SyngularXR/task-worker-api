@@ -472,3 +472,52 @@ async def test_lease_loss_never_journals_a_fail_for_an_unfailable_attempt(
         await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
 
     assert [c.args[1] for c in client.resource_operation.call_args_list] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_files, expected", [
+    # v1's upload_outputs documents aliasing one artifact under two keys; the
+    # v2 attempt-output endpoint is immutable, so the second PUT of the same
+    # filename either burns a duplicate multi-GB transfer or is rejected.
+    ({"scene": "model.ply", "warm_start": "model.ply"}, ["model.ply"]),
+    ({"scene": "model.ply", "preview": "preview.png"}, ["model.ply", "preview.png"]),
+])
+async def test_aliased_outputs_publish_one_stream_per_file(
+        monkeypatch, tmp_path, output_files, expected):
+    """Two keys pointing at one file upload it once, and both keys still complete."""
+    task = AdmittedTask(id=1, task_type="model_initializing", case_id=None, item_key="mesh",
+                        params=dict(job_id="job", input_path="mesh.stl", base_name="mesh"), inputs={})
+    claim = _admitted_claim(uuid4()).model_copy(update={
+        "task": task, "profile": cpu_profile(profile_id="p", task_type=task.task_type),
+        "input_digest": input_snapshot_digest(task), "state": "reserved"})
+    journal = SimpleNamespace(pending=lambda: ("claim", {"claim": claim.model_dump(mode="json")}))
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+    for filename in set(output_files.values()):
+        (tmp_path / filename).write_bytes(b"artifact")
+
+    class Lease:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def start(self, report, digest): pass
+        async def run(self, handler, ctx, params): return await handler(ctx, params)
+        lost = asyncio.Event()
+
+    async def handler(ctx, params):
+        return {"output_files": output_files}
+
+    client = FakeBackendClient()
+    client.resource_operation = AsyncMock()
+    client.resource_upload = AsyncMock()
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", Lease)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", AsyncMock(return_value=files))
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=client,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+    await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
+
+    assert [c.args[1] for c in client.resource_upload.call_args_list] == expected
+    operation = client.resource_operation.call_args
+    assert operation.args[1] == "complete"
+    assert operation.args[2]["result"]["output_files"] == output_files
