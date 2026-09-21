@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 
@@ -22,6 +23,7 @@ from task_worker_api import (
 from task_worker_api.schemas import TASK_PARAMS_SCHEMAS, DetectCutPlanesParams
 from task_worker_api.schemas._base import TaskParamsBase
 from task_worker_api.testing import FakeBackendClient
+from task_worker_api.worker import _MAX_RESULT_BODY_BYTES
 from pydantic import ConfigDict
 
 
@@ -440,9 +442,49 @@ async def test_worker_fails_task_when_result_is_not_json_serializable(
     # And the operator sees why the result never made it.
     error_records = [
         r for r in caplog.records
-        if r.levelname == "ERROR" and "not JSON-serializable" in r.getMessage()
+        if r.levelname == "ERROR" and "could not be encoded" in r.getMessage()
     ]
     assert len(error_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_task_when_result_is_oversized(
+    make_worker, tmp_path, caplog,
+):
+    """The same guard the admitted path applies, on the v1 terminal report.
+
+    A result over the complete-body cap (an inlined log tail, a per-frame
+    metrics array, a base64 blob) comes back 413/422 — non-transient, so
+    ``_request`` raises it without retrying — and the terminal report is lost:
+    the task sits in_progress until the sweeper reclaims and *recomputes* it.
+    The worker reports a fail naming the limit and the actual size instead.
+    """
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": [], "log_tail": "x" * (_MAX_RESULT_BODY_BYTES + 1)}
+
+    with caplog.at_level("ERROR"):
+        worker = make_worker(client=client, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    # complete() was never attempted — the backend would have rejected the PUT.
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    error = client.failed_tasks[0]["error"]
+    assert "complete limit" in error
+    assert str(_MAX_RESULT_BODY_BYTES) in error
+    # The reason names the actual size, not just "too big".
+    assert re.search(r"serializes to \d+ bytes", error)
+    assert [
+        r for r in caplog.records
+        if r.levelname == "ERROR" and "complete limit" in r.getMessage()
+    ]
 
 
 @pytest.mark.asyncio

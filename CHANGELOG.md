@@ -2,6 +2,19 @@
 
 ## 0.19.0.dev47
 
+- Apply the admitted path's oversized-result guard to the v1 terminal report.
+  `run_admitted_attempt` checked both the encodability *and* the size of a
+  handler result before choosing `complete`, but `_execute_one` checked only
+  encodability and then sent `complete()` with an unbounded body. A handler
+  returning a large dict — an inlined log tail, a per-frame metrics array, a
+  base64 blob — made the backend reject the PUT with 413/422, which `_request`
+  treats as non-transient and raises immediately, so the terminal report was
+  lost and the task sat `in_progress` until the stale sweeper reclaimed and
+  *recomputed* it, redoing hours of GPU work. Both paths now ask one shared
+  `_undeliverable_result_reason()` at the same point — before any request goes
+  out, where converting to a fail is unambiguous — and an oversized result
+  becomes a terminal fail naming the limit and the actual size. Results within
+  the cap are unaffected.
 - Never journal a terminal `fail` for a v2 attempt that cannot be failed. The
   admitted path's `except Exception` arm reported one unconditionally, but
   `TaskCancelled` — what a lost lease raises out of staging, the handler race

@@ -531,6 +531,38 @@ def _result_body_bytes(result: object) -> int:
     ).content)
 
 
+def _undeliverable_result_reason(result: object) -> Optional[str]:
+    """Why ``complete(task_id, result)`` could never land, or ``None``.
+
+    The single boundary both terminal paths (v1 ``_execute_one``, v2
+    ``run_admitted_attempt``) check before choosing ``complete`` over ``fail``.
+    Two ways a handler's result is undeliverable, and neither is retryable:
+    httpx raises while *building* an unencodable body, so nothing is ever
+    transmitted, and a body over the cap comes back 413/422 — statuses
+    ``_request`` treats as non-transient and raises immediately. Either way the
+    terminal report is lost and the task orphans in ``in_progress`` until the
+    backend's sweeper reclaims and *recomputes* it, redoing hours of GPU work.
+    Deciding here, before any request goes out, is what makes converting to a
+    fail safe: there is no transmitted write whose commit status is ambiguous.
+
+    The returned string is the failure reason reported to the backend, so it
+    names the limit and the actual size rather than just "too big".
+    """
+    encode_error = _result_encode_error(result)
+    if encode_error is not None:
+        return (
+            "handler result could not be encoded for the complete report: "
+            f"{encode_error}"
+        )
+    size = _result_body_bytes(result)
+    if size > _MAX_RESULT_BODY_BYTES:
+        return (
+            f"handler result serializes to {size} bytes, over the "
+            f"{_MAX_RESULT_BODY_BYTES}-byte complete limit"
+        )
+    return None
+
+
 class Worker:
     """Glues everything together. One instance per worker process.
 
@@ -1094,14 +1126,9 @@ class Worker:
                     result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease,
                                                                  profile=claim.profile), params)
                     result = result or {}
-                    if _result_encode_error(result) is not None:
-                        raise ProtocolError("handler result cannot be encoded")
-                    size = _result_body_bytes(result)
-                    if size > _MAX_RESULT_BODY_BYTES:
-                        raise ProtocolError(
-                            f"handler result serializes to {size} bytes, over the "
-                            f"{_MAX_RESULT_BODY_BYTES}-byte complete limit"
-                        )
+                    undeliverable = _undeliverable_result_reason(result)
+                    if undeliverable is not None:
+                        raise ProtocolError(undeliverable)
                     names = _require_safe_filenames(result.get("output_files") or {}, field="output_files")
                     # Same off-loop dispatch as the v1 publish path: the walk is one
                     # ``resolve(strict=True)`` + ``lstat`` per declared output against
@@ -1641,14 +1668,17 @@ class Worker:
                     # the exception fires before the method returns. ``fired`` wins
                     # over outcome because a timeout overrides a late completion.
                     #
-                    # A result the wire can't encode is a terminal report that
-                    # can never land: complete() raises while *building* the
-                    # request, so nothing is ever sent, and the task orphans in
-                    # in_progress until the backend's sweeper reclaims and
-                    # *recomputes* it — hours of GPU work redone over a stray
-                    # numpy scalar, Path or datetime left in a handler's dict.
-                    # Catch it here and report the failure instead, so the task
-                    # lands terminal carrying the real cause.
+                    # A result the wire can't carry — unencodable, or a body
+                    # over the size cap the backend rejects with a
+                    # non-transient 413/422 — is a terminal report that can
+                    # never land, and the task orphans in in_progress until
+                    # the backend's sweeper reclaims and *recomputes* it:
+                    # hours of GPU work redone over a stray Path left in a
+                    # handler's dict, or an inlined log tail. The admitted
+                    # path checks the same two conditions at the same point,
+                    # so both ask _undeliverable_result_reason(); catch it
+                    # here and report the failure instead, so the task lands
+                    # terminal carrying the real cause.
                     #
                     # Deciding this *before* the request is what makes it safe,
                     # and is why there is no post-hoc "complete() raised, so
@@ -1666,21 +1696,16 @@ class Worker:
                     # below is the same single terminal report this worker
                     # already owed the task.
                     if not fired and outcome[0] == "complete":
-                        encode_error = _result_encode_error(outcome[1])
-                        if encode_error is not None:
+                        undeliverable = _undeliverable_result_reason(outcome[1])
+                        if undeliverable is not None:
                             log.error(
-                                "task %s: handler result is not JSON-"
-                                "serializable (%s); reporting the task failed "
-                                "instead — complete() could never have been "
-                                "sent, and leaving it unreported orphans the "
-                                "task in_progress",
-                                task.id, encode_error,
+                                "task %s: %s; reporting the task failed "
+                                "instead — complete() could never have "
+                                "landed, and leaving it unreported orphans "
+                                "the task in_progress",
+                                task.id, undeliverable,
                             )
-                            outcome = (
-                                "fail",
-                                "handler succeeded but its result could not be "
-                                f"encoded for the complete report: {encode_error}",
-                            )
+                            outcome = ("fail", undeliverable)
                     if fired:
                         terminal = "fail"
                     elif outcome[0] == "complete":
