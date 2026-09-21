@@ -22,6 +22,7 @@ from task_worker_api import (
 from task_worker_api.schemas import TASK_PARAMS_SCHEMAS, DetectCutPlanesParams
 from task_worker_api.schemas._base import TaskParamsBase
 from task_worker_api.testing import FakeBackendClient
+from task_worker_api import worker as worker_mod
 from pydantic import ConfigDict
 
 
@@ -441,6 +442,43 @@ async def test_worker_fails_task_when_result_is_not_json_serializable(
     error_records = [
         r for r in caplog.records
         if r.levelname == "ERROR" and "not JSON-serializable" in r.getMessage()
+    ]
+    assert len(error_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_task_when_result_is_too_large_to_deliver(
+    make_worker, tmp_path, caplog,
+):
+    """An encodable-but-oversized result must not orphan the task either.
+
+    nginx answers an over-limit body with 413, which the client does not treat
+    as transient, so it burns its retries and the outcome is lost. Same
+    pre-transmission decision as the encode check, same cap the admitted path
+    enforces: convert it to the single terminal fail the worker already owes.
+    """
+    (tmp_path / "fake.stl").write_bytes(b"solid\nnendsolid\n")
+    client = FakeBackendClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        return {"planes": [], "debug": "x" * (worker_mod._MAX_RESULT_BODY_BYTES + 1)}
+
+    with caplog.at_level("ERROR"):
+        worker = make_worker(client=client, handlers={TaskType.DETECT_CUT_PLANES: handler})
+        await worker.run_one()
+
+    # complete() was never attempted — the fake would have accepted anything.
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
+    assert "over the" in client.failed_tasks[0]["error"]
+    assert "complete limit" in client.failed_tasks[0]["error"]
+    error_records = [
+        r for r in caplog.records
+        if r.levelname == "ERROR" and "complete limit" in r.getMessage()
     ]
     assert len(error_records) == 1
 
