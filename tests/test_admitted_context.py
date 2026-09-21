@@ -34,6 +34,7 @@ async def test_handler_receives_granted_profile_without_changing_payload(monkeyp
         async def __aexit__(self, *args): pass
         async def start(self, report, digest): assert digest == claim.input_digest
         async def run(self, handler, ctx, params): return await handler(ctx, params)
+        lost = asyncio.Event()
 
     async def handler(ctx, params):
         assert ctx.profile is profile
@@ -78,6 +79,7 @@ async def test_publication_validation_does_not_block_the_event_loop(monkeypatch,
         async def __aexit__(self, *args): pass
         async def start(self, report, digest): pass
         async def run(self, handler, ctx, params): return await handler(ctx, params)
+        lost = asyncio.Event()
 
     async def handler(ctx, params):
         asyncio.get_running_loop().call_soon(ticked.set)
@@ -126,12 +128,13 @@ async def test_interrupted_attempt_reports_a_terminal_fail_only_after_start(
         async def __aexit__(self, *args): pass
         async def start(self, report, digest): pass
         async def run(self, handler, ctx, params): return await handler(ctx, params)
+        lost = asyncio.Event()
         is_cancelled = lease_cancelled
 
     async def handler(ctx, params):
         raise asyncio.CancelledError
 
-    async def stage(*args):
+    async def stage(*args, **kwargs):
         if interrupt_staging:
             raise asyncio.CancelledError
         return files
@@ -168,6 +171,7 @@ async def test_a_failing_interrupt_report_never_masks_the_cancel(monkeypatch, tm
         async def __aexit__(self, *args): pass
         async def start(self, report, digest): pass
         async def run(self, handler, ctx, params): return await handler(ctx, params)
+        lost = asyncio.Event()
         is_cancelled = False
 
     async def handler(ctx, params):
@@ -193,6 +197,8 @@ class _Lease:
     async def __aexit__(self, *args): pass
     async def start(self, report, digest): pass
     async def run(self, handler, ctx, params): return await handler(ctx, params)
+    lost = asyncio.Event()
+    is_cancelled = False
 
 
 def _oversized_attempt(tmp_path, result):
@@ -294,3 +300,128 @@ async def test_a_normal_result_still_completes(monkeypatch, tmp_path):
     await transport.aclose()
     assert seen == ["/tasks/1/complete"]
     assert journal.unresolved_operations() == []
+
+
+@pytest.mark.asyncio
+async def test_staging_and_publication_carry_the_lease_loss_event(monkeypatch, tmp_path):
+    """Both bulk transfer phases must be raceable against the lease dying.
+
+    ``AttemptLease.run`` interrupts the handler the moment the lease is lost,
+    but staging and publication are the two slowest stretches around it. With
+    the event unthreaded, a worker kept pulling inputs for an attempt that will
+    never start and kept pushing outputs whose verdict can no longer land.
+    """
+    task = AdmittedTask(id=1, task_type="model_initializing", case_id=None, item_key="mesh",
+                        params=dict(job_id="job", input_path="mesh.stl", base_name="mesh"), inputs={})
+    claim = _admitted_claim(uuid4()).model_copy(update={
+        "task": task, "profile": cpu_profile(profile_id="p", task_type=task.task_type),
+        "input_digest": input_snapshot_digest(task), "state": "reserved"})
+    journal = SimpleNamespace(pending=lambda: ("claim", {"claim": claim.model_dump(mode="json")}))
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+    source = tmp_path / "mesh.glb"
+    source.write_bytes(b"glb")
+
+    class Lease:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def start(self, report, digest): pass
+        async def run(self, handler, ctx, params): return await handler(ctx, params)
+        lost = asyncio.Event()
+
+    async def handler(ctx, params):
+        return {"output_files": {"mesh": "mesh.glb"}}
+
+    stage = AsyncMock(return_value=files)
+    client = FakeBackendClient()
+    client.resource_operation = AsyncMock()
+    client.resource_upload = AsyncMock()
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", Lease)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", stage)
+    monkeypatch.setattr("task_worker_api.files._require_output_sources",
+                        lambda output_dir, names: {"mesh": ("mesh.glb", source)})
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=client,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+    await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
+
+    assert stage.call_args.kwargs["cancelled"] is Lease.lost
+    assert client.resource_upload.call_args.kwargs["cancelled"] is Lease.lost
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase, expected", [
+    # Lease lost while inputs stage: start was never acknowledged, so the
+    # attempt is still reserved and its resolution is the supervisor's decline.
+    ("staging", []),
+    # Lease lost during publication: the token is retired, so no report lands.
+    ("publication", []),
+    # Control: a real handler failure on a live lease still owes a verdict.
+    ("handler", ["fail"]),
+])
+async def test_lease_loss_never_journals_a_fail_for_an_unfailable_attempt(
+        monkeypatch, tmp_path, phase, expected):
+    """TaskCancelled is an Exception, so the fail arm must check the lease too.
+
+    A fail journaled for a reserved attempt — or on a retired token — is
+    durable: recovery replays it, the backend rejects it, and reconciliation
+    aborts before the decline and release, wedging the worker behind
+    previous_claim_unresolved.
+    """
+    from task_worker_api.errors import TaskCancelled
+
+    task = AdmittedTask(id=1, task_type="model_initializing", case_id=None, item_key="mesh",
+                        params=dict(job_id="job", input_path="mesh.stl", base_name="mesh"), inputs={})
+    claim = _admitted_claim(uuid4()).model_copy(update={
+        "task": task, "profile": cpu_profile(profile_id="p", task_type=task.task_type),
+        "input_digest": input_snapshot_digest(task), "state": "reserved"})
+    journal = SimpleNamespace(pending=lambda: ("claim", {"claim": claim.model_dump(mode="json")}))
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+    source = tmp_path / "mesh.glb"
+    source.write_bytes(b"glb")
+
+    class Lease:
+        """Loses the lease exactly where the phase under test transfers bytes."""
+
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def start(self, report, digest): pass
+        async def run(self, handler, ctx, params): return await handler(ctx, params)
+        lost = asyncio.Event()
+
+        @property
+        def is_cancelled(self): return self.lost.is_set()
+
+    async def stage(*args, **kwargs):
+        if phase == "staging":
+            Lease.lost.set()
+            raise TaskCancelled("attempt lease was lost while downloading mesh.stl")
+        return files
+
+    async def upload(*args, **kwargs):
+        Lease.lost.set()
+        raise TaskCancelled("attempt lease was lost while uploading mesh.glb")
+
+    async def handler(ctx, params):
+        if phase == "handler":
+            raise RuntimeError("handler blew up")
+        return {"output_files": {"mesh": "mesh.glb"}}
+
+    client = FakeBackendClient()
+    client.resource_operation = AsyncMock()
+    client.resource_upload = AsyncMock(side_effect=upload)
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", Lease)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", stage)
+    monkeypatch.setattr("task_worker_api.files._require_output_sources",
+                        lambda output_dir, names: {"mesh": ("mesh.glb", source)})
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=client,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+
+    with pytest.raises(RuntimeError if phase == "handler" else TaskCancelled):
+        await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
+
+    assert [c.args[1] for c in client.resource_operation.call_args_list] == expected

@@ -1239,8 +1239,25 @@ class BackendClient:
         if body.get("worker_instance_id") != str(worker_instance_id) or body.get("ready") is not True:
             raise ProtocolError("invalid worker readiness acknowledgement")
 
-    async def resource_download(self, claim, artifact, dest: Path):
-        """Fetch exactly the admitted input and reject truncated or changed bytes."""
+    async def resource_download(
+        self, claim, artifact, dest: Path,
+        *,
+        cancelled: Optional["asyncio.Event"] = None,
+    ):
+        """Fetch exactly the admitted input and reject truncated or changed bytes.
+
+        ``cancelled`` (the attempt lease's loss event) is honoured exactly as
+        ``download_file`` honours a ``CancelGuard``'s: checked before the
+        request goes out and raced against the in-flight stream. Staging is
+        the long stretch before ``start`` is acknowledged, so a backend cancel
+        or an expired lease landing mid-transfer would otherwise keep pulling
+        multi-GB inputs for an attempt that will never run —
+        ``prepare_admitted_inputs`` only looks between files, so a one-input
+        claim (a lone colmap-splat PLY, a Neural-Canvas splat) never looked at
+        all. ``TaskCancelled`` is not transient, so it leaves the retry loop
+        immediately without consuming retry budget, and the partial at
+        ``dest`` is removed by the same cleanup as any other failure.
+        """
         import hashlib
         from .files import _require_safe_filename
 
@@ -1250,8 +1267,14 @@ class BackendClient:
         path = f"/tasks/{claim.task_id}/attempts/{claim.ownership.attempt_id}/inputs/{artifact.filename}"
         params = claim.ownership.model_dump(mode="json", exclude={"token", "attempt_id"})
         params["protocol_version"] = 2
+        cancel_message = (
+            f"attempt {claim.ownership.attempt_id} lease was lost while "
+            f"downloading {artifact.filename}"
+        )
 
         async def once():
+            if cancelled is not None and cancelled.is_set():
+                raise TaskCancelled(cancel_message)
             digest = hashlib.sha256()
             size = 0
             async with self._client.stream("GET", path, params=params,
@@ -1270,6 +1293,11 @@ class BackendClient:
                     # at the same byte it did before.
                     buf = bytearray()
                     async for chunk in response.aiter_bytes():
+                        # Per wire chunk, like download_file: the race below
+                        # only wins on a loop tick, and a body arriving faster
+                        # than the 1 MB write buffer fills gives it none.
+                        if cancelled is not None and cancelled.is_set():
+                            raise TaskCancelled(cancel_message)
                         size += len(chunk)
                         if size > artifact.size_bytes:
                             raise ProtocolError("input exceeds admitted size")
@@ -1285,8 +1313,12 @@ class BackendClient:
                 finally:
                     await _to_thread_complete(file.close)
 
+        operation = self._retry(once, method="GET", path=path, retry_after_max_s=None)
         try:
-            await self._retry(once, method="GET", path=path, retry_after_max_s=None)
+            if cancelled is None:
+                await operation
+            else:
+                await _await_unless_cancelled(operation, cancelled, cancel_message)
         except BaseException:
             # Unlinking a multi-GB partial on a network-mounted scratch pool
             # blocks, so it goes off the loop like every other file operation
@@ -1297,8 +1329,24 @@ class BackendClient:
             await _to_thread_complete(functools.partial(dest.unlink, missing_ok=True))
             raise
 
-    async def resource_upload(self, claim, filename, src: Path):
-        """Immutable attempt output; retries restart the stream, never overwrite another attempt."""
+    async def resource_upload(
+        self, claim, filename, src: Path,
+        *,
+        cancelled: Optional["asyncio.Event"] = None,
+    ):
+        """Immutable attempt output; retries restart the stream, never overwrite another attempt.
+
+        ``cancelled`` (the attempt lease's loss event) is honoured exactly as
+        ``upload_file`` honours a ``CancelGuard``'s: checked before the request
+        goes out and raced against the in-flight PUT. Publication streams every
+        declared output, and once the lease is lost the terminal verdict those
+        bytes belong to can no longer land — the publication loop only looks
+        between files, so a single-output result (a lone colmap-splat PLY, a
+        Neural-Canvas splat) never looked at all. ``TaskCancelled`` is not
+        transient, so it leaves the retry loop immediately without consuming
+        retry budget. This stops the client transport; it cannot retract a file
+        the backend finished committing before the connection was severed.
+        """
         import hashlib
         from .files import _require_safe_filename
 
@@ -1306,8 +1354,14 @@ class BackendClient:
         path = f"/tasks/{claim.task_id}/attempts/{claim.ownership.attempt_id}/outputs/{filename}"
         params = claim.ownership.model_dump(mode="json", exclude={"token", "attempt_id"})
         params["protocol_version"] = 2
+        cancel_message = (
+            f"attempt {claim.ownership.attempt_id} lease was lost while "
+            f"uploading {filename}"
+        )
 
         async def once():
+            if cancelled is not None and cancelled.is_set():
+                raise TaskCancelled(cancel_message)
             digest = hashlib.sha256()
             size = 0
             file = await _to_thread_complete(open, src, "rb", cancel_cleanup=lambda opened: opened.close())
@@ -1332,7 +1386,10 @@ class BackendClient:
             finally:
                 await _to_thread_complete(file.close)
 
-        return await self._retry(once, method="PUT", path=path, retry_after_max_s=None)
+        operation = self._retry(once, method="PUT", path=path, retry_after_max_s=None)
+        if cancelled is None:
+            return await operation
+        return await _await_unless_cancelled(operation, cancelled, cancel_message)
 
     async def claim_next(
         self, task_types: list, worker_id: str
