@@ -504,9 +504,13 @@ def _result_encode_error(result: object) -> Optional[str]:
     return None if exc is None else f"{type(exc).__name__}: {exc}"
 
 
-# Cap on the serialized v2 ``complete`` body, the deliverability half of the
-# encodability check above. Same wire constraint (and same rationale) as
-# ``client._MAX_FAIL_ERROR_BYTES``, but it bites harder on the admitted path:
+# Cap on the serialized ``complete`` body, the deliverability half of the
+# encodability check above, applied on both terminal paths. Same wire
+# constraint (and same rationale) as ``client._MAX_FAIL_ERROR_BYTES``. On v1 an
+# oversized body costs the outcome: nginx answers 413, which ``_retry`` does not
+# treat as transient, so the client exhausts its retries and the task sits
+# in_progress until the backend's stale sweep. It bites harder still on the
+# admitted path:
 # ``ClaimJournal.prepare_operation`` persists the complete request *before* it
 # is transmitted and ``_resource_replay_operation`` replays it forever, so a
 # body nginx rejects with 413 — not a transient status — is an operation that
@@ -1665,6 +1669,14 @@ class Worker:
                     # no complete request was ever transmitted, and the fail()
                     # below is the same single terminal report this worker
                     # already owed the task.
+                    #
+                    # A result that encodes but is too big to deliver orphans
+                    # the task the same way, one step later: nginx rejects the
+                    # body with 413, which ``_retry`` does not treat as
+                    # transient, so the complete is never accepted. Bound it
+                    # here with the same cap the admitted path enforces, for
+                    # the same reason the encode check is safe — the decision
+                    # is made before any complete request goes out.
                     if not fired and outcome[0] == "complete":
                         encode_error = _result_encode_error(outcome[1])
                         if encode_error is not None:
@@ -1680,6 +1692,22 @@ class Worker:
                                 "fail",
                                 "handler succeeded but its result could not be "
                                 f"encoded for the complete report: {encode_error}",
+                            )
+                        elif (size := _result_body_bytes(outcome[1])) > _MAX_RESULT_BODY_BYTES:
+                            log.error(
+                                "task %s: handler result serializes to %d bytes, "
+                                "over the %d-byte complete limit; reporting the "
+                                "task failed instead — the backend rejects an "
+                                "oversized body with a non-transient 413, and "
+                                "leaving it unreported orphans the task "
+                                "in_progress",
+                                task.id, size, _MAX_RESULT_BODY_BYTES,
+                            )
+                            outcome = (
+                                "fail",
+                                "handler succeeded but its result serializes to "
+                                f"{size} bytes, over the {_MAX_RESULT_BODY_BYTES}-"
+                                "byte complete limit",
                             )
                     if fired:
                         terminal = "fail"
