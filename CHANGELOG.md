@@ -52,6 +52,18 @@
   finished first still wins the tie and still faces the post-run check, so
   uncancelled attempts are unchanged. v1 already had this treatment
   (`CancelGuard` interrupts its guarded block).
+- Fail a v2 admitted attempt only once its `start` is acknowledged. The
+  `except Exception` boundary in `run_admitted_attempt` journaled a terminal
+  `fail` for every pre-start error too — a `prepare_admitted_inputs`
+  download/digest failure, an unknown task type, params validation — while the
+  attempt was still `reserved`, the state the backend resolves with a
+  `decline`. Being durable, that rejected operation made
+  `resource_recover_operations` raise before it reached the decline and the
+  release behind it, holding the reservation and wedging the worker behind
+  `previous_claim_unresolved`. The report is now gated on an acknowledged start
+  and a live lease, the same invariant the sibling interrupt branch enforces;
+  pre-start failures propagate untouched and are left to supervisor
+  decline/reconciliation.
 - Enforce attempt identity on every v2 `AttemptState`, not only on the
   journal-replayed operations. `_resource_replay_operation` rejected a state
   whose `attempt_id`/`task_id` did not match the claim, but the sibling paths
