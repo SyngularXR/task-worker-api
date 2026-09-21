@@ -504,9 +504,13 @@ def _result_encode_error(result: object) -> Optional[str]:
     return None if exc is None else f"{type(exc).__name__}: {exc}"
 
 
-# Cap on the serialized v2 ``complete`` body, the deliverability half of the
-# encodability check above. Same wire constraint (and same rationale) as
-# ``client._MAX_FAIL_ERROR_BYTES``, but it bites harder on the admitted path:
+# Cap on the serialized ``complete`` body, the deliverability half of the
+# encodability check above, applied on both terminal paths. Same wire
+# constraint (and same rationale) as ``client._MAX_FAIL_ERROR_BYTES``. On v1 an
+# oversized body costs the outcome: nginx answers 413, which ``_retry`` does not
+# treat as transient, so the client exhausts its retries and the task sits
+# in_progress until the backend's stale sweep. It bites harder still on the
+# admitted path:
 # ``ClaimJournal.prepare_operation`` persists the complete request *before* it
 # is transmitted and ``_resource_replay_operation`` replays it forever, so a
 # body nginx rejects with 413 — not a transient status — is an operation that
@@ -1695,6 +1699,14 @@ class Worker:
                     # no complete request was ever transmitted, and the fail()
                     # below is the same single terminal report this worker
                     # already owed the task.
+                    #
+                    # A result that encodes but is too big to deliver orphans
+                    # the task the same way, one step later: nginx rejects the
+                    # body with 413, which ``_retry`` does not treat as
+                    # transient, so the complete is never accepted. Bound it
+                    # here with the same cap the admitted path enforces, for
+                    # the same reason the encode check is safe — the decision
+                    # is made before any complete request goes out.
                     if not fired and outcome[0] == "complete":
                         undeliverable = _undeliverable_result_reason(outcome[1])
                         if undeliverable is not None:

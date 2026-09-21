@@ -15,6 +15,19 @@
   out, where converting to a fail is unambiguous — and an oversized result
   becomes a terminal fail naming the limit and the actual size. Results within
   the cap are unaffected.
+- Bound the serialized `complete` body on the v1 terminal path too, not just
+  its encodability. `Worker._run_one` pre-checked the handler result with
+  `_result_encode_error` and converted an unencodable one into a terminal
+  `fail`, but an encodable-but-oversized result still went out: nginx answers
+  the request with 413, which `_retry` does not treat as transient, so the
+  client exhausts its retries, the terminal report is lost and the task sits
+  `in_progress` until the backend's stale sweep reclaims and recomputes it.
+  The pre-check now also applies `_MAX_RESULT_BODY_BYTES` / `_result_body_bytes`
+  — the same cap and helpers the admitted v2 path enforces before publication —
+  so an over-limit result becomes the single terminal `fail` the worker already
+  owes the task, carrying the measured size and the limit. Safe for the same
+  reason the encode pre-check is: the decision happens before any `complete`
+  request is transmitted, so there is no committed-or-not ambiguity to race.
 - Never journal a terminal `fail` for a v2 attempt that cannot be failed. The
   admitted path's `except Exception` arm reported one unconditionally, but
   `TaskCancelled` — what a lost lease raises out of staging, the handler race
