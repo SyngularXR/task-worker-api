@@ -2,6 +2,40 @@
 
 ## 0.19.0.dev47
 
+- Never journal a terminal `fail` for a v2 attempt that cannot be failed. The
+  admitted path's `except Exception` arm reported one unconditionally, but
+  `TaskCancelled` — what a lost lease raises out of staging, the handler race
+  and publication — is an ordinary `Exception`, so it landed there too: before
+  `start` is acknowledged the attempt is still `reserved`, whose resolution is
+  the supervisor's `decline`, and after the token is retired nothing can land
+  at all. `resource_operation` journals the request before transmitting it, so
+  the backend's rejection was not the end of it: recovery replayed a rejected
+  operation, raised, and wedged the worker behind `previous_claim_unresolved`
+  ahead of the decline and the release behind it. The fail arm now applies the
+  same `started and not lease.is_cancelled` rule the interrupt arm already
+  applies (it holds for every exception, not only a cancel) and logs one
+  WARNING when it defers to reconciliation. A handler failure on a live,
+  started attempt still reports fail exactly as before.
+- Race the v2 admitted path's bulk transfers against the attempt lease being
+  lost. `AttemptLease.run` already interrupts the handler the moment the lease
+  dies, but the two slowest phases around it were unguarded:
+  `prepare_admitted_inputs` staged every declared input and the publication
+  loop streamed every declared output without ever looking at the lease. Once
+  the backend cancelled the attempt or the acknowledged lease expired, the
+  worker kept pulling and pushing multi-GB artifacts on a token the backend had
+  already retired — the inputs of an attempt that will never start, or the
+  outputs of one whose terminal verdict can no longer land — and because both
+  loops only advanced between files, a single-artifact attempt (a lone
+  colmap-splat PLY, a Neural-Canvas splat) was invisible end to end.
+  `AttemptLease` now exposes its loss event as `lost`, `resource_download` /
+  `resource_upload` take the same optional `cancelled` event the v1
+  `download_file` / `upload_file` already take (pre-flight check, per-chunk
+  check on the download, and the in-flight request raced through
+  `_await_unless_cancelled`), and both call sites pass the lease's event.
+  `TaskCancelled` bypasses the retry budget, the off-loop partial-file unlink
+  still runs, and it surfaces through the existing `except Exception` arm as
+  the terminal fail, unchanged in shape. The kwarg is additive: every existing
+  caller that omits it behaves exactly as before.
 - Interrupt the running v2 handler when the backend cancels the attempt or the
   lease is lost. `AttemptLease._accept` already marked the lease dead the
   moment the backend reported the attempt cancelled or in a non-workable state,

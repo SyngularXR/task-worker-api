@@ -4532,3 +4532,147 @@ async def test_resource_download_still_rejects_oversized_input(tmp_path):
     await client.close()
 
     assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# v2 admitted transfers — the attempt lease's loss event
+#
+# AttemptLease.run already races the handler against the lease being lost, but
+# the bulk transfers on either side of it ran unguarded: staging kept pulling
+# inputs for an attempt that will never start, and publication kept pushing
+# outputs whose terminal verdict can no longer land. Both loops only looked
+# between files, so a single-artifact attempt (a lone colmap-splat PLY, a
+# Neural-Canvas splat) never looked at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resource_download_aborts_mid_stream_when_lease_is_lost(tmp_path):
+    """A lease lost partway through staging aborts the GET at a chunk boundary."""
+    import hashlib
+
+    from task_worker_api.resources import InputArtifact
+
+    payload = b"x" * 1024
+    body_bytes = payload * 10
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(body_bytes).hexdigest(), size_bytes=len(body_bytes),
+    )
+    claim = _download_claim(artifact)
+    cancelled = asyncio.Event()
+    chunks_sent = {"n": 0}
+    requests = {"n": 0}
+
+    async def body():
+        for _ in range(10):
+            chunks_sent["n"] += 1
+            if chunks_sent["n"] == 2:
+                cancelled.set()  # the heartbeat sees the attempt cancelled
+            yield payload
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=body())
+
+    client = _client_with_handler(handler, max_retries=4)
+    dest = tmp_path / "scene.ply"
+    with pytest.raises(TaskCancelled, match="lease was lost"):
+        await client.resource_download(claim, artifact, dest, cancelled=cancelled)
+    await client.close()
+
+    assert chunks_sent["n"] < 10, (
+        "staging must stop mid-file once the lease is gone, not finish "
+        "pulling a multi-GB input for an attempt that will never start"
+    )
+    # TaskCancelled is not transient: re-issuing the GET would re-stream the
+    # very file the guard exists to stop streaming.
+    assert requests["n"] == 1
+    # Same cleanup as any other failure — no truncated input left behind.
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_resource_download_checks_lease_before_request(tmp_path):
+    """A lease already lost must not put the GET on the wire at all."""
+    import hashlib
+
+    from task_worker_api.resources import InputArtifact
+
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(b"body").hexdigest(), size_bytes=4,
+    )
+    claim = _download_claim(artifact)
+    cancelled = asyncio.Event()
+    cancelled.set()
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=b"body")
+
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled):
+        await client.resource_download(
+            claim, artifact, tmp_path / "scene.ply", cancelled=cancelled,
+        )
+    await client.close()
+    assert requests["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_resource_upload_aborts_in_flight_put_when_lease_is_lost(tmp_path):
+    """A lease lost mid-publication aborts the PUT instead of streaming on."""
+    from task_worker_api.resources import InputArtifact
+
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply", sha256="b" * 64, size_bytes=1,
+    )
+    claim = _download_claim(artifact)
+    src = tmp_path / "scene.ply"
+    src.write_bytes(b"y" * (4 * _DOWNLOAD_CHUNK_BYTES))
+    cancelled = asyncio.Event()
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        read = 0
+        async for chunk in request.stream:
+            read += len(chunk)
+            cancelled.set()  # the lease dies after the first chunk is on the wire
+        return httpx.Response(200, json={"filename": "scene.ply", "sha256": "", "size_bytes": read})
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(TaskCancelled, match="lease was lost"):
+        await client.resource_upload(claim, "scene.ply", src, cancelled=cancelled)
+    await client.close()
+
+    # Not transient: a retry would re-send the same output on a retired token.
+    assert requests["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resource_upload_checks_lease_before_request(tmp_path):
+    """A lease already lost must not put the PUT on the wire at all."""
+    from task_worker_api.resources import InputArtifact
+
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply", sha256="b" * 64, size_bytes=1,
+    )
+    claim = _download_claim(artifact)
+    src = tmp_path / "scene.ply"
+    src.write_bytes(b"y")
+    cancelled = asyncio.Event()
+    cancelled.set()
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled):
+        await client.resource_upload(claim, "scene.ply", src, cancelled=cancelled)
+    await client.close()
+    assert requests["n"] == 0
