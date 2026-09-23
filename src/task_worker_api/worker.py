@@ -750,6 +750,15 @@ class Worker:
                     "worker handles; remove the entry or fix its task_types."
                 )
             validated.append((spec, usable))
+        # Run the input checks httpx.AsyncClient would run for each foreign
+        # client we will build (the same URL and header parsing, so the same
+        # exceptions), here, before the home client exists. A bad URL such as
+        # ``http://far:bad/api/v1`` falls back verbatim in _canonical_url and
+        # otherwise only raised once the home pool was already open.
+        for spec, _ in validated:
+            if spec.client is None:
+                httpx.URL(spec.url.rstrip("/"))
+                httpx.Headers({"Authorization": f"Bearer {spec.api_key}"})
 
         if client is None:
             self._client = BackendClient(

@@ -15,6 +15,7 @@ than at first claim (or worse, silently forever):
 """
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from task_worker_api import TaskType, Worker
@@ -433,5 +434,25 @@ def test_worker_init_rejects_before_constructing_any_client(
             api_key="k",
             worker_id="box-w",
             handlers=handlers,
+        )
+    assert async_client_spy == []
+
+
+@pytest.mark.parametrize("targets", [
+    "http://foreign:bad/api/v1|kf|detect_cut_planes",
+    "http://foreign/api/v1|kä|detect_cut_planes",
+])
+def test_worker_init_rejects_unbuildable_foreign_client_before_any_client(
+    monkeypatch, async_client_spy, targets,
+):
+    """A foreign URL or key httpx refuses is rejected before the home client
+    is built, not by the foreign constructor with the home pool already open."""
+    monkeypatch.setenv("SYNPUSHER_TARGETS", targets)
+    with pytest.raises((httpx.InvalidURL, UnicodeEncodeError)):
+        Worker(
+            backend_url="http://home/api/v1",
+            api_key="k",
+            worker_id="box-w",
+            handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
         )
     assert async_client_spy == []
