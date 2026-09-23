@@ -1501,3 +1501,57 @@ async def test_cancelled_worker_reports_shutdown_reason(
     ]
     assert len(cancelled_logs) == 1, [r.message for r in caplog.records]
     assert cancelled_logs[0].message == error
+
+
+class _HangingFailClient(FakeBackendClient):
+    """``fail`` never returns: a backend degraded past the stop grace."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_calls = 0
+
+    async def fail(self, task_id: int, error: str) -> None:
+        self.fail_calls += 1
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_terminal_report_is_bounded_by_grace(
+    make_worker, tmp_path, caplog,
+):
+    """A shutdown-interrupted task's terminal report must give up after
+    timeout_grace_s so the stop grace is left for teardown, not spent on a
+    report the supervisor will SIGKILL mid-retry."""
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client = _HangingFailClient()
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+    in_handler = asyncio.Event()
+
+    async def handler(ctx, params):
+        in_handler.set()
+        await asyncio.sleep(60)
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        timeout_grace_s=0.2,
+    )
+    with caplog.at_level("ERROR"):
+        run = asyncio.create_task(worker.run_one())
+        await asyncio.wait_for(in_handler.wait(), timeout=5)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run, timeout=5)
+
+    assert client.fail_calls == 1
+    assert any(
+        "terminal fail report failed" in r.message for r in caplog.records
+    ), [r.message for r in caplog.records]
+    settled = len(client.progress_events)
+    await asyncio.sleep(0.05)
+    assert len(client.progress_events) == settled, "progress.stop() skipped"
+    assert not any((tmp_path / "work").glob("task_*"))
+    assert worker._active_task_dir is None
