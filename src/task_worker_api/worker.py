@@ -1112,8 +1112,19 @@ class Worker:
                     # the scratch pool, and stalling it here would freeze the lease
                     # heartbeat whose deadline is only ~30s from a hard exit.
                     sources = await asyncio.to_thread(_require_output_sources, files.output_dir, names)
+                    uploaded: set[str] = set()
                     for filename, source in sources.values():
+                        if filename in uploaded:
+                            # An earlier key already published this exact file;
+                            # the result manifest still carries both keys. Both
+                            # v1 branches de-duplicate the same way, and here the
+                            # endpoint is an immutable attempt output: a second
+                            # PUT either burns a duplicate multi-GB transfer or is
+                            # rejected non-transiently, failing an attempt whose
+                            # handler already succeeded.
+                            continue
                         await client.resource_upload(claim, filename, source, cancelled=lease.lost)
+                        uploaded.add(filename)
                 except Exception as exc:
                     # Only pre-publication failure selects fail. Once a terminal
                     # request is transmitted, its durable operation alone is replayed.
