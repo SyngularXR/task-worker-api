@@ -1508,11 +1508,15 @@ class _HangingFailClient(FakeBackendClient):
 
     def __init__(self) -> None:
         super().__init__()
-        self.fail_calls = 0
+        self.terminal_calls: list[str] = []
 
     async def fail(self, task_id: int, error: str) -> None:
-        self.fail_calls += 1
+        self.terminal_calls.append("fail")
         await asyncio.Event().wait()
+
+    async def complete(self, task_id: int, result: dict) -> None:
+        self.terminal_calls.append("complete")
+        await super().complete(task_id, result)
 
 
 @pytest.mark.asyncio
@@ -1538,20 +1542,28 @@ async def test_interrupted_terminal_report_is_bounded_by_grace(
         client=client,
         handlers={TaskType.DETECT_CUT_PLANES: handler},
         timeout_grace_s=0.2,
+        heartbeat_interval_s=0.01,
     )
+    loop = asyncio.get_running_loop()
     with caplog.at_level("ERROR"):
         run = asyncio.create_task(worker.run_one())
         await asyncio.wait_for(in_handler.wait(), timeout=5)
         run.cancel()
+        cancelled_at = loop.time()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(run, timeout=5)
+        elapsed = loop.time() - cancelled_at
 
-    assert client.fail_calls == 1
+    # The hung report is abandoned at the 0.2s grace, not the 5s test cap.
+    assert 0.2 <= elapsed < 0.2 + 0.3, elapsed
+    assert client.terminal_calls == ["fail"]
     assert any(
         "terminal fail report failed" in r.message for r in caplog.records
     ), [r.message for r in caplog.records]
+    # A leaked 0.01s heartbeat would land several more events in 0.1s.
     settled = len(client.progress_events)
-    await asyncio.sleep(0.05)
+    assert settled > 0, "heartbeat never ticked; stop() check is vacuous"
+    await asyncio.sleep(0.1)
     assert len(client.progress_events) == settled, "progress.stop() skipped"
     assert not any((tmp_path / "work").glob("task_*"))
     assert worker._active_task_dir is None
