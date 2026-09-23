@@ -648,29 +648,11 @@ class Worker:
 
         self._payload_logger = self._build_payload_logger()
 
-        if client is None:
-            self._client = BackendClient(
-                backend_url, api_key, timeout_s=request_timeout_s,
-                worker_id=worker_id,
-                file_timeout_s=file_timeout_s,
-                cancel_timeout_s=cancel_timeout_s,
-                lifecycle_timeout_s=lifecycle_timeout_s,
-                max_retries=max_retries,
-                retry_backoff_s=retry_backoff_s,
-                retry_backoff_max_s=retry_backoff_max_s,
-                retry_sleep_budget_s=retry_sleep_budget_s,
-                retry_jitter=retry_jitter,
-                payload_logger=self._payload_logger,
-            )
-        else:
-            # Externally-supplied client (e.g. FakeBackendClient in tests) is
-            # used as-is; we don't reach in and rewrite its state.
-            self._client = client
-        self._stop = asyncio.Event()
-        # Consecutive failed claim round-trips; drives the escalating idle
-        # wait in run_forever. Reset by any claim that reaches the backend.
-        self._claim_failures = 0
-
+        # Every fail-fast check below runs before any BackendClient is built:
+        # each owns an httpx.AsyncClient, and raising out of __init__ after
+        # one exists leaks its pool (nothing ever holds the Worker to close
+        # it).
+        #
         # Fail fast on misconfiguration: an empty handlers dict makes
         # task_types=[] in run_forever's poll loop, so the worker silently
         # polls forever without ever processing work. Operators only notice
@@ -703,7 +685,7 @@ class Worker:
         # or completed-against-the-wrong-tenant. Real BackendClient always
         # carries base_url; test doubles (FakeBackendClient) may not, and are
         # skipped — they don't make real HTTP calls, so URL provenance is moot.
-        client_base_url = getattr(self._client, "base_url", None)
+        client_base_url = getattr(client, "base_url", None)
         if client_base_url is not None:
             client_norm = _canonical_url(str(client_base_url))
             worker_norm = _canonical_url(self.backend_url)
@@ -734,11 +716,9 @@ class Worker:
             if foreign_targets is not None
             else parse_synpusher_targets(os.environ.get("SYNPUSHER_TARGETS"))
         )
-        self._foreign_targets: list[_Target] = []
-        #: Rotating start index into ``_foreign_targets`` (see ``_claim``).
-        self._foreign_cursor = 0
         home_norm = _canonical_url(self.backend_url)
         seen_urls: set[str] = set()
+        validated: list[tuple[ForeignTarget, list[TaskType]]] = []
         for idx, spec in enumerate(specs):
             spec_url = _canonical_url(spec.url or "")
             if spec_url and spec_url == home_norm:
@@ -769,6 +749,35 @@ class Worker:
                     f"foreign target {spec.url!r} has no task type this "
                     "worker handles; remove the entry or fix its task_types."
                 )
+            validated.append((spec, usable))
+
+        if client is None:
+            self._client = BackendClient(
+                backend_url, api_key, timeout_s=request_timeout_s,
+                worker_id=worker_id,
+                file_timeout_s=file_timeout_s,
+                cancel_timeout_s=cancel_timeout_s,
+                lifecycle_timeout_s=lifecycle_timeout_s,
+                max_retries=max_retries,
+                retry_backoff_s=retry_backoff_s,
+                retry_backoff_max_s=retry_backoff_max_s,
+                retry_sleep_budget_s=retry_sleep_budget_s,
+                retry_jitter=retry_jitter,
+                payload_logger=self._payload_logger,
+            )
+        else:
+            # Externally-supplied client (e.g. FakeBackendClient in tests) is
+            # used as-is; we don't reach in and rewrite its state.
+            self._client = client
+        self._stop = asyncio.Event()
+        # Consecutive failed claim round-trips; drives the escalating idle
+        # wait in run_forever. Reset by any claim that reaches the backend.
+        self._claim_failures = 0
+
+        self._foreign_targets: list[_Target] = []
+        #: Rotating start index into ``_foreign_targets`` (see ``_claim``).
+        self._foreign_cursor = 0
+        for spec, usable in validated:
             tgt_client = spec.client
             if tgt_client is None:
                 tgt_client = BackendClient(
@@ -874,48 +883,54 @@ class Worker:
 
     async def run_forever(self) -> None:
         """Main polling loop. Returns when shutdown() is called."""
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        log.info(
-            "task-worker-api Worker starting: id=%s url=%s types=%s",
-            self.worker_id, self.backend_url,
-            ",".join(t.value for t in self.task_types),
-        )
-        if self._payload_logger.enabled:
-            log.info(
-                "payload logging: enabled, root=%s, retention=%dd",
-                self._payload_logger.root, self._payload_logger.retention_days,
-            )
-        else:
-            log.info(
-                "payload logging: disabled (shared_volume_path=%r, env=%r)",
-                self.shared_volume_path,
-                os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
-            )
-        await self._run_cleanup()
-
-        cleanup_raw = os.environ.get("WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600")
+        # All startup work belongs inside the try: any failure (workdir
+        # mkdir, retention sweep, box affinity) must still run the finally,
+        # or the clients' pools leak and a fatal ProtocolError surfaces
+        # buried in "Task was destroyed but it is pending" and
+        # unclosed-socket noise.
+        cleanup_task: Optional[asyncio.Task] = None
         try:
-            cleanup_interval_s = float(cleanup_raw)
-            if not math.isfinite(cleanup_interval_s) or cleanup_interval_s <= 0:
-                raise ValueError(
-                    f"cleanup interval must be a finite positive number of "
-                    f"seconds, got {cleanup_interval_s}"
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            log.info(
+                "task-worker-api Worker starting: id=%s url=%s types=%s",
+                self.worker_id, self.backend_url,
+                ",".join(t.value for t in self.task_types),
+            )
+            if self._payload_logger.enabled:
+                log.info(
+                    "payload logging: enabled, root=%s, retention=%dd",
+                    self._payload_logger.root,
+                    self._payload_logger.retention_days,
                 )
-        except (ValueError, TypeError):
-            log.warning(
-                "payload_log: WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S=%r is "
-                "invalid; falling back to 3600 seconds",
-                cleanup_raw,
-            )
-            cleanup_interval_s = 3600.0
-        cleanup_task = asyncio.create_task(
-            self._periodic_cleanup_loop(cleanup_interval_s)
-        )
+            else:
+                log.info(
+                    "payload logging: disabled (shared_volume_path=%r, env=%r)",
+                    self.shared_volume_path,
+                    os.environ.get("WORKER_PAYLOAD_LOG_ENABLED", "true"),
+                )
+            await self._run_cleanup()
 
-        # Startup checks belong inside the try: a fatal one (box affinity)
-        # must still run the finally, or its ProtocolError surfaces buried in
-        # "Task was destroyed but it is pending" and unclosed-socket noise.
-        try:
+            cleanup_raw = os.environ.get(
+                "WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S", "3600",
+            )
+            try:
+                cleanup_interval_s = float(cleanup_raw)
+                if not math.isfinite(cleanup_interval_s) or cleanup_interval_s <= 0:
+                    raise ValueError(
+                        f"cleanup interval must be a finite positive number of "
+                        f"seconds, got {cleanup_interval_s}"
+                    )
+            except (ValueError, TypeError):
+                log.warning(
+                    "payload_log: WORKER_PAYLOAD_LOG_CLEANUP_INTERVAL_S=%r is "
+                    "invalid; falling back to 3600 seconds",
+                    cleanup_raw,
+                )
+                cleanup_interval_s = 3600.0
+            cleanup_task = asyncio.create_task(
+                self._periodic_cleanup_loop(cleanup_interval_s)
+            )
+
             if self._foreign_targets:
                 log.info(
                     "cross-box mode: %d foreign target(s): %s",
@@ -948,13 +963,17 @@ class Worker:
                 task, target = claimed
                 await self._run_one(task, target)
         finally:
-            cleanup_task.cancel()
-            try:
-                await cleanup_task
-            except asyncio.CancelledError:
-                pass
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                try:
+                    await cleanup_task
+                except asyncio.CancelledError:
+                    pass
             self._payload_logger.close()
-            await self._client.close()
+            try:
+                await self._client.close()
+            except Exception:  # noqa: BLE001 — shutdown is best-effort
+                log.warning("failed to close client for home")
             for tgt in self._foreign_targets:
                 try:
                     await tgt.client.close()

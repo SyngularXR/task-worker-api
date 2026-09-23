@@ -388,3 +388,50 @@ async def test_worker_init_rejects_max_retries_below_one():
             handlers={TaskType.DETECT_CUT_PLANES: _noop_handler},
             max_retries=0,
         )
+
+
+# --- no client is constructed for a rejected config -------------------------
+
+
+@pytest.fixture
+def async_client_spy(monkeypatch):
+    """Counts ``httpx.AsyncClient`` constructions (each one owns a pool)."""
+    import httpx
+
+    built = []
+    real_init = httpx.AsyncClient.__init__
+
+    def _spy(self, *args, **kwargs):
+        built.append(self)
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _spy)
+    return built
+
+
+@pytest.mark.parametrize("handlers, targets, match", [
+    (
+        {TaskType.DETECT_CUT_PLANES: _noop_handler},
+        "http://a/api/v1|ka|detect_cut_planes;"
+        "http://a/api/v1|kb|detect_cut_planes",
+        "repeats target URL",
+    ),
+    ({}, None, "handlers is empty"),
+])
+def test_worker_init_rejects_before_constructing_any_client(
+    monkeypatch, async_client_spy, handlers, targets, match,
+):
+    """Every fail-fast check runs before the home or any foreign
+    BackendClient is built, so a rejected config leaks no pool."""
+    if targets is None:
+        monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    else:
+        monkeypatch.setenv("SYNPUSHER_TARGETS", targets)
+    with pytest.raises(ProtocolError, match=match):
+        Worker(
+            backend_url="http://home/api/v1",
+            api_key="k",
+            worker_id="box-w",
+            handlers=handlers,
+        )
+    assert async_client_spy == []
