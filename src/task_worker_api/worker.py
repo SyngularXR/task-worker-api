@@ -1504,6 +1504,7 @@ class Worker:
         outcome: tuple[str, object] = (
             "fail", "worker exited the task without recording an outcome",
         )
+        interrupted = False
         try:
             # Capture BEFORE schema validation so malformed payloads — exactly
             # the bugs most worth replaying — still produce a typed-stream
@@ -1641,6 +1642,7 @@ class Worker:
             # reason, and an operator reading logs after a redeploy sees a
             # task that simply stops mid-run.
             log.warning("%s", reason)
+            interrupted = True
             raise
         except (TaskParamsError, ProtocolError) as e:
             log.error("task %s protocol error: %s", task.id, e)
@@ -1754,11 +1756,23 @@ class Worker:
                         terminal = "complete"
                     else:
                         terminal = "fail"
+                    # A shutdown-interrupted report runs inside the stop
+                    # grace: the supervisor SIGKILLs the process when it runs
+                    # out, and a report still retrying against a degraded
+                    # backend would spend all of it and starve the teardown
+                    # below. Bound it by timeout_grace_s; a timeout surfaces
+                    # as the ERROR log in the handler below, like any other
+                    # lost report. Normal reports keep their full retry
+                    # window.
+                    def bounded(aw):
+                        if interrupted:
+                            return asyncio.wait_for(aw, self.timeout_grace_s)
+                        return aw
                     try:
                         if fired:
-                            await target.client.fail(
+                            await bounded(target.client.fail(
                                 task.id, f"timeout: exceeded {timeout_s:.0f}s",
-                            )
+                            ))
                             log.warning(
                                 "task %s timed out (%s)",
                                 task.id, task.task_type.value,
@@ -1770,7 +1784,7 @@ class Worker:
                                 task.id, task.task_type.value,
                             )
                         else:
-                            await target.client.fail(task.id, outcome[1])
+                            await bounded(target.client.fail(task.id, outcome[1]))
                             if outcome[1] == "cancelled by user":
                                 log.info("task %s cancelled by user", task.id)
                     except Exception as report_exc:  # noqa: BLE001
