@@ -2,6 +2,16 @@
 
 ## 0.19.0.dev47
 
+- Bound the admission supervisor's retry sleeps. `admission_supervisor.run`
+  built its `BackendClient` with `retry_sleep_budget_s=None`, so a backend
+  answering with long `Retry-After` values could pin one call inside `_retry`
+  for up to 5 x 6h; the unattended loop has no watch thread and its own 5-60s
+  backoff never regained control, idling the host. The supervisor now passes
+  the client's recommended 600s budget (CONFIG `retry_sleep_budget_s`
+  overrides it; `null` restores the unbounded default). Every supervisor
+  operation is idempotent and replayed by the next cycle. `BackendClient`'s
+  own default and the v1 `Worker` path are unchanged.
+
 - De-duplicate v2 attempt outputs by filename during publication. A handler
   manifest may alias one artifact under two keys (`{"scene": "model.ply",
   "warm_start": "model.ply"}`), the shape v1's `upload_outputs` explicitly
