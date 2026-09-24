@@ -92,3 +92,31 @@ def test_windows_execution_scopes_share_measured_host_budget(monkeypatch, native
     config.pop("vm_command", None)
     with pytest.raises(ValueError, match="requires an execution scope"):
         host_reporter._snapshot(config, 2)
+
+
+@pytest.mark.parametrize("headers, posts", [({"Retry-After": "21600"}, 2), ({}, 15)])
+def test_throttled_host_report_resumes_within_heartbeat_ceiling(monkeypatch, headers, posts):
+    import asyncio
+    import httpx
+
+    clock, sent = [0.0], []
+    real_client = httpx.AsyncClient
+
+    def reply(request):
+        sent.append(clock[0])
+        return httpx.Response(429, headers=headers)
+
+    async def tick(seconds):
+        clock[0] += seconds
+        if clock[0] >= 75:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(host_reporter, "publish_report", lambda config: SimpleNamespace(model_dump=lambda **kw: {}))
+    monkeypatch.setattr(host_reporter, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(host_reporter.asyncio, "sleep", tick)
+    monkeypatch.setattr(host_reporter.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(reply), **kw))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(host_reporter.run({"backend_url": "http://backend/api/v1"}))
+    assert len(sent) == posts
+    assert max(sent) <= 70  # a 6h Retry-After parks the next post for 60s, not hours

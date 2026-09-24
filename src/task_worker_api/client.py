@@ -269,9 +269,9 @@ def _retry_after_delay(response: httpx.Response, *, maximum_seconds: Optional[in
         delay = float(value)
         if not math.isfinite(delay):
             # Only reachable without a ceiling. Raising here would be fatal
-            # where it lands (it escapes the v2 supervisor's retry loop and
-            # the host reporter's except block), and a delay we cannot even
-            # represent is no more usable than a malformed one.
+            # where it lands (it escapes the v2 supervisor's retry loop), and
+            # a delay we cannot even represent is no more usable than a
+            # malformed one.
             log.warning("Retry-After is too large to represent (%d digits); using our own schedule", len(value))
             return None
         return delay

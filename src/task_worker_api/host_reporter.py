@@ -23,7 +23,7 @@ from uuid import UUID, uuid5
 
 import httpx
 
-from .client import _retry_after_delay
+from .client import _HEARTBEAT_RETRY_AFTER_MAX_S, _retry_after_delay
 from .host_resources import (
     linux_execution_scopes, linux_host_capacity, nvidia_gpu_capacity,
     scratch_capacities, windows_host_capacity,
@@ -126,7 +126,10 @@ async def run(config):
                     response.raise_for_status()
             except Exception as exc:
                 if isinstance(exc, httpx.HTTPStatusError):
-                    delay = _retry_after_delay(exc.response, maximum_seconds=None)
+                    # Capped like the v1 heartbeat: the next tick posts a fresher,
+                    # higher-sequence observation, while an hours-long window would
+                    # let the backend's copy go stale and fail every admission here.
+                    delay = _retry_after_delay(exc.response, maximum_seconds=_HEARTBEAT_RETRY_AFTER_MAX_S)
                     if delay is not None:
                         next_post = monotonic() + delay
                 log.error("Host report failed; previous observations will expire: %s", exc)
