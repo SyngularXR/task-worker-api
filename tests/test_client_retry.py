@@ -1164,6 +1164,64 @@ async def test_upload_file_rejects_source_that_changed_size(tmp_path, monkeypatc
     await client.close()
 
 
+@pytest.mark.asyncio
+async def test_upload_file_rejects_source_that_grew_without_retry(
+    tmp_path, monkeypatch,
+):
+    """A file that grows after the stat must fail once, not be resent.
+
+    Past the declared Content-Length h11 raises ``LocalProtocolError``, a
+    retryable ``TransportError``; the growth must surface as the SDK's
+    ``ProtocolError`` before any over-length bytes reach the wire.
+    """
+    from task_worker_api import client as client_mod
+    from task_worker_api.errors import ProtocolError
+
+    size = 4096
+    src = tmp_path / "output.ply"
+    src.write_bytes(b"z" * size)
+
+    real_open = open
+    opened = []
+
+    def growing_open(path, mode, *a, **kw):
+        f = real_open(path, mode, *a, **kw)
+        opened.append(f)
+        with real_open(path, "ab") as g:
+            g.write(b"\x01" * size)  # still being written after the stat
+        return f
+
+    monkeypatch.setattr(client_mod, "open", growing_open, raising=False)
+
+    calls = {"n": 0}
+    received: list[bytes] = []
+
+    class _StreamingTransport(httpx.AsyncBaseTransport):
+        """Record each body chunk as it would go on the wire."""
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            async for chunk in request.stream:
+                received.append(chunk)
+            return httpx.Response(200)
+
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1", transport=_StreamingTransport(),
+    )
+    client = BackendClient(
+        "http://fake/api/v1", "x",
+        client=http, max_retries=4, retry_backoff_s=0.0, retry_jitter=False,
+    )
+    with pytest.raises(ProtocolError):
+        await client.upload_file(9, "output.ply", src)
+    await client.close()
+
+    assert calls["n"] == 1
+    assert len(opened) == 1
+    assert b"\x01" not in b"".join(received)
+    assert all(f.closed for f in opened)
+
+
 # -----------------------------------------------------------------------
 # upload_file cancel — a user cancel during a multi-GB output stream must
 # abort the in-flight PUT. upload_outputs only checked between batch files,
