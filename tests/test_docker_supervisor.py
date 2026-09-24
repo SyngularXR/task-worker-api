@@ -79,7 +79,8 @@ async def test_supervisor_renews_reservation_during_child_startup(tmp_path, monk
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("startup_failures", [0, 5])
-async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_path, monkeypatch, startup_failures):
+@pytest.mark.parametrize("budget", [{}, {"retry_sleep_budget_s": 30}])
+async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_path, monkeypatch, startup_failures, budget):
     from task_worker_api import admission_supervisor
 
     for name in ("private", "report", "publication", "artifacts", "credentials"):
@@ -93,12 +94,13 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
         worker_instance_id=str(uuid4()), worker_id="test-finalizer", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
         credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
         backend_finalizer=dict(publication_directory="publication", artifact_root="artifacts",
-            response_key_file="credentials/response", database_url_file="credentials/database"))
+            response_key_file="credentials/response", database_url_file="credentials/database"), **budget)
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
 
     ready_calls = 0
     retry_delays = []
+    client_kwargs = {}
 
     async def sleep(delay):
         retry_delays.append(delay)
@@ -106,8 +108,8 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
     monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
 
     class Client:
-        def __init__(self, *args):
-            pass
+        def __init__(self, *args, **kwargs):
+            client_kwargs.update(kwargs)
         async def __aenter__(self):
             return self
         async def __aexit__(self, *args):
@@ -138,6 +140,7 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(admission_supervisor.run(path), timeout=5)
     assert retry_delays == [5, 10, 20, 40, 40][:startup_failures]
+    assert client_kwargs["retry_sleep_budget_s"] == budget.get("retry_sleep_budget_s", 600)
 
 
 def test_supervisor_singleton_releases_lock_on_exit(tmp_path):

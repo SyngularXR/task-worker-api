@@ -132,6 +132,9 @@ async def run(config_path):
     Optional read_only_mounts maps host paths
     to container paths for model assets; no signing state may be included.
     Optional environment supplies the measured model/config/cache settings.
+    Optional retry_sleep_budget_s (default 600) caps the backoff sleeps one
+    backend call may admit, so a throttled backend cannot park this unattended
+    loop inside the client for hours; null restores the unbounded client default.
     A trusted backend CPU supervisor replaces handlers with backend_finalizer:
     publication_directory, artifact_root, response_key_file, database_url_file.
     It accepts backend CPU publication tasks and mounts the publication store read-write.
@@ -231,7 +234,8 @@ async def run(config_path):
         async def read_report():
             return SignedHostReport.model_validate_json(report_file.read_text())
 
-        async with BackendClient(config["backend_url"], credential_file.read_text().strip()) as client:
+        async with BackendClient(config["backend_url"], credential_file.read_text().strip(),
+                                 retry_sleep_budget_s=config.get("retry_sleep_budget_s", 600)) as client:
             needs_ready = journal.pending() is None
             failures = 0
             while True:
