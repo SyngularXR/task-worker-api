@@ -1321,7 +1321,12 @@ class BackendClient:
                 finally:
                     await _to_thread_complete(file.close)
 
-        operation = self._retry(once, method="GET", path=path, retry_after_max_s=None)
+        # Default six-hour Retry-After ceiling, like download_file — not the
+        # lifecycle path's uncapped guidance. The lease keeps renewing in the
+        # background while this waits, so lease loss never ends an absurd
+        # delay (Retry-After: 31536000), and staging would park the worker on
+        # an attempt it cannot start.
+        operation = self._retry(once, method="GET", path=path)
         try:
             if cancelled is None:
                 await operation
@@ -1394,7 +1399,10 @@ class BackendClient:
             finally:
                 await _to_thread_complete(file.close)
 
-        operation = self._retry(once, method="PUT", path=path, retry_after_max_s=None)
+        # Default six-hour Retry-After ceiling, as in resource_download: the
+        # renewing lease would otherwise hold publication for whatever delay a
+        # 429/503 names.
+        operation = self._retry(once, method="PUT", path=path)
         if cancelled is None:
             return await operation
         return await _await_unless_cancelled(operation, cancelled, cancel_message)

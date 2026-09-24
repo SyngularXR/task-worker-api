@@ -2,6 +2,15 @@
 
 ## 0.19.0.dev47
 
+- Cap `Retry-After` on v2 bulk transfers. `BackendClient.resource_download`
+  and `resource_upload` passed `retry_after_max_s=None`, so a 429/503 naming
+  an absurd delay (`Retry-After: 31536000`, a far-future HTTP-date) parked
+  input staging or output publication for that long; `AttemptLease` keeps
+  renewing in the background, so lease loss never ended the wait. Both now use
+  the default six-hour ceiling, like v1 `download_file`/`upload_file`. The v2
+  lifecycle path (`_resource_request`) keeps its uncapped guidance; nothing
+  changes on the wire.
+
 - Bound the admission supervisor's retry sleeps. `admission_supervisor.run`
   built its `BackendClient` with `retry_sleep_budget_s=None`, so a backend
   answering with long `Retry-After` values could pin one call inside `_retry`
