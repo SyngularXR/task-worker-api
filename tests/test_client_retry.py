@@ -25,6 +25,7 @@ from task_worker_api.client import (
     _DOWNLOAD_CHUNK_BYTES,
     _HEARTBEAT_RETRY_AFTER_MAX_S,
     _MAX_FAIL_ERROR_BYTES,
+    _MAX_RETRY_AFTER_S,
     _UPLOAD_CHUNK_BYTES,
     BackendClient,
 )
@@ -4734,3 +4735,108 @@ async def test_resource_upload_checks_lease_before_request(tmp_path):
         await client.resource_upload(claim, "scene.ply", src, cancelled=cancelled)
     await client.close()
     assert requests["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# v2 admitted transfers — Retry-After ceiling
+#
+# resource_download/resource_upload used to pass retry_after_max_s=None, so a
+# 429/503 naming an absurd delay parked staging or publication for that long:
+# the lease keeps renewing in the background, so it is never lost and never
+# ends the wait. They now take the default six-hour ceiling, like v1's
+# download_file/upload_file.
+# ---------------------------------------------------------------------------
+
+
+def _v2_transfer(kind, tmp_path):
+    """Return ``(ok, call, dest)``: a success response factory, a runner for one v2 transfer, and the download target."""
+    import hashlib
+
+    from task_worker_api.resources import InputArtifact
+
+    body = b"body"
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(body).hexdigest(), size_bytes=len(body),
+    )
+    claim = _download_claim(artifact)
+    src = tmp_path / "out.ply"
+    src.write_bytes(body)
+    dest = tmp_path / "scene.ply"
+
+    def ok() -> httpx.Response:
+        if kind == "download":
+            return httpx.Response(200, content=body)
+        return httpx.Response(200, json={
+            "filename": "scene.ply", "sha256": artifact.sha256, "size_bytes": len(body),
+        })
+
+    async def call(client, **kw):
+        if kind == "download":
+            return await client.resource_download(claim, artifact, dest, **kw)
+        return await client.resource_upload(claim, "scene.ply", src, **kw)
+
+    return ok, call, dest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["download", "upload"])
+@pytest.mark.parametrize("retry_after", ["31536000", "Fri, 01 Jan 9999 00:00:00 GMT"])
+async def test_v2_transfer_caps_absurd_retry_after(monkeypatch, tmp_path, kind, retry_after):
+    sleeps = _sleep_recorder(monkeypatch)
+    ok, call, _ = _v2_transfer(kind, tmp_path)
+    responses = iter([httpx.Response(429, headers={"Retry-After": retry_after}), ok()])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    client = _client_with_handler(handler, retry_jitter=True)
+    await call(client)
+    await client.close()
+    assert len(sleeps) == 1 and sleeps[0] <= _MAX_RETRY_AFTER_S
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["download", "upload"])
+async def test_v2_transfer_honours_normal_retry_after(monkeypatch, tmp_path, kind):
+    sleeps = _sleep_recorder(monkeypatch)
+    ok, call, _ = _v2_transfer(kind, tmp_path)
+    responses = iter([httpx.Response(503, headers={"Retry-After": "7"}), ok()])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    client = _client_with_handler(handler)
+    await call(client)
+    await client.close()
+    assert sleeps == [7.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["download", "upload"])
+async def test_v2_transfer_lease_loss_ends_retry_after_wait(monkeypatch, tmp_path, kind):
+    """Lease loss during the (capped) Retry-After wait still cancels the transfer."""
+    ok, call, dest = _v2_transfer(kind, tmp_path)
+    cancelled = asyncio.Event()
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        cancelled.set()  # the lease dies while the retry loop waits
+        await asyncio.get_running_loop().create_future()  # never wakes on its own
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if kind == "download":
+            # A 503 that already wrote a partial, like a mid-stream failure.
+            dest.write_bytes(b"partial")
+        return httpx.Response(503, headers={"Retry-After": "31536000"})
+
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled, match="lease was lost"):
+        await call(client, cancelled=cancelled)
+    await client.close()
+    assert sleeps == [float(_MAX_RETRY_AFTER_S)]
+    if kind == "download":
+        assert not dest.exists()
