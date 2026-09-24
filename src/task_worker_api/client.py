@@ -538,7 +538,10 @@ async def _multipart_file_body(
     or shrank between the ``stat`` and the read would otherwise put a body of
     the wrong length on the wire, which the backend sees as a truncated (or
     hung) upload rather than an error. Raising instead fails the attempt
-    loudly.
+    loudly. Growth is caught before the extra bytes are yielded: past the
+    declared length h11 would raise ``LocalProtocolError``, a
+    ``TransportError`` that ``_retry`` would treat as transient and resend
+    the whole file. ``ProtocolError`` is not retried.
     """
     yield prologue
     sent = 0
@@ -548,6 +551,11 @@ async def _multipart_file_body(
     try:
         while chunk := await _to_thread_complete(f.read, _UPLOAD_CHUNK_BYTES):
             sent += len(chunk)
+            if sent > size:
+                raise ProtocolError(
+                    f"{src} changed size during upload: declared {size} bytes, "
+                    f"read at least {sent}"
+                )
             yield chunk
     finally:
         await _to_thread_complete(f.close)
