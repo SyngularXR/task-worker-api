@@ -99,11 +99,19 @@ _MAX_RETRY_AFTER_S = 6 * 60 * 60
 # same state, so the only thing honouring the window buys is a frozen
 # ``updated_at`` — which is exactly what the backend's stale-task sweeper
 # reclaims and re-queues, handing the task to a second worker that recomputes
-# and republishes the same outcome. Terminal reports (complete/fail) keep the
-# six-hour ceiling: nothing else will ever re-send them. ``int`` because
-# ``_retry_after_delay`` compares delta-seconds as decimal *text* against
-# ``str(maximum_seconds)``, which a float's ``.0`` suffix would corrupt.
+# and republishes the same outcome. ``int`` because ``_retry_after_delay``
+# compares delta-seconds as decimal *text* against ``str(maximum_seconds)``,
+# which a float's ``.0`` suffix would corrupt.
 _HEARTBEAT_RETRY_AFTER_MAX_S = int(_DEFAULT_BACKOFF_MAX_S)
+
+# Ceiling on ``Retry-After`` for the v1 terminal reports (complete/fail) and
+# the remaining retried v1 reads (cancel status, box id). The terminal retry
+# window is sized at ~60s to ride out a backend restart; one 429/503 naming
+# hours during that restart would otherwise hold the worker slot — including
+# the shutdown/cancel ``fail`` path — long after the result is computed. The
+# backoff cap plus ``lifecycle_timeout_s``-scale headroom (15s default) still
+# honours any window that fits a restart. ``int`` for the same reason as above.
+_TERMINAL_RETRY_AFTER_MAX_S = int(_DEFAULT_BACKOFF_MAX_S) + 15
 
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
@@ -834,6 +842,7 @@ class BackendClient:
         extra_transient: frozenset = frozenset(),
         attempts: Optional[int] = None,
         retry_after_max_s: Optional[int] = _MAX_RETRY_AFTER_S,
+        retry_after_budget_s: Optional[float] = None,
     ):
         """Run ``await fn()`` with exponential-backoff retry on transient errors.
 
@@ -903,6 +912,14 @@ class BackendClient:
         Bounding that last overrun is not something this loop can do from
         inside the blocked loop, and it is why this is a budget rather than a
         maximum: pick a value with headroom against a handler that blocks.
+
+        ``retry_after_budget_s`` is a per-call budget with the same semantics
+        that only gates ``Retry-After``-driven sleeps (the tighter of it and
+        ``retry_sleep_budget_s`` applies to those). Terminal reports use it to
+        keep a persistent 429/503 inside their retry window (see
+        :meth:`complete`); the backoff schedule is already bounded by the
+        attempt budget, so gating it too would let a merely late-returning
+        sleep drop the final 500 retry.
         """
         import asyncio
 
@@ -920,7 +937,7 @@ class BackendClient:
                     attempt, self.retry_backoff_s,
                     self.retry_backoff_max_s, self.retry_jitter,
                 )
-                what, source = type(e).__name__, ""
+                what, source, retry_after = type(e).__name__, "", None
             except httpx.HTTPStatusError as e:
                 if not _is_transient_status(e, extra_transient):
                     raise
@@ -957,10 +974,10 @@ class BackendClient:
                 source = " (Retry-After)" if retry_after is not None else ""
             # Reached only from a retryable failure that still has attempts
             # left; both branches above have picked this attempt's delay.
-            if (
-                self.retry_sleep_budget_s is not None
-                and slept_s + delay > self.retry_sleep_budget_s
-            ):
+            budget = self.retry_sleep_budget_s
+            if retry_after is not None and retry_after_budget_s is not None:
+                budget = retry_after_budget_s if budget is None else min(budget, retry_after_budget_s)
+            if budget is not None and slept_s + delay > budget:
                 # Waiting the delay out would blow the budget, and firing the
                 # request early lands inside the window the backend just named
                 # — so stop here and let the caller (and the sweeper) handle
@@ -972,10 +989,10 @@ class BackendClient:
                 log.warning(
                     "transient %s on %s %s; giving up after %d attempt(s) and "
                     "%.1fs of retry backoff — the next delay (%.1fs) exceeds "
-                    "the remaining %.1fs of the %.1fs retry_sleep_budget_s",
+                    "the remaining %.1fs of the %.1fs retry sleep budget "
+                    "(retry_sleep_budget_s or the call's own)",
                     what, method, path, attempt + 1, slept_s, delay,
-                    max(0.0, self.retry_sleep_budget_s - slept_s),
-                    self.retry_sleep_budget_s,
+                    max(0.0, budget - slept_s), budget,
                 )
                 break
             log.debug(
@@ -1018,6 +1035,7 @@ class BackendClient:
         extra_transient: frozenset = frozenset(),
         attempts: Optional[int] = None,
         retry_after_max_s: Optional[int] = _MAX_RETRY_AFTER_S,
+        retry_after_budget_s: Optional[float] = None,
         **kwargs,
     ) -> httpx.Response:
         """Request with exponential-backoff retry on transient errors.
@@ -1027,8 +1045,8 @@ class BackendClient:
         errors surface immediately. Uses no third-party retry library to keep
         SDK dependencies minimal.
 
-        ``extra_transient`` / ``attempts`` / ``retry_after_max_s`` are
-        forwarded to :meth:`_retry` (terminal reports widen the transient set
+        ``extra_transient`` / ``attempts`` / ``retry_after_max_s`` /
+        ``retry_after_budget_s`` are forwarded to :meth:`_retry` (terminal reports widen the transient set
         to include 500 and raise the attempt budget; the periodic heartbeat
         lowers the ``Retry-After`` ceiling); all other kwargs go to httpx.
 
@@ -1046,8 +1064,33 @@ class BackendClient:
         return await self._retry(
             _do_request, method=method, path=path,
             extra_transient=extra_transient, attempts=attempts,
-            retry_after_max_s=retry_after_max_s,
+            retry_after_max_s=retry_after_max_s, retry_after_budget_s=retry_after_budget_s,
         )
+
+    def _terminal_retry_kwargs(self) -> dict:
+        """Retry settings shared by v1 ``complete``/``fail``.
+
+        The per-call ``Retry-After`` budget is the worst-case jittered backoff
+        schedule over the raised attempt budget (~62s → 77.5s with defaults),
+        floored at one capped ``Retry-After``. It gates only Retry-After
+        sleeps, so the backoff/500 path keeps every attempt however late its
+        sleeps return, while a persistent 429/503 cannot chain capped sleeps
+        past the window (five 75s sleeps = 375s): it gives up and the sweeper
+        re-queues.
+        """
+        attempts = max(self.max_retries, _TERMINAL_MIN_ATTEMPTS)
+        spread = 1.0 + (_JITTER_SPREAD if self.retry_jitter else 0.0)
+        cap = math.inf if self.retry_backoff_max_s is None else self.retry_backoff_max_s
+        window = sum(
+            min(_backoff_delay(n, self.retry_backoff_s, self.retry_backoff_max_s, False) * spread, cap)
+            for n in range(attempts - 1)
+        )
+        return {
+            "extra_transient": _TERMINAL_EXTRA_TRANSIENT,
+            "attempts": attempts,
+            "retry_after_max_s": _TERMINAL_RETRY_AFTER_MAX_S,
+            "retry_after_budget_s": max(float(_TERMINAL_RETRY_AFTER_MAX_S), window),
+        }
 
     # ----- task lifecycle --------------------------------------------
 
@@ -1583,7 +1626,9 @@ class BackendClient:
         ordering.
         """
         try:
-            resp = await self._request("GET", "/tasks/box-id")
+            resp = await self._request(
+                "GET", "/tasks/box-id", retry_after_max_s=_TERMINAL_RETRY_AFTER_MAX_S,
+            )
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 404:
                 return None
@@ -1612,6 +1657,7 @@ class BackendClient:
         resp = await self._request(
             "GET", f"/tasks/{task_id}/cancel-status",
             timeout=self._cancel_timeout,
+            retry_after_max_s=_TERMINAL_RETRY_AFTER_MAX_S,
         )
         return resp.json() or {}
 
@@ -1655,14 +1701,19 @@ class BackendClient:
         transient (a dead backend dependency mid-write looks like a 500 here,
         and dropping the report orphans the computed outcome) and the attempt
         budget is raised to at least ``_TERMINAL_MIN_ATTEMPTS`` so the retry
-        window (~60s jittered) rides out a backend restart.
+        window (~60s jittered) rides out a backend restart. A 429/503's
+        ``Retry-After`` is capped at ``_TERMINAL_RETRY_AFTER_MAX_S`` (75s) to
+        match that window, so one hours-long hint during the restart cannot
+        hold the worker slot after the result is computed, and the call's total
+        sleep is bounded by that same window (see
+        :meth:`_terminal_retry_kwargs`), so a *persistent* throttle gives up
+        and leaves the task to the sweeper rather than chaining 75s sleeps.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
-            extra_transient=_TERMINAL_EXTRA_TRANSIENT,
-            attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
+            **self._terminal_retry_kwargs(),
         )
 
     async def fail(self, task_id: int, error: str) -> None:
@@ -1672,8 +1723,8 @@ class BackendClient:
         a stalled fail call fails fast instead of blocking the polling loop
         for up to 120s (30s × 4 retries) under backend load.
 
-        Retries 500 with a raised attempt budget, same as :meth:`complete` —
-        see there for the rationale.
+        Retries 500 with a raised attempt budget and caps ``Retry-After``,
+        same as :meth:`complete` — see there for the rationale.
 
         ``error`` is capped at ``_MAX_FAIL_ERROR_BYTES`` (see
         :func:`_cap_fail_error`) — the cap lives here, on the wire boundary
@@ -1683,8 +1734,7 @@ class BackendClient:
             "PUT", f"/tasks/{task_id}/fail", json={"error": _cap_fail_error(error)},
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
-            extra_transient=_TERMINAL_EXTRA_TRANSIENT,
-            attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
+            **self._terminal_retry_kwargs(),
         )
 
     # ----- file transfer (remote mode workers) ----------------------
