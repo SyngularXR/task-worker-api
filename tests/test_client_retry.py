@@ -26,6 +26,7 @@ from task_worker_api.client import (
     _HEARTBEAT_RETRY_AFTER_MAX_S,
     _MAX_FAIL_ERROR_BYTES,
     _MAX_RETRY_AFTER_S,
+    _TERMINAL_RETRY_AFTER_MAX_S,
     _UPLOAD_CHUNK_BYTES,
     BackendClient,
 )
@@ -3457,7 +3458,7 @@ async def test_retry_after_is_not_shortened_by_backoff_ceiling(monkeypatch):
     client = _client_with_handler(
         handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
     )
-    await client.complete(7, {"output": "done"})
+    await client._request("PUT", "/tasks/7/complete")
     await client.close()
 
     assert sleeps == [3600.0]
@@ -3554,23 +3555,100 @@ async def test_periodic_heartbeat_caps_retry_after(monkeypatch):
     assert sum(sleeps) < _MIN_STALE_THRESHOLD_S
 
 
+def _six_hours_http_date() -> str:
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    return format_datetime(datetime.now(timezone.utc) + timedelta(hours=6), usegmt=True)
+
+
+# A backend restart can answer 429/503 with an hours-long Retry-After; the
+# terminal report must still land within its ~60s retry window, not park the
+# worker slot (or the shutdown/cancel fail) for hours.
 @pytest.mark.asyncio
-async def test_terminal_report_keeps_full_retry_after_ceiling(monkeypatch):
-    """The same response on complete() still waits the window out — nothing
-    else will ever re-send a terminal report."""
+@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("retry_after", ["21600", None])
+@pytest.mark.parametrize("call", ["complete", "fail"])
+async def test_terminal_report_caps_retry_after(monkeypatch, status, retry_after, call):
     sleeps = _sleep_recorder(monkeypatch)
+    header = retry_after or _six_hours_http_date()
+    calls = {"n": 0}
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            429, headers={"Retry-After": "3600"}, text="Too Many Requests",
-        )
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(status, headers={"Retry-After": header}, text="restarting")
+        return httpx.Response(200, json={})
 
     client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
-    with pytest.raises(httpx.HTTPStatusError):
+    if call == "complete":
         await client.complete(7, {"output": "done"})
+    else:
+        await client.fail(7, "boom")
     await client.close()
 
-    assert sleeps and set(sleeps) == {3600.0}
+    assert calls["n"] == 2
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= _TERMINAL_RETRY_AFTER_MAX_S
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["complete", "fail"])
+async def test_terminal_report_honours_short_retry_after(monkeypatch, call):
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "5"}, text="slow")
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    await (client.complete(7, {}) if call == "complete" else client.fail(7, "boom"))
+    await client.close()
+
+    assert sleeps == [5.0]
+
+
+@pytest.mark.asyncio
+async def test_terminal_report_cap_keeps_budget_and_500_retry(monkeypatch):
+    """The cap only shortens the sleep: 500 still retries, and the raised
+    six-attempt budget is unchanged."""
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(500, text="db down")
+        return httpx.Response(503, headers={"Retry-After": "21600"}, text="restarting")
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=0.0)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.fail(7, "boom")
+    await client.close()
+
+    assert calls["n"] == 6
+    assert sleeps[1:] == [_TERMINAL_RETRY_AFTER_MAX_S] * 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["cancel", "box"])
+async def test_v1_reads_cap_retry_after(monkeypatch, call):
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "21600"}, text="slow")
+        return httpx.Response(200, json={"box_id": "b"})
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    await (client.get_cancel_status(7) if call == "cancel" else client.get_box_id())
+    await client.close()
+
+    assert sleeps == [_TERMINAL_RETRY_AFTER_MAX_S]
 
 
 @pytest.mark.asyncio
@@ -3791,10 +3869,11 @@ def test_init_defaults_retry_total_max_to_none():
 
 @pytest.mark.asyncio
 async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatch):
-    """The motivating case: with the budget enabled, a complete() throttled
-    with Retry-After: 6h must not sleep it out — one such delay already
-    exceeds the whole budget, so the call gives up immediately rather than
-    pinning the polling loop for 30h."""
+    """The motivating case: with the budget enabled, a call on the default
+    six-hour ceiling throttled with Retry-After: 6h must not sleep it out —
+    one such delay already exceeds the whole budget, so the call gives up
+    immediately rather than pinning the polling loop for 30h. (``complete``
+    itself now caps the header; this exercises the budget on ``_request``.)"""
     sleeps = _sleep_recorder(monkeypatch)
     calls = {"n": 0}
 
@@ -3808,7 +3887,7 @@ async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatc
         handler, max_retries=4, retry_backoff_s=2.0, retry_sleep_budget_s=600.0,
     )
     with pytest.raises(httpx.HTTPStatusError) as exc_info:
-        await client.complete(7, {"output": "done"})
+        await client._request("PUT", "/tasks/7/complete")
     await client.close()
 
     # One attempt, no sleep — and the caller sees the same error it would

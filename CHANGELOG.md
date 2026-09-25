@@ -2,6 +2,15 @@
 
 ## 0.19.0.dev47
 
+- Cap `Retry-After` on the v1 terminal reports and remaining v1 reads.
+  `BackendClient.complete` and `fail` retried with the six-hour ceiling, so one
+  429/503 naming hours during a backend restart held the worker slot (for
+  `fail`, the shutdown/cancel path too) long after the result was computed.
+  They now cap it at 75s, matching the ~60s terminal retry window plus
+  `lifecycle_timeout_s`-scale headroom; `get_cancel_status` and `get_box_id`
+  take the same cap. The raised attempt budget and 500-as-transient are
+  unchanged, and nothing changes on the wire.
+
 - Cap `Retry-After` on the v1 claim poll. `BackendClient.claim_next` retried
   with the six-hour ceiling, and `Worker` awaits it inline for the home backend
   and every foreign target, so one rate-limited box answering 429/503 with a

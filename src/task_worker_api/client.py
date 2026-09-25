@@ -99,11 +99,19 @@ _MAX_RETRY_AFTER_S = 6 * 60 * 60
 # same state, so the only thing honouring the window buys is a frozen
 # ``updated_at`` — which is exactly what the backend's stale-task sweeper
 # reclaims and re-queues, handing the task to a second worker that recomputes
-# and republishes the same outcome. Terminal reports (complete/fail) keep the
-# six-hour ceiling: nothing else will ever re-send them. ``int`` because
-# ``_retry_after_delay`` compares delta-seconds as decimal *text* against
-# ``str(maximum_seconds)``, which a float's ``.0`` suffix would corrupt.
+# and republishes the same outcome. ``int`` because ``_retry_after_delay``
+# compares delta-seconds as decimal *text* against ``str(maximum_seconds)``,
+# which a float's ``.0`` suffix would corrupt.
 _HEARTBEAT_RETRY_AFTER_MAX_S = int(_DEFAULT_BACKOFF_MAX_S)
+
+# Ceiling on ``Retry-After`` for the v1 terminal reports (complete/fail) and
+# the remaining retried v1 reads (cancel status, box id). The terminal retry
+# window is sized at ~60s to ride out a backend restart; one 429/503 naming
+# hours during that restart would otherwise hold the worker slot — including
+# the shutdown/cancel ``fail`` path — long after the result is computed. The
+# backoff cap plus ``lifecycle_timeout_s``-scale headroom (15s default) still
+# honours any window that fits a restart. ``int`` for the same reason as above.
+_TERMINAL_RETRY_AFTER_MAX_S = int(_DEFAULT_BACKOFF_MAX_S) + 15
 
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
@@ -1583,7 +1591,9 @@ class BackendClient:
         ordering.
         """
         try:
-            resp = await self._request("GET", "/tasks/box-id")
+            resp = await self._request(
+                "GET", "/tasks/box-id", retry_after_max_s=_TERMINAL_RETRY_AFTER_MAX_S,
+            )
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 404:
                 return None
@@ -1612,6 +1622,7 @@ class BackendClient:
         resp = await self._request(
             "GET", f"/tasks/{task_id}/cancel-status",
             timeout=self._cancel_timeout,
+            retry_after_max_s=_TERMINAL_RETRY_AFTER_MAX_S,
         )
         return resp.json() or {}
 
@@ -1655,7 +1666,10 @@ class BackendClient:
         transient (a dead backend dependency mid-write looks like a 500 here,
         and dropping the report orphans the computed outcome) and the attempt
         budget is raised to at least ``_TERMINAL_MIN_ATTEMPTS`` so the retry
-        window (~60s jittered) rides out a backend restart.
+        window (~60s jittered) rides out a backend restart. A 429/503's
+        ``Retry-After`` is capped at ``_TERMINAL_RETRY_AFTER_MAX_S`` (75s) to
+        match that window, so one hours-long hint during the restart cannot
+        hold the worker slot after the result is computed.
         """
         await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
@@ -1663,6 +1677,7 @@ class BackendClient:
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
+            retry_after_max_s=_TERMINAL_RETRY_AFTER_MAX_S,
         )
 
     async def fail(self, task_id: int, error: str) -> None:
@@ -1672,8 +1687,8 @@ class BackendClient:
         a stalled fail call fails fast instead of blocking the polling loop
         for up to 120s (30s × 4 retries) under backend load.
 
-        Retries 500 with a raised attempt budget, same as :meth:`complete` —
-        see there for the rationale.
+        Retries 500 with a raised attempt budget and caps ``Retry-After``,
+        same as :meth:`complete` — see there for the rationale.
 
         ``error`` is capped at ``_MAX_FAIL_ERROR_BYTES`` (see
         :func:`_cap_fail_error`) — the cap lives here, on the wire boundary
@@ -1685,6 +1700,7 @@ class BackendClient:
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
+            retry_after_max_s=_TERMINAL_RETRY_AFTER_MAX_S,
         )
 
     # ----- file transfer (remote mode workers) ----------------------
