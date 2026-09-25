@@ -3675,9 +3675,10 @@ def test_retry_after_delay_unrepresentable_without_ceiling_is_no_guidance(caplog
 async def test_v2_retries_on_own_schedule_when_retry_after_is_unrepresentable(
     monkeypatch, caplog,
 ):
-    """End to end on the v2 transport (retry_after_max_s=None): a 429 naming a
-    400-digit Retry-After must not abort the call — the retry loop falls back
-    to its exponential schedule, exactly as for an absent header."""
+    """End to end on the v2 transport with the ceiling lifted
+    (retry_after_max_s=None): a 429 naming a 400-digit Retry-After must not
+    abort the call — the retry loop falls back to its exponential schedule,
+    exactly as for an absent header."""
     sleeps: list[float] = []
 
     async def fake_sleep(delay):
@@ -3691,7 +3692,7 @@ async def test_v2_retries_on_own_schedule_when_retry_after_is_unrepresentable(
     client = _client_with_handler(handler, max_retries=3, retry_backoff_s=2.0)
     with caplog.at_level("WARNING"):
         with pytest.raises(httpx.HTTPStatusError):
-            await client._resource_request("GET", "/tasks/x")
+            await client._resource_request("GET", "/tasks/x", retry_after_max_s=None)
     await client.close()
 
     assert sleeps == [2.0 * 2**0, 2.0 * 2**1]

@@ -2,14 +2,22 @@
 
 ## 0.19.0.dev47
 
+- Cap `Retry-After` on the retried v2 lifecycle path. `_resource_request`,
+  the shared retry wrapper for v2 claim, start/decline/release and the
+  journal-replayed complete/fail, passed `retry_after_max_s=None`, so one
+  429/503 naming hours or days parked the worker for that long while an
+  admitted attempt held its GPU slot and its lease ran out, or a terminal
+  report sat undelivered. It now takes a `retry_after_max_s` keyword defaulting
+  to the six-hour ceiling every v1 path uses. The claim-204 poll hint is not a
+  retry and stays uncapped; nothing changes on the wire.
+
 - Cap `Retry-After` on v2 bulk transfers. `BackendClient.resource_download`
   and `resource_upload` passed `retry_after_max_s=None`, so a 429/503 naming
   an absurd delay (`Retry-After: 31536000`, a far-future HTTP-date) parked
   input staging or output publication for that long; `AttemptLease` keeps
   renewing in the background, so lease loss never ended the wait. Both now use
-  the default six-hour ceiling, like v1 `download_file`/`upload_file`. The v2
-  lifecycle path (`_resource_request`) keeps its uncapped guidance; nothing
-  changes on the wire.
+  the default six-hour ceiling, like v1 `download_file`/`upload_file`;
+  nothing changes on the wire.
 
 - Bound the admission supervisor's retry sleeps. `admission_supervisor.run`
   built its `BackendClient` with `retry_sleep_budget_s=None`, so a backend
