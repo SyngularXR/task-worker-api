@@ -3634,6 +3634,40 @@ async def test_terminal_report_cap_keeps_budget_and_500_retry(monkeypatch, jitte
 
 
 @pytest.mark.asyncio
+async def test_terminal_report_500_keeps_last_attempt_when_sleeps_overrun(monkeypatch):
+    """max_retries=8, no jitter: the Retry-After budget equals the backoff
+    schedule exactly (182s), so if it gated backoff too, any late-returning
+    sleep would skip the eighth attempt and drop the report to the sweeper."""
+    import time
+
+    clock = {"t": 1000.0}
+    sleeps: list[float] = []
+
+    async def overrunning_sleep(delay):
+        sleeps.append(delay)
+        clock["t"] += delay + 1.0  # event loop hands control back late
+
+    monkeypatch.setattr(asyncio, "sleep", overrunning_sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 8:
+            return httpx.Response(500, text="db down")
+        return httpx.Response(200, json={})
+
+    client = _client_with_handler(
+        handler, max_retries=8, retry_backoff_s=2.0, retry_backoff_max_s=60.0,
+        retry_jitter=False,
+    )
+    await client.complete(7, {})
+    await client.close()
+
+    assert calls["n"] == 8 and len(sleeps) == 7
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("call", ["complete", "fail"])
 async def test_terminal_report_persistent_throttle_stays_in_window(monkeypatch, call):
     """A persistent 429/503 must not chain five capped 75s sleeps (375s):
@@ -3652,7 +3686,7 @@ async def test_terminal_report_persistent_throttle_stays_in_window(monkeypatch, 
     await client.close()
 
     assert sleeps and sum(sleeps) < 80  # ~77.5s jittered window, not 375s
-    assert sum(sleeps) <= client._terminal_retry_kwargs()["sleep_budget_s"]
+    assert sum(sleeps) <= client._terminal_retry_kwargs()["retry_after_budget_s"]
 
 
 @pytest.mark.asyncio

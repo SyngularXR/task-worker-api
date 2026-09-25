@@ -842,7 +842,7 @@ class BackendClient:
         extra_transient: frozenset = frozenset(),
         attempts: Optional[int] = None,
         retry_after_max_s: Optional[int] = _MAX_RETRY_AFTER_S,
-        sleep_budget_s: Optional[float] = None,
+        retry_after_budget_s: Optional[float] = None,
     ):
         """Run ``await fn()`` with exponential-backoff retry on transient errors.
 
@@ -913,16 +913,17 @@ class BackendClient:
         inside the blocked loop, and it is why this is a budget rather than a
         maximum: pick a value with headroom against a handler that blocks.
 
-        ``sleep_budget_s`` is a per-call budget with the same semantics; when
-        both are set the tighter one applies. Terminal reports use it to keep
-        a persistent 429/503 inside their retry window (see :meth:`complete`).
+        ``retry_after_budget_s`` is a per-call budget with the same semantics
+        that only gates ``Retry-After``-driven sleeps (the tighter of it and
+        ``retry_sleep_budget_s`` applies to those). Terminal reports use it to
+        keep a persistent 429/503 inside their retry window (see
+        :meth:`complete`); the backoff schedule is already bounded by the
+        attempt budget, so gating it too would let a merely late-returning
+        sleep drop the final 500 retry.
         """
         import asyncio
 
         total_attempts = attempts if attempts is not None else self.max_retries
-        budget = self.retry_sleep_budget_s
-        if sleep_budget_s is not None:
-            budget = sleep_budget_s if budget is None else min(budget, sleep_budget_s)
         last_exc: Optional[Exception] = None
         slept_s = 0.0
         for attempt in range(total_attempts):
@@ -936,7 +937,7 @@ class BackendClient:
                     attempt, self.retry_backoff_s,
                     self.retry_backoff_max_s, self.retry_jitter,
                 )
-                what, source = type(e).__name__, ""
+                what, source, retry_after = type(e).__name__, "", None
             except httpx.HTTPStatusError as e:
                 if not _is_transient_status(e, extra_transient):
                     raise
@@ -973,6 +974,9 @@ class BackendClient:
                 source = " (Retry-After)" if retry_after is not None else ""
             # Reached only from a retryable failure that still has attempts
             # left; both branches above have picked this attempt's delay.
+            budget = self.retry_sleep_budget_s
+            if retry_after is not None and retry_after_budget_s is not None:
+                budget = retry_after_budget_s if budget is None else min(budget, retry_after_budget_s)
             if budget is not None and slept_s + delay > budget:
                 # Waiting the delay out would blow the budget, and firing the
                 # request early lands inside the window the backend just named
@@ -1031,7 +1035,7 @@ class BackendClient:
         extra_transient: frozenset = frozenset(),
         attempts: Optional[int] = None,
         retry_after_max_s: Optional[int] = _MAX_RETRY_AFTER_S,
-        sleep_budget_s: Optional[float] = None,
+        retry_after_budget_s: Optional[float] = None,
         **kwargs,
     ) -> httpx.Response:
         """Request with exponential-backoff retry on transient errors.
@@ -1042,7 +1046,7 @@ class BackendClient:
         SDK dependencies minimal.
 
         ``extra_transient`` / ``attempts`` / ``retry_after_max_s`` /
-        ``sleep_budget_s`` are forwarded to :meth:`_retry` (terminal reports widen the transient set
+        ``retry_after_budget_s`` are forwarded to :meth:`_retry` (terminal reports widen the transient set
         to include 500 and raise the attempt budget; the periodic heartbeat
         lowers the ``Retry-After`` ceiling); all other kwargs go to httpx.
 
@@ -1060,17 +1064,19 @@ class BackendClient:
         return await self._retry(
             _do_request, method=method, path=path,
             extra_transient=extra_transient, attempts=attempts,
-            retry_after_max_s=retry_after_max_s, sleep_budget_s=sleep_budget_s,
+            retry_after_max_s=retry_after_max_s, retry_after_budget_s=retry_after_budget_s,
         )
 
     def _terminal_retry_kwargs(self) -> dict:
         """Retry settings shared by v1 ``complete``/``fail``.
 
-        The per-call sleep budget is the worst-case jittered backoff schedule
-        over the raised attempt budget (~62s → 77.5s with defaults), floored at
-        one capped ``Retry-After``. The backoff/500 path therefore keeps every
-        attempt, while a persistent 429/503 cannot chain capped sleeps past the
-        window (five 75s sleeps = 375s): it gives up and the sweeper re-queues.
+        The per-call ``Retry-After`` budget is the worst-case jittered backoff
+        schedule over the raised attempt budget (~62s → 77.5s with defaults),
+        floored at one capped ``Retry-After``. It gates only Retry-After
+        sleeps, so the backoff/500 path keeps every attempt however late its
+        sleeps return, while a persistent 429/503 cannot chain capped sleeps
+        past the window (five 75s sleeps = 375s): it gives up and the sweeper
+        re-queues.
         """
         attempts = max(self.max_retries, _TERMINAL_MIN_ATTEMPTS)
         spread = 1.0 + (_JITTER_SPREAD if self.retry_jitter else 0.0)
@@ -1083,7 +1089,7 @@ class BackendClient:
             "extra_transient": _TERMINAL_EXTRA_TRANSIENT,
             "attempts": attempts,
             "retry_after_max_s": _TERMINAL_RETRY_AFTER_MAX_S,
-            "sleep_budget_s": max(float(_TERMINAL_RETRY_AFTER_MAX_S), window),
+            "retry_after_budget_s": max(float(_TERMINAL_RETRY_AFTER_MAX_S), window),
         }
 
     # ----- task lifecycle --------------------------------------------

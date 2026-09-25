@@ -8,10 +8,11 @@
   `fail`, the shutdown/cancel path too) long after the result was computed.
   They now cap it at 75s, matching the ~60s terminal retry window plus
   `lifecycle_timeout_s`-scale headroom; `get_cancel_status` and `get_box_id`
-  take the same cap. The terminal reports' total retry sleep is also bounded
-  by their window (worst-case jittered backoff, ~77.5s by default), so a
-  persistent 429/503 gives up — leaving the task to the sweeper — instead of
-  chaining five 75s sleeps. The backoff/500 path keeps its six attempts, and
+  take the same cap. The terminal reports' total `Retry-After` sleep is also
+  bounded by their window (worst-case jittered backoff, ~77.5s by default), so
+  a persistent 429/503 gives up — leaving the task to the sweeper — instead of
+  chaining five 75s sleeps. That bound gates only `Retry-After` sleeps: the
+  backoff/500 path keeps every attempt even when its sleeps return late, and
   nothing changes on the wire.
 
 - Cap `Retry-After` on the v1 claim poll. `BackendClient.claim_next` retried
