@@ -3611,25 +3611,48 @@ async def test_terminal_report_honours_short_retry_after(monkeypatch, call):
 
 
 @pytest.mark.asyncio
-async def test_terminal_report_cap_keeps_budget_and_500_retry(monkeypatch):
-    """The cap only shortens the sleep: 500 still retries, and the raised
-    six-attempt budget is unchanged."""
+@pytest.mark.parametrize("jitter", [False, True])
+async def test_terminal_report_cap_keeps_budget_and_500_retry(monkeypatch, jitter):
+    """The sleep budget only binds on Retry-After: a persistent 500 still
+    gets the full six-attempt backoff schedule, jittered or not."""
     sleeps = _sleep_recorder(monkeypatch)
     calls = {"n": 0}
 
     async def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        if calls["n"] == 1:
-            return httpx.Response(500, text="db down")
-        return httpx.Response(503, headers={"Retry-After": "21600"}, text="restarting")
+        return httpx.Response(500, text="db down")
 
-    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=0.0)
+    client = _client_with_handler(
+        handler, max_retries=4, retry_backoff_s=2.0, retry_backoff_max_s=60.0,
+        retry_jitter=jitter,
+    )
     with pytest.raises(httpx.HTTPStatusError):
         await client.fail(7, "boom")
     await client.close()
 
-    assert calls["n"] == 6
-    assert sleeps[1:] == [_TERMINAL_RETRY_AFTER_MAX_S] * 4
+    assert calls["n"] == 6 and len(sleeps) == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["complete", "fail"])
+async def test_terminal_report_persistent_throttle_stays_in_window(monkeypatch, call):
+    """A persistent 429/503 must not chain five capped 75s sleeps (375s):
+    total sleep stays within the terminal retry window, then it gives up."""
+    sleeps = _sleep_recorder(monkeypatch)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"Retry-After": "21600"}, text="restarting")
+
+    client = _client_with_handler(
+        handler, max_retries=4, retry_backoff_s=2.0, retry_backoff_max_s=60.0,
+        retry_jitter=True,
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await (client.complete(7, {}) if call == "complete" else client.fail(7, "boom"))
+    await client.close()
+
+    assert sleeps and sum(sleeps) < 80  # ~77.5s jittered window, not 375s
+    assert sum(sleeps) <= client._terminal_retry_kwargs()["sleep_budget_s"]
 
 
 @pytest.mark.asyncio
