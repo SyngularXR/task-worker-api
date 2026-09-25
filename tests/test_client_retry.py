@@ -3434,7 +3434,7 @@ async def test_retry_after_honoured_in_full_never_shortened(monkeypatch):
         handler, max_retries=3, retry_backoff_s=2.0, retry_backoff_max_s=300.0,
     )
     with pytest.raises(httpx.HTTPStatusError):
-        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+        await client._request("GET", "/tasks/7")
     await client.close()
 
     assert sleeps == [120.0, 120.0]
@@ -3478,7 +3478,7 @@ async def test_retry_after_has_distinct_remote_input_cap(monkeypatch):
         handler, max_retries=2, retry_backoff_s=2.0, retry_backoff_max_s=30.0,
     )
     with pytest.raises(httpx.HTTPStatusError):
-        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+        await client._request("GET", "/tasks/7")
     await client.close()
 
     assert sleeps == [6 * 60 * 60]
@@ -3587,6 +3587,47 @@ async def test_heartbeat_cap_does_not_lengthen_a_short_retry_after(monkeypatch):
 
     client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
     await client.report_progress(7, stage="rendering")
+    await client.close()
+
+    assert sleeps == [5.0]
+
+
+# The worker awaits claim_next inline for the home backend and every foreign
+# target, so one backend naming a six-hour window must not freeze the poll loop.
+@pytest.mark.asyncio
+async def test_claim_next_caps_retry_after(monkeypatch):
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                429, headers={"Retry-After": "21600"}, text="Too Many Requests",
+            )
+        return httpx.Response(204)
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    assert await client.claim_next([TaskType.MODEL_INITIALIZING], "w") is None
+    await client.close()
+
+    assert calls["n"] == 2
+    assert sleeps == [_HEARTBEAT_RETRY_AFTER_MAX_S]
+
+
+@pytest.mark.asyncio
+async def test_claim_next_honours_short_retry_after(monkeypatch):
+    sleeps = _sleep_recorder(monkeypatch)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, headers={"Retry-After": "5"}, text="busy")
+        return httpx.Response(404)
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0)
+    assert await client.claim_next([TaskType.MODEL_INITIALIZING], "w") is None
     await client.close()
 
     assert sleeps == [5.0]
@@ -3796,7 +3837,7 @@ async def test_total_budget_accumulates_across_attempts(monkeypatch):
         handler, max_retries=6, retry_backoff_s=2.0, retry_sleep_budget_s=400.0,
     )
     with pytest.raises(httpx.HTTPStatusError):
-        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+        await client._request("GET", "/tasks/7")
     await client.close()
 
     # 200 + 200 exactly fills the 400s budget; the third would overrun it.
@@ -3820,7 +3861,7 @@ async def test_budget_exhaustion_logs_warning(monkeypatch, caplog):
     )
     with caplog.at_level("WARNING"):
         with pytest.raises(httpx.HTTPStatusError):
-            await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+            await client._request("GET", "/tasks/7")
     await client.close()
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
@@ -3895,7 +3936,7 @@ async def test_budget_charges_measured_time_and_admission_only(monkeypatch):
         handler, max_retries=6, retry_backoff_s=2.0, retry_sleep_budget_s=600.0,
     )
     with pytest.raises(httpx.HTTPStatusError):
-        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+        await client._request("GET", "/tasks/7")
     await client.close()
 
     # Two sleeps really cost 400 + 400 = 800s, so the third can't fit. Summing
@@ -3930,7 +3971,7 @@ async def test_no_budget_keeps_unbounded_retrying(monkeypatch, budget):
     )
     assert client.retry_sleep_budget_s is None
     with pytest.raises(httpx.HTTPStatusError):
-        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+        await client._request("GET", "/tasks/7")
     await client.close()
 
     assert sleeps == [3600.0, 3600.0]

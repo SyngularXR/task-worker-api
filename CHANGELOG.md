@@ -2,6 +2,14 @@
 
 ## 0.19.0.dev47
 
+- Cap `Retry-After` on the v1 claim poll. `BackendClient.claim_next` retried
+  with the six-hour ceiling, and `Worker` awaits it inline for the home backend
+  and every foreign target, so one rate-limited box answering 429/503 with a
+  long `Retry-After` stopped the worker claiming from every backend (a healthy
+  home included) and hid `shutdown()` for hours. The claim now uses the 60s
+  heartbeat cap; the worker's own claim backoff still paces a backend that
+  stays unhealthy. Nothing changes on the wire.
+
 - Cap `Retry-After` on the retried v2 lifecycle path. `_resource_request`,
   the shared retry wrapper for v2 claim, start/decline/release and the
   journal-replayed complete/fail, passed `retry_after_max_s=None`, so one
