@@ -697,3 +697,58 @@ async def test_run_forever_fatal_affinity_still_tears_down(make_worker, tmp_path
     assert asyncio.all_tasks() - before == set()   # cleanup task not left pending
     assert home.closed and foreign.closed
     assert logger_closed
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_foreign_target_does_not_park_home(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A foreign box answering 429 + Retry-After: 6h is waited out for at
+    most the claim cap, so the next cycle still claims from home."""
+    from task_worker_api.client import (
+        _HEARTBEAT_RETRY_AFTER_MAX_S,
+        BackendClient,
+    )
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "21600"})
+
+    foreign = BackendClient(
+        "http://foreign-box:5000/api/v1", "foreign-key",
+        client=httpx.AsyncClient(
+            base_url="http://foreign-box:5000/api/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+        max_retries=4, retry_backoff_s=0.0, retry_jitter=False,
+    )
+    home = FakeBackendClient()
+    worker = make_worker(
+        client=home,
+        handlers={TaskType.MODEL_INITIALIZING: _mi_handler},
+        foreign_targets=[ForeignTarget(
+            url="http://foreign-box:5000/api/v1", api_key="foreign-key",
+            task_types=[TaskType.MODEL_INITIALIZING], client=foreign,
+        )],
+    )
+    # Cycle 1: home empty, foreign rate-limited through its retry budget.
+    # Sleeps are faked only here: the task cycle below needs real ones.
+    with monkeypatch.context() as m:
+        m.setattr(asyncio, "sleep", fake_sleep)
+        assert await worker.run_one() is False
+    assert sleeps and max(sleeps) <= _HEARTBEAT_RETRY_AFTER_MAX_S
+
+    src = tmp_path / "part.stl"
+    src.write_bytes(b"solid\n")
+    home.queue_task(
+        task_type=TaskType.MODEL_INITIALIZING,
+        params={"job_id": "j1", "input_path": str(src), "base_name": "part"},
+    )
+    assert await worker.run_one() is True
+    assert len(home.completed_tasks) == 1
+    await foreign.close()

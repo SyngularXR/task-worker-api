@@ -1422,6 +1422,14 @@ class BackendClient:
         recorded via the optional payload_logger before re-raising. This is
         how a worker captures evidence when the backend ships a new task
         type before the worker fleet has been upgraded.
+
+        A 429/503's ``Retry-After`` is capped at
+        ``_HEARTBEAT_RETRY_AFTER_MAX_S`` (60s): :class:`Worker
+        <task_worker_api.worker.Worker>` awaits this call inline for the home
+        backend and every foreign target, so honouring an hours-long window
+        from one rate-limited backend would stop claiming from all of them and
+        leave ``_stop`` unnoticed until it ended. A backend that stays
+        unhealthy is already handled by the worker's own claim backoff.
         """
         types_str = ",".join(
             t.value if hasattr(t, "value") else str(t) for t in task_types
@@ -1444,7 +1452,10 @@ class BackendClient:
             resp.raise_for_status()
             return resp
 
-        resp = await self._retry(_claim_once, method="GET", path=path)
+        resp = await self._retry(
+            _claim_once, method="GET", path=path,
+            retry_after_max_s=_HEARTBEAT_RETRY_AFTER_MAX_S,
+        )
         if resp.status_code == 204:
             return None
         if resp.status_code == 404:
