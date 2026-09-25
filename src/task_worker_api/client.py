@@ -232,8 +232,9 @@ def _retry_after_delay(response: httpx.Response, *, maximum_seconds: Optional[in
 
     Returns ``None`` only when the header carries no usable guidance — absent
     or malformed. The caller then falls back to its own exponential schedule.
-    By default valid delays are capped at ``_MAX_RETRY_AFTER_S``; admission v2
-    passes maximum_seconds=None so server guidance is never shortened. This is deliberately
+    By default valid delays are capped at ``_MAX_RETRY_AFTER_S``; the v2
+    claim's 204 poll hint passes maximum_seconds=None, since it is a poll
+    interval rather than a retry, so that guidance is never shortened. This is deliberately
     separate from ``retry_backoff_max_s``: a 60-second exponential-backoff cap
     must not turn ``Retry-After: 3600`` into six requests inside a one-hour
     rate-limit window.
@@ -1089,16 +1090,20 @@ class BackendClient:
         response.raise_for_status()
         return response
 
-    async def _resource_request(self, method, path, *, extra_transient=frozenset(), attempts=None, **kwargs):
+    async def _resource_request(self, method, path, *, extra_transient=frozenset(), attempts=None,
+                                retry_after_max_s=_MAX_RETRY_AFTER_S, **kwargs):
         """Retried v2 lifecycle request.
 
-        ``extra_transient`` / ``attempts`` are forwarded to :meth:`_retry`, as
-        on v1's :meth:`_request` — terminal reports use them to widen the
-        transient set and raise the attempt budget.
+        ``extra_transient`` / ``attempts`` / ``retry_after_max_s`` are forwarded
+        to :meth:`_retry`, as on v1's :meth:`_request` — terminal reports use
+        the first two to widen the transient set and raise the attempt budget.
+        ``Retry-After`` takes v1's six-hour ceiling: an uncapped 429/503 naming
+        hours or days parks the worker while an admitted attempt holds its GPU
+        slot and its lease runs out, or a terminal report sits undelivered.
         """
         return await self._retry(
             lambda: self._resource_request_once(method, path, **kwargs),
-            method=method, path=path, retry_after_max_s=None,
+            method=method, path=path, retry_after_max_s=retry_after_max_s,
             extra_transient=extra_transient, attempts=attempts,
         )
 
@@ -1207,9 +1212,9 @@ class BackendClient:
         the same reason as v1's :meth:`report_progress_once`: this runs on the
         handler's critical path (``AttemptLease.update``), and the retry loop
         would let a degraded backend block the handler for ``max_retries`` ×
-        ``lifecycle_timeout_s`` plus backoff (~74s on defaults) — or, since the
-        v2 path passes ``retry_after_max_s=None``, for however long a 429's
-        ``Retry-After`` names — while the work being described sits idle.
+        ``lifecycle_timeout_s`` plus backoff (~74s on defaults) — or for as
+        long as a 429's ``Retry-After`` names, up to the six-hour ceiling —
+        while the work being described sits idle.
         Dropping one display update is cheap: the lease's own background
         ``_renew`` heartbeat is what refreshes the deadline, and it keeps its
         retries — bounded, there, by the lease they are renewing (see

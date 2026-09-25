@@ -8,7 +8,7 @@ import httpx
 from pydantic import ValidationError
 
 from task_worker_api.claim_journal import ClaimJournal
-from task_worker_api.client import BackendClient, _MAX_FAIL_ERROR_BYTES, _TERMINAL_MIN_ATTEMPTS
+from task_worker_api.client import BackendClient, _MAX_FAIL_ERROR_BYTES, _MAX_RETRY_AFTER_S, _TERMINAL_MIN_ATTEMPTS
 from task_worker_api.resources import AdmissionError
 from task_worker_api.resources import (AttemptOwnership, Capacity, ClaimRequest, ClaimResult,
                                         ResourceProfile, HostSnapshot)
@@ -101,7 +101,9 @@ def test_claim_journal_survives_lost_response_and_process_restart(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_v2_retry_after_is_not_shortened_by_jitter_or_legacy_cap(tmp_path, monkeypatch):
+async def test_v2_claim_poll_hint_is_uncapped_but_its_retry_sleep_is_capped(tmp_path, monkeypatch):
+    """The 204's Retry-After is a poll interval, handed back unshortened; the
+    503's is a retry sleep inside ``_retry``, held to v1's six-hour ceiling."""
     sleeps = []
 
     async def sleep(seconds):
@@ -123,7 +125,7 @@ async def test_v2_retry_after_is_not_shortened_by_jitter_or_legacy_cap(tmp_path,
         backend = BackendClient("http://test", "test", client=client, max_retries=2, retry_backoff_max_s=60)
         result, delay = await backend.resource_claim(ClaimJournal(tmp_path / "journal.sqlite"), uuid4(), ["test"], report)
     assert result is None and delay == 86400
-    assert sleeps == [86401]
+    assert sleeps == [_MAX_RETRY_AFTER_S]
     assert len(calls) == 2 and calls[0].content == calls[1].content
 
 
@@ -246,8 +248,10 @@ async def test_v2_fail_replays_the_capped_body_after_a_lost_response(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _flaky_backend(claim, statuses, calls, **options):
+def _flaky_backend(claim, statuses, calls, *, retry_after=None, **options):
     """Backend whose lifecycle route returns ``statuses`` in order, then 200.
+
+    ``retry_after``, when given, is sent as the failures' Retry-After header.
 
     ``retry_backoff_s=0`` keeps the retry loop's sleeps instant; the delay
     schedule itself is covered in ``test_client_retry``.
@@ -256,7 +260,7 @@ def _flaky_backend(claim, statuses, calls, **options):
         calls.append(request)
         status = statuses[len(calls) - 1] if len(calls) <= len(statuses) else 200
         if status != 200:
-            return httpx.Response(status)
+            return httpx.Response(status, headers={} if retry_after is None else {"Retry-After": retry_after})
         now = datetime.now(timezone.utc)
         return httpx.Response(200, json={
             "task_id": claim.task_id, "attempt_id": str(claim.ownership.attempt_id),
@@ -318,6 +322,35 @@ async def test_v2_non_terminal_operation_keeps_the_default_retry_contract(tmp_pa
     await transport.aclose()
 
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["start", "complete"])
+@pytest.mark.parametrize("retry_after", ["31536000", "Fri, 01 Jan 9999 00:00:00 GMT"])
+async def test_v2_lifecycle_caps_an_absurd_retry_after(tmp_path, no_blocking_sleep, kind, retry_after):
+    """One 429 naming a year must not park the worker for a year — an admitted
+    attempt would hold its GPU slot while its lease ran out, or a terminal
+    report would sit undelivered. The v1 ceiling applies, jitter included."""
+    journal, claim = _admitted_journal(tmp_path, uuid4())
+    calls: list = []
+    backend, transport = _flaky_backend(claim, [429], calls, retry_after=retry_after, retry_jitter=True)
+    state = await backend.resource_operation(journal, kind, {} if kind == "start" else _terminal_payload(kind))
+    await transport.aclose()
+
+    assert no_blocking_sleep == [_MAX_RETRY_AFTER_S]
+    assert len(calls) == 2 and state.attempt_id == claim.ownership.attempt_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["start", "complete"])
+async def test_v2_lifecycle_honours_a_normal_retry_after(tmp_path, no_blocking_sleep, kind):
+    journal, claim = _admitted_journal(tmp_path, uuid4())
+    calls: list = []
+    backend, transport = _flaky_backend(claim, [429], calls, retry_after="7", retry_jitter=False)
+    await backend.resource_operation(journal, kind, {} if kind == "start" else _terminal_payload(kind))
+    await transport.aclose()
+
+    assert no_blocking_sleep == [7.0] and len(calls) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +430,10 @@ async def test_v2_progress_stays_one_shot_under_a_degraded_backend(failure, no_b
 
 
 @pytest.mark.asyncio
-async def test_v2_progress_ignores_an_uncapped_retry_after(no_blocking_sleep):
-    """The v2 lifecycle path passes ``retry_after_max_s=None``, so a 429 on the
-    retried path can impose an arbitrary server-named sleep. One-shot progress
-    never honours it: a throttling backend cannot park the handler for an hour."""
+async def test_v2_progress_ignores_retry_after(no_blocking_sleep):
+    """A 429 on the retried lifecycle path imposes a server-named sleep of up
+    to six hours. One-shot progress never honours it: a throttling backend
+    cannot park the handler for an hour."""
     claim = _admitted_claim(uuid4())
     sent: list = []
 
