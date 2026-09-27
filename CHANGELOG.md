@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.0.dev48
+
+- Register `visual_tracking` with an algorithm-neutral, replay-only params schema
+  and generated TypeScript types. Candidate inputs use staged `sequence.json`
+  and relative assets; ground truth stays outside the worker. Adapter IDs are
+  resolved by the installed handler. Registration does not enroll a worker,
+  validate a resource profile, or enable live sessions.
+
 ## 0.19.0.dev47
 
 - Cap `Retry-After` on the v1 claim poll. `BackendClient.claim_next` retried

@@ -171,6 +171,23 @@ def test_gs4d_build_registered():
     assert TASK_PARAMS_SCHEMAS[TaskType.GS4D_BUILD] is Gs4dBuildParams
 
 
+def test_visual_tracking_replay_contract():
+    from task_worker_api.schemas import VisualTrackingParams
+
+    assert TASK_PARAMS_SCHEMAS[TaskType.VISUAL_TRACKING] is VisualTrackingParams
+    params = VisualTrackingParams(adapter_id="candidate_a", adapter_params={"stage": {"iterations": 4}})
+    assert VisualTrackingParams.model_validate_json(params.model_dump_json()) == params
+    assert params.sequence_path == "sequence.json"
+    for invalid in ({"mode": "live"}, {"sequence_path": "../sequence.json"},
+                    {"input_path": "/private/sequence.json"}, {"adapter_id": "package:run"},
+                    {"frame_timeout_seconds": 0}, {"frame_timeout_seconds": True},
+                    {"run_timeout_seconds": float("inf")}, {"run_timeout_seconds": 1},
+                    {"adapter_params": {"threshold": float("nan")}},
+                    {"adapter_params": {"blob": "x" * 65536}}):
+        with pytest.raises(ValidationError):
+            VisualTrackingParams(**{**params.model_dump(), **invalid})
+
+
 def test_gs4d_build_stages_match_backend_queue():
     assert Gs4dBuildParams(stage="render").n_cameras == 0
     assert Gs4dBuildParams(stage="finalize", n_phases=3).n_phases == 3
