@@ -8,6 +8,15 @@
   resolved by the installed handler. Registration does not enroll a worker,
   validate a resource profile, or enable live sessions.
 
+- Keep the admission supervisor's startup heartbeat alive across transport
+  errors. An `httpx.TransportError` from `resource_heartbeat` (after the
+  client's retries) ended the heartbeat task, stopped renewing the reservation
+  while the child launched, and `run_cycle` then re-raised it over the cycle's
+  own exception, skipping cleanup and release. It is now logged as a warning
+  and the 5s heartbeat continues. A 409 still ends heartbeating, and a
+  `ProtocolError` still ends the cycle, but neither replaces an error the cycle
+  body is already raising.
+
 ## 0.19.0.dev47
 
 - Cap `Retry-After` on the v1 claim poll. `BackendClient.claim_next` retried

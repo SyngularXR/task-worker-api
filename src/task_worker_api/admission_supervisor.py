@@ -59,8 +59,13 @@ async def run_cycle(client, journal, worker_instance_id, task_types, supervisor,
                     if exc.response.status_code == 409:
                         return  # Terminal/fenced attempts proceed to owned cleanup.
                     raise
-                if state.state != "reserved" or state.cancelled:
-                    return
+                except httpx.TransportError:
+                    # A blip after the client's retries costs one renewal, not the
+                    # heartbeat. ProtocolError and other failures still end the cycle.
+                    logging.getLogger(__name__).warning("Startup heartbeat unavailable", exc_info=True)
+                else:
+                    if state.state != "reserved" or state.cancelled:
+                        return
                 await asyncio.sleep(5)
 
         heartbeat = asyncio.create_task(startup_heartbeat())
@@ -76,8 +81,10 @@ async def run_cycle(client, journal, worker_instance_id, task_types, supervisor,
                 await asyncio.sleep(2)
         finally:
             heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+            await asyncio.wait([heartbeat])  # Drain without letting its error replace the body's.
+            failure = None if heartbeat.cancelled() else heartbeat.exception()
+        if failure is not None:
+            raise failure
     # Recovery never resumes an old handler, even if its container is still alive.
     await asyncio.to_thread(supervisor.cleanup, claim)
     await _log_resources(claim, read_report, "cleanup_finished", started)
