@@ -46,6 +46,7 @@ class TaskType(str, Enum):
     FINALIZE_DEPLOY_PREPARATION = "finalize_deploy_prep"
     SPATIAL_RECONSTRUCTION = "spatial_recon"
     SPATIAL_GS_BUILD = "spatial_gs_build"
+    VISUAL_TRACKING = "visual_tracking"
 
 
 class TaskStatus(IntEnum):

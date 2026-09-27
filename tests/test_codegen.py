@@ -62,3 +62,11 @@ def test_spatial_gs_build_contract_is_generated(generated_ts):
     assert "| 'spatial_gs_build'" in generated_ts
     assert "SPATIAL_GS_BUILD: 'spatial_gs_build' as const" in generated_ts
     assert "'spatial_gs_build': SpatialGsBuildParams;" in generated_ts
+
+
+def test_visual_tracking_contract_is_generated(generated_ts):
+    assert "VISUAL_TRACKING: 'visual_tracking' as const" in generated_ts
+    assert "'visual_tracking': VisualTrackingParams;" in generated_ts
+    assert 'mode?: "replay";' in generated_ts
+    assert 'sequence_path?: "sequence.json";' in generated_ts
+    assert 'schema_version?: 1;' in generated_ts

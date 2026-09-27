@@ -28,6 +28,7 @@ export type TaskType =
   | 'finalize_deploy_prep'
   | 'spatial_recon'
   | 'spatial_gs_build'
+  | 'visual_tracking'
 ;
 
 export const TaskType = {
@@ -54,6 +55,7 @@ export const TaskType = {
   FINALIZE_DEPLOY_PREPARATION: 'finalize_deploy_prep' as const,
   SPATIAL_RECONSTRUCTION: 'spatial_recon' as const,
   SPATIAL_GS_BUILD: 'spatial_gs_build' as const,
+  VISUAL_TRACKING: 'visual_tracking' as const,
 } as const;
 
 export enum TaskStatus {
@@ -281,7 +283,7 @@ export interface DeployCaseParams {
  * Assemble the immutable recipe staged by the backend admission service.
  */
 export interface PrepareDeployParams {
-  recipe_path?: string;
+  recipe_path?: "recipe.json";
 }
 
 /**
@@ -313,7 +315,7 @@ export interface SpatialReconstructionParams {
   case_guid: string;
   capture_hash: string;
   capture_root_rel: string;
-  coordinate_frame: string;
+  coordinate_frame: "syngar_anchor_v1";
 }
 
 /**
@@ -323,12 +325,29 @@ export interface SpatialGsBuildParams {
   case_guid: string;
   capture_hash: string;
   capture_root_rel: string;
-  coordinate_frame: string;
+  coordinate_frame: "syngar_anchor_v1";
   iterations?: number;
   max_image_size?: number;
   max_splats?: number;
   input_id?: string;
   input_manifest_sha256?: string;
+}
+
+/**
+ * Replay candidate-only inputs staged from an immutable admission manifest.
+
+Stage sequence.json at the input root and preserve its relative asset paths.
+Ground truth is evaluator-only and must never be included in these inputs.
+The installed handler allowlists adapters; an ID is not a Python import path.
+ */
+export interface VisualTrackingParams {
+  schema_version?: 1;
+  mode?: "replay";
+  sequence_path?: "sequence.json";
+  adapter_id: string;
+  adapter_params?: Record<string, unknown>;
+  frame_timeout_seconds?: number;
+  run_timeout_seconds?: number;
 }
 
 
@@ -346,4 +365,5 @@ export interface TaskParamsByType {
   'generate_synthetic': GenerateSyntheticParams;
   'spatial_recon': SpatialReconstructionParams;
   'spatial_gs_build': SpatialGsBuildParams;
+  'visual_tracking': VisualTrackingParams;
 }
