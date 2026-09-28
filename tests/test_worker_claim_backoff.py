@@ -68,8 +68,14 @@ class _RecoveringClient(_AlwaysFailingClient):
 def _capture_wait_timeouts(monkeypatch) -> list[float]:
     """Capture the timeout that the poll loop actually passes to wait_for."""
     waits: list[float] = []
+    real_wait_for = asyncio.wait_for
 
     async def _wait_for(awaitable, timeout):
+        # The patch lands on the shared asyncio module, so other bounded waits
+        # (e.g. the progress heartbeat tick) come through here too; only the
+        # poll loop's idle wait on ``_stop`` is the one under test.
+        if getattr(awaitable, "__qualname__", "") != "Event.wait":
+            return await real_wait_for(awaitable, timeout)
         waits.append(timeout)
         awaitable.close()
         await asyncio.sleep(0)
