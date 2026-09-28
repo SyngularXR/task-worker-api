@@ -77,6 +77,103 @@ async def test_supervisor_renews_reservation_during_child_startup(tmp_path, monk
         assert state["renewed_after_launch"] >= 2
 
 
+
+def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None):
+    """run_cycle harness whose startup heartbeat and launch are scripted."""
+    state = dict(phase="reserved", polls=0)
+    claim = SimpleNamespace(ownership=SimpleNamespace(attempt_id=uuid4()))
+    sleep = asyncio.sleep
+
+    async def short_sleep(seconds):
+        await sleep(0.001 if seconds == 5 else 0.01)
+
+    monkeypatch.setattr(asyncio, "sleep", short_sleep)
+
+    class Client:
+        async def resource_claim(self, *args):
+            return claim, 0
+        async def resource_heartbeat(self, *args):
+            heartbeat()
+            return SimpleNamespace(state="reserved", cancelled=False)
+        async def resource_status(self, *args):
+            return SimpleNamespace(state=state["phase"], cancelled=False)
+        async def resource_recover_operations(self, *args):
+            pass
+        async def resource_operation(self, journal, operation, *args, **kwargs):
+            state["phase"] = "released" if operation == "release" else "releasing"
+            state[operation] = True
+            return SimpleNamespace(state=state["phase"])
+        async def resource_ready(self, *args):
+            pass
+
+    class Supervisor:
+        def _row(self, *args):
+            raise AdmissionError("launch_unknown")
+        def launch(self, *args, **kwargs):
+            launch()
+        def running(self, *args):
+            state["polls"] += 1
+            return state["polls"] < 4
+        def cleanup(self, *args):
+            state["cleaned"] = True
+        def sign_cleanup(self, *args):
+            return None
+
+    async def report():
+        return None
+
+    from task_worker_api.admission_supervisor import run_cycle
+    journal = SimpleNamespace(path=tmp_path / "journal", acknowledge_release=lambda attempt: None)
+    return state, run_cycle(Client(), journal, uuid4(), ["gs_build"], Supervisor(), {}, report, b"key")
+
+
+@pytest.mark.asyncio
+async def test_startup_heartbeat_survives_transport_error(tmp_path, monkeypatch):
+    calls = []
+
+    def heartbeat():
+        calls.append(None)
+        if len(calls) == 1:
+            raise httpx.ConnectError("blip", request=httpx.Request("POST", "http://test/heartbeat"))
+
+    state, cycle = _startup_cycle(tmp_path, monkeypatch, heartbeat)
+    await cycle
+    assert len(calls) >= 2  # Renewal resumed after the blip.
+    assert state["cleaned"] and state["release"]
+
+
+@pytest.mark.asyncio
+async def test_startup_heartbeat_protocol_error_ends_cycle(tmp_path, monkeypatch):
+    from task_worker_api.errors import ProtocolError
+
+    def heartbeat():
+        raise ProtocolError("retired protocol")
+
+    state, cycle = _startup_cycle(tmp_path, monkeypatch, heartbeat)
+    with pytest.raises(ProtocolError):
+        await cycle
+    assert "cleaned" not in state and "release" not in state
+
+
+@pytest.mark.asyncio
+async def test_startup_heartbeat_error_does_not_mask_launch_error(tmp_path, monkeypatch):
+    import threading
+    from task_worker_api.errors import ProtocolError
+
+    failed = threading.Event()
+
+    def heartbeat():
+        failed.set()
+        raise ProtocolError("retired protocol")
+
+    def launch():
+        assert failed.wait(5)
+        raise RuntimeError("launch failed")
+
+    _, cycle = _startup_cycle(tmp_path, monkeypatch, heartbeat, launch)
+    with pytest.raises(RuntimeError, match="launch failed"):
+        await cycle
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("startup_failures", [0, 5])
 @pytest.mark.parametrize("budget", [{}, {"retry_sleep_budget_s": 30}])
