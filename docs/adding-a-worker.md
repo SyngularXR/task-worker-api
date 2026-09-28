@@ -251,12 +251,15 @@ immediate report is a one-shot call (`BackendClient.report_progress_once`)
 with no retry loop: a degraded backend costs you one `lifecycle_timeout_s`
 (default 15s), not `max_retries` × that plus backoff. A dropped update costs
 stage-transition latency only — the background heartbeat re-sends the state
-on its next tick, and *it* still retries, which is what keeps the task from
-looking abandoned to the sweeper.
+on its next tick, which is what keeps the task from looking abandoned to the
+sweeper. Heartbeat ticks use the same one-shot call, each bounded by
+`heartbeat_interval_s`, so one hung report is abandoned instead of freezing
+the heartbeat.
 
 Nothing to migrate if you supply your own client
 (`Worker(client=your_client)`): one without `report_progress_once` keeps
-using the retried `report_progress` for immediate reports and the SDK logs
+using the retried `report_progress` for immediate reports and heartbeat
+ticks (each tick still bounded by `heartbeat_interval_s`) and the SDK logs
 one WARNING per process naming it. Add
 `report_progress_once(task_id, *, stage, current=0, total=0, kill_handle=None)`
 — same signature and wire call as `report_progress`, minus the retries — to

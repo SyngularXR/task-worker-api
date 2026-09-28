@@ -37,7 +37,7 @@ def _one_shot_report(client: "BackendClient"):
     every one of them at the first stage transition, so a client that lacks it
     keeps the retried call it always had — it just keeps the old worst case,
     where one immediate report can block the handler for ``max_retries`` ×
-    ``lifecycle_timeout_s`` plus backoff.
+    ``lifecycle_timeout_s`` plus backoff (the heartbeat bounds its own ticks).
     """
     report = getattr(client, "report_progress_once", None)
     if report is not None:
@@ -46,8 +46,8 @@ def _one_shot_report(client: "BackendClient"):
     if not _warned_legacy_progress_client:
         _warned_legacy_progress_client = True
         log.warning(
-            "%s has no 'report_progress_once'; an immediate progress update "
-            "will keep going through the retried 'report_progress', so a "
+            "%s has no 'report_progress_once'; progress reports will keep "
+            "going through the retried 'report_progress', so a "
             "degraded backend can stall a handler for max_retries x "
             "lifecycle_timeout_s plus backoff on one update. Add a one-shot "
             "(no-retry) 'report_progress_once' with the same signature.",
@@ -112,8 +112,7 @@ class ProgressReporter:
         work the update was describing. Losing one immediate report costs
         stage-transition latency only: the new state is already in
         ``self._state``, and the background heartbeat re-sends it on its next
-        tick through the retried call, which is what keeps ``updated_at``
-        fresh across a backend blip.
+        tick, which is what keeps ``updated_at`` fresh across a backend blip.
         """
         self._state.stage = stage
         self._state.current = current
@@ -186,8 +185,13 @@ class ProgressReporter:
     async def _heartbeat_loop(self) -> None:
         """Background heartbeat — best-effort, tolerates transient errors.
 
-        A single failed tick (the BackendClient has already exhausted its
-        own retries by this point) is logged at DEBUG: a transient blip
+        Each tick is one one-shot report bounded by ``heartbeat_interval_s``:
+        a call that hangs (or a retried legacy call riding out backoff) is
+        abandoned as a failed tick so the next one fires on cadence. Waiting
+        it out would freeze ``updated_at`` for the whole stall, and the next
+        tick re-sends the same state anyway.
+
+        A single failed tick is logged at DEBUG: a transient blip
         during a long-running task is noise an operator doesn't need.
         But a *sustained* outage — N consecutive failures — means the
         backend is unreachable and the task's ``updated_at`` is going
@@ -197,12 +201,15 @@ class ProgressReporter:
         """
         while True:
             try:
-                resp = await self._client.report_progress(
-                    self._task_id,
-                    stage=self._state.stage,
-                    current=self._state.current,
-                    total=self._state.total,
-                    kill_handle=_REMOTE_KILL_HANDLE,
+                resp = await asyncio.wait_for(
+                    _one_shot_report(self._client)(
+                        self._task_id,
+                        stage=self._state.stage,
+                        current=self._state.current,
+                        total=self._state.total,
+                        kill_handle=_REMOTE_KILL_HANDLE,
+                    ),
+                    timeout=self._interval,
                 )
                 if resp.get("cancelled"):
                     self._state.cancelled.set()
@@ -212,12 +219,12 @@ class ProgressReporter:
                 if self._heartbeat_failures >= self._warn_threshold:
                     log.warning(
                         "heartbeat failed for task %s (%d consecutive "
-                        "failures): %s",
+                        "failures): %r",
                         self._task_id, self._heartbeat_failures, e,
                     )
                 else:
                     log.debug(
-                        "heartbeat failed for task %s: %s",
+                        "heartbeat failed for task %s: %r",
                         self._task_id, e,
                     )
             try:

@@ -106,10 +106,10 @@ async def test_update_uses_report_progress_once_not_the_retried_call():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_still_uses_the_retried_report_progress():
-    """The background heartbeat keeps the retried call: it's off the critical
-    path, and it's what rides through a blip to keep updated_at fresh so the
-    sweeper doesn't read the task as abandoned."""
+async def test_heartbeat_uses_report_progress_once():
+    """A heartbeat tick is one-shot: a retried call riding out backoff would
+    hold the tick (and freeze updated_at) for minutes, while the next tick
+    re-sends the same state anyway."""
     client = _RoutingClient()
     pr = ProgressReporter(client, task_id=1, heartbeat_interval_s=0.01)
     await pr.start_heartbeat()
@@ -117,7 +117,47 @@ async def test_heartbeat_still_uses_the_retried_report_progress():
     await pr.stop()
 
     assert client.calls, "heartbeat never ticked"
-    assert set(client.calls) == {"report_progress"}
+    assert set(client.calls) == {"report_progress_once"}
+
+
+class _HangingClient(FakeBackendClient):
+    """report_progress never returns (FakeBackendClient's once delegates)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def report_progress(self, task_id, *, stage, current=0, total=0,
+                              kill_handle=None):
+        self.calls += 1
+        await asyncio.Event().wait()
+
+
+class _HangingLegacyClient:
+    """No report_progress_once, so the heartbeat falls back to this."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def report_progress(self, task_id, *, stage, current=0, total=0,
+                              kill_handle=None):
+        self.calls += 1
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_cls", [_HangingClient, _HangingLegacyClient])
+async def test_heartbeat_abandons_a_report_that_never_returns(client_cls):
+    """One hung report must not freeze the heartbeat: the tick is abandoned
+    and the next one fires on cadence (was: 1 call, then nothing)."""
+    client = client_cls()
+    pr = ProgressReporter(client, task_id=1, heartbeat_interval_s=0.01)
+    await pr.start_heartbeat()
+    await asyncio.sleep(0.08)
+    await pr.stop()
+
+    assert client.calls >= 2
+    assert pr._heartbeat_failures >= 1
 
 
 @pytest.mark.asyncio

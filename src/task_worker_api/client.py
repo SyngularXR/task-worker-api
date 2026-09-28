@@ -1511,12 +1511,13 @@ class BackendClient:
         retries) on a single slow progress call.
 
         A 429's ``Retry-After`` is capped at ``_HEARTBEAT_RETRY_AFTER_MAX_S``
-        (60s) here for the same reason: this is the call
-        :meth:`ProgressReporter._heartbeat_loop
-        <task_worker_api.progress.ProgressReporter._heartbeat_loop>` makes on
-        a timer, and parking it for the window a rate-limited backend names
-        would freeze ``updated_at`` long enough for the stale-task sweeper to
-        reclaim a task whose worker is demonstrably alive. Re-sending the same
+        (60s) here for the same reason: a client without
+        :meth:`report_progress_once` still sends its heartbeat through this
+        call (bounded per tick by :meth:`ProgressReporter._heartbeat_loop
+        <task_worker_api.progress.ProgressReporter._heartbeat_loop>`), and
+        parking it for the window a rate-limited backend names would freeze
+        ``updated_at`` long enough for the stale-task sweeper to reclaim a
+        task whose worker is demonstrably alive. Re-sending the same
         state a minute later costs one request; losing the task to a second
         worker costs the whole attempt. Terminal reports keep the full ceiling.
         """
@@ -1551,11 +1552,13 @@ class BackendClient:
         the work the update was describing sat idle.
 
         Dropping a *single* progress report is cheap: the state it carries is
-        kept in the reporter and re-sent by the next background heartbeat,
-        which still uses the retried :meth:`report_progress` so the task's
-        ``updated_at`` keeps riding through backend blips (the sweeper reads a
-        stale ``updated_at`` as abandonment). Stage-transition latency is the
-        only thing traded away, and only while the backend is degraded.
+        kept in the reporter and re-sent by the next background heartbeat
+        tick. The heartbeat uses this call too, each tick bounded by the
+        heartbeat interval, so one stuck request is abandoned and the next
+        tick keeps ``updated_at`` fresh (the sweeper reads a stale
+        ``updated_at`` as abandonment) instead of the retried call holding the
+        tick for minutes. Stage-transition latency is the only thing traded
+        away, and only while the backend is degraded.
 
         Transport errors and transient HTTP status codes surface immediately
         rather than being retried; ``ProgressReporter.update`` catches them and

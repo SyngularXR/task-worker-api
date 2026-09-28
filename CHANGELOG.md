@@ -2,6 +2,16 @@
 
 ## 0.19.0.dev48
 
+- Bound each v1 heartbeat tick. `ProgressReporter`'s heartbeat awaited the
+  retried `report_progress` with no end-to-end bound, so one report that never
+  returned (or rode out 4 x `lifecycle_timeout_s` plus backoff, ~4 minutes)
+  froze the heartbeat and `updated_at` until the stale-task sweeper could
+  reclaim a live task. A tick now goes through the same one-shot
+  `report_progress_once` as `update()` (falling back to `report_progress` on a
+  legacy client) under `asyncio.wait_for(timeout=heartbeat_interval_s)`; a
+  timed-out tick counts as a failed tick and the next fires on cadence.
+  Nothing changes on the wire.
+
 - Register `visual_tracking` with an algorithm-neutral, replay-only params schema
   and generated TypeScript types. Candidate inputs use staged `sequence.json`
   and relative assets; ground truth stays outside the worker. Adapter IDs are
