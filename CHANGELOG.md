@@ -2,6 +2,21 @@
 
 ## 0.19.0.dev48
 
+- Stop the v1 heartbeat reliably on Python 3.10/3.11. dev48's per-tick
+  `asyncio.wait_for` bound swallows a cancel that lands in the loop pass its
+  report completes in (fixed upstream in 3.12), so `ProgressReporter.stop()`
+  could wait forever on a heartbeat that kept ticking, hanging `_run_one`.
+  The loop now exits once `stop()` has detached it, as the v2 attempt
+  heartbeat already does.
+
+- Cap the v2 claim's 204 poll hint. `BackendClient.resource_claim` parsed the
+  no-work `Retry-After` with no ceiling, and the admission supervisor sleeps
+  the returned delay unattended, so `Retry-After: 999999999` or an HTTP-date
+  years ahead left a live-looking worker that never claimed again. The hint is
+  now clamped to `_CLAIM_POLL_HINT_MAX_S` (5 minutes). This reverses dev47's
+  "stays uncapped". Shorter hints pass through unchanged, and a missing or
+  malformed header still gives 5s. Nothing changes on the wire.
+
 - Retry a truncated protocol-v2 input download. `resource_download` treated a
   body ending short of the admitted `size_bytes` as `ProtocolError("input
   differs from admitted digest")`, which `_retry` does not retry, so one early

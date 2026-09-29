@@ -141,14 +141,14 @@ class ProgressReporter:
 
     async def stop(self) -> None:
         """Stop the heartbeat loop cleanly."""
-        if self._task is None:
+        task, self._task = self._task, None
+        if task is None:
             return
-        self._task.cancel()
+        task.cancel()
         try:
-            await self._task
+            await task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
-        self._task = None
 
     def link_cancelled(self, event: Optional[asyncio.Event]) -> None:
         """Link an external cancel event (typically from a CancelGuard).
@@ -227,6 +227,12 @@ class ProgressReporter:
                         "heartbeat failed for task %s: %r",
                         self._task_id, e,
                     )
+            if self._task is None:
+                # stop() cancelled this task and the cancel never arrived:
+                # wait_for on Python <= 3.11 swallows one that lands in the
+                # loop pass its inner report completes in. Unchecked, the
+                # loop heartbeats on and stop() waits on it forever.
+                return
             try:
                 await asyncio.sleep(self._interval)
             except asyncio.CancelledError:

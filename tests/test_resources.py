@@ -8,7 +8,7 @@ import httpx
 from pydantic import ValidationError
 
 from task_worker_api.claim_journal import ClaimJournal
-from task_worker_api.client import BackendClient, _MAX_FAIL_ERROR_BYTES, _MAX_RETRY_AFTER_S, _TERMINAL_MIN_ATTEMPTS
+from task_worker_api.client import BackendClient, _CLAIM_POLL_HINT_MAX_S, _MAX_FAIL_ERROR_BYTES, _MAX_RETRY_AFTER_S, _TERMINAL_MIN_ATTEMPTS
 from task_worker_api.resources import AdmissionError
 from task_worker_api.resources import (AttemptOwnership, Capacity, ClaimRequest, ClaimResult,
                                         ResourceProfile, HostSnapshot)
@@ -101,9 +101,9 @@ def test_claim_journal_survives_lost_response_and_process_restart(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_v2_claim_poll_hint_is_uncapped_but_its_retry_sleep_is_capped(tmp_path, monkeypatch):
-    """The 204's Retry-After is a poll interval, handed back unshortened; the
-    503's is a retry sleep inside ``_retry``, held to v1's six-hour ceiling."""
+async def test_v2_claim_poll_hint_and_its_retry_sleep_have_separate_caps(tmp_path, monkeypatch):
+    """The 204's Retry-After is a poll interval, held to the poll-hint ceiling;
+    the 503's is a retry sleep inside ``_retry``, held to v1's six-hour ceiling."""
     sleeps = []
 
     async def sleep(seconds):
@@ -124,9 +124,37 @@ async def test_v2_claim_poll_hint_is_uncapped_but_its_retry_sleep_is_capped(tmp_
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
         backend = BackendClient("http://test", "test", client=client, max_retries=2, retry_backoff_max_s=60)
         result, delay = await backend.resource_claim(ClaimJournal(tmp_path / "journal.sqlite"), uuid4(), ["test"], report)
-    assert result is None and delay == 86400
+    assert result is None and delay == _CLAIM_POLL_HINT_MAX_S
     assert sleeps == [_MAX_RETRY_AFTER_S]
     assert len(calls) == 2 and calls[0].content == calls[1].content
+
+
+_FAR_FUTURE = (datetime.now(timezone.utc) + timedelta(days=3650)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("headers, expected", [
+    ({"Retry-After": "999999999"}, _CLAIM_POLL_HINT_MAX_S),
+    ({"Retry-After": _FAR_FUTURE}, _CLAIM_POLL_HINT_MAX_S),
+    ({"Retry-After": "30"}, 30.0),
+    ({"Retry-After": "0"}, 0.0),
+    ({"Retry-After": "soon"}, 5.0),
+    ({}, 5.0),
+])
+async def test_v2_claim_poll_hint_is_clamped_and_journal_recorded(tmp_path, headers, expected):
+    snapshot = HostSnapshot(host_id=uuid4(), boot_id=uuid4(), sequence=1,
+                            captured_at=datetime.now(timezone.utc), host_ram={"allocatable": 1, "available": 1},
+                            cpu_millicores=1, execution_scopes={}, scratch_pools={}, gpus={})
+    report = SignedHostReport(authority_id=uuid4(), epoch=1, report=snapshot, signature="0" * 64)
+    journal = ClaimJournal(tmp_path / "journal.sqlite")
+    transport = httpx.MockTransport(lambda request: httpx.Response(204, headers=headers))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        result, delay = await backend.resource_claim(journal, uuid4(), ["test"], report)
+    assert result is None and delay == expected
+    request, response = journal.pending()
+    assert response == {"claim": None}
+    journal.acknowledge_no_work(request.claim_request_id)  # raises unless the 204 was recorded
 
 
 # ---------------------------------------------------------------------------
