@@ -2,6 +2,14 @@
 
 ## 0.19.0.dev48
 
+- Cap the v2 claim's 204 poll hint. `BackendClient.resource_claim` parsed the
+  no-work `Retry-After` with no ceiling, and the admission supervisor sleeps
+  the returned delay unattended, so `Retry-After: 999999999` or an HTTP-date
+  years ahead left a live-looking worker that never claimed again. The hint is
+  now clamped to `_CLAIM_POLL_HINT_MAX_S` (5 minutes). This reverses dev47's
+  "stays uncapped". Shorter hints pass through unchanged, and a missing or
+  malformed header still gives 5s. Nothing changes on the wire.
+
 - Bound each v1 heartbeat tick. `ProgressReporter`'s heartbeat awaited the
   retried `report_progress` with no end-to-end bound, so one report that never
   returned (or rode out 4 x `lifecycle_timeout_s` plus backoff, ~4 minutes)

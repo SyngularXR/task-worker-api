@@ -105,6 +105,13 @@ _MAX_RETRY_AFTER_S = 6 * 60 * 60
 # ``str(maximum_seconds)``, which a float's ``.0`` suffix would corrupt.
 _HEARTBEAT_RETRY_AFTER_MAX_S = int(_DEFAULT_BACKOFF_MAX_S)
 
+# Ceiling on the v2 claim's 204 ``Retry-After`` poll hint. It is a poll
+# interval, not a retry, but the admission supervisor sleeps it unattended, so
+# an absurd hint (``Retry-After: 999999999``, a far-future HTTP-date) would
+# stop the worker claiming until restarted. Shorter hints pass through as sent.
+# ``int`` for the same decimal-text comparison as above.
+_CLAIM_POLL_HINT_MAX_S = 5 * 60
+
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
 # band — enough to decorrelate the fleet (Neural-Canvas, Blender-CLI,
@@ -233,8 +240,8 @@ def _retry_after_delay(response: httpx.Response, *, maximum_seconds: Optional[in
     Returns ``None`` only when the header carries no usable guidance — absent
     or malformed. The caller then falls back to its own exponential schedule.
     By default valid delays are capped at ``_MAX_RETRY_AFTER_S``; the v2
-    claim's 204 poll hint passes maximum_seconds=None, since it is a poll
-    interval rather than a retry, so that guidance is never shortened. This is deliberately
+    claim's 204 poll hint passes ``_CLAIM_POLL_HINT_MAX_S``, so hints under a
+    few minutes are honoured as sent and longer ones are clamped. This is deliberately
     separate from ``retry_backoff_max_s``: a 60-second exponential-backoff cap
     must not turn ``Retry-After: 3600`` into six requests inside a one-hour
     rate-limit window.
@@ -1065,7 +1072,7 @@ class BackendClient:
         response = await self._resource_request("POST", "/tasks/claim", json=body)
         if response.status_code == 204:
             journal.record_response(request.claim_request_id, None)
-            delay = _retry_after_delay(response, maximum_seconds=None)
+            delay = _retry_after_delay(response, maximum_seconds=_CLAIM_POLL_HINT_MAX_S)
             return None, (5.0 if delay is None else delay)
         result = ClaimResult.model_validate(response.json())
         if result.ownership.worker_instance_id != worker_instance_id:
