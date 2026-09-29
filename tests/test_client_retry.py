@@ -4622,7 +4622,10 @@ async def test_resource_download_still_rejects_oversized_input(tmp_path):
     )
     claim = _download_claim(artifact)
 
+    requests = {"n": 0}
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
         # One wire chunk, well under the 1 MB write buffer, over the declared size.
         return httpx.Response(200, content=declared + b"x")
 
@@ -4632,6 +4635,107 @@ async def test_resource_download_still_rejects_oversized_input(tmp_path):
         await client.resource_download(claim, artifact, dest)
     await client.close()
 
+    assert requests["n"] == 1, "oversize is content drift, not a transient"
+    assert not dest.exists()
+
+
+def _chunked(data: bytes):
+    """A streamed body with no Content-Length, as a proxy relays it."""
+    async def body():
+        yield data
+    return body()
+
+
+@pytest.mark.asyncio
+async def test_resource_download_retries_truncated_body(tmp_path):
+    """A chunked body closed early is a transport fault: re-fetch, don't fail.
+
+    With no Content-Length, h11 cannot tell a proxy's early close from the
+    real end, so the short body used to surface as a non-retryable
+    "differs from admitted digest" and fail staging on a single blip.
+    """
+    import hashlib
+
+    from task_worker_api.resources import InputArtifact
+
+    declared = b"0123456789" * 100
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(declared).hexdigest(), size_bytes=len(declared),
+    )
+    claim = _download_claim(artifact)
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=_chunked(
+            declared[:300] if requests["n"] == 1 else declared))
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    await client.resource_download(claim, artifact, dest)
+    await client.close()
+
+    assert requests["n"] == 2
+    # The retry reopened dest with "wb": no leftover prefix from attempt one.
+    assert dest.read_bytes() == declared
+
+
+@pytest.mark.asyncio
+async def test_resource_download_truncated_every_time_exhausts_retries(tmp_path):
+    import hashlib
+
+    from task_worker_api.resources import InputArtifact
+
+    declared = b"x" * 1000
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(declared).hexdigest(), size_bytes=len(declared),
+    )
+    claim = _download_claim(artifact)
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=_chunked(declared[:999]))
+
+    client = _client_with_handler(handler, max_retries=3)
+    dest = tmp_path / "scene.ply"
+    with pytest.raises(httpx.RemoteProtocolError, match="received 999 of 1000 bytes"):
+        await client.resource_download(claim, artifact, dest)
+    await client.close()
+
+    assert requests["n"] == 3
+    assert not dest.exists()
+
+
+@pytest.mark.asyncio
+async def test_resource_download_rejects_full_length_digest_mismatch_without_retry(tmp_path):
+    """Right size, wrong bytes is real content drift — fail at once."""
+    import hashlib
+
+    from task_worker_api.errors import ProtocolError
+    from task_worker_api.resources import InputArtifact
+
+    declared = b"x" * 1000
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(declared).hexdigest(), size_bytes=len(declared),
+    )
+    claim = _download_claim(artifact)
+    requests = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=_chunked(b"y" * 1000))
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    with pytest.raises(ProtocolError, match="differs from admitted digest"):
+        await client.resource_download(claim, artifact, dest)
+    await client.close()
+
+    assert requests["n"] == 1
     assert not dest.exists()
 
 
