@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from task_worker_api.errors import ProtocolError, TaskCancelled
@@ -133,14 +134,15 @@ async def test_delayed_or_wrong_attempt_response_cannot_extend_lease():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("loss", ["revoked", "unworkable", "parks"])
+@pytest.mark.parametrize("loss", ["revoked", "unworkable", "fenced", "parks"])
 async def test_lease_loss_interrupts_the_running_handler(loss):
     """A lease lost mid-handler must interrupt the handler, not be noticed after
     it returns.
 
     ``_accept`` marks the lease dead the instant the backend reports the attempt
     cancelled (``revoked``) or in a state no longer workable (``unworkable``),
-    and the acknowledged deadline lapses under a heartbeat that never answers
+    ``_renew`` does on the backend's dead-lease 409 (``fenced``: lease_expired,
+    attempt_fenced), and the acknowledged deadline lapses under a heartbeat that never answers
     (``parks``). A handler parked on an await would otherwise run to the end of
     a job the backend gave up on hours earlier, and the post-run check would
     then call the dead lease a generic protocol error. It is cancelled and
@@ -162,6 +164,8 @@ async def test_lease_loss_interrupts_the_running_handler(loss):
             return client.response().model_copy(update={"cancelled": True})
         if loss == "unworkable":
             return client.response().model_copy(update={"state": "failed"})
+        if loss == "fenced":
+            raise _status_error(409)
         await asyncio.Future()  # transport retry never returns
 
     client.resource_heartbeat = heartbeat
@@ -188,6 +192,39 @@ async def test_lease_loss_interrupts_the_running_handler(loss):
     if loss != "parks":
         assert time.monotonic() - started < 4, "the handler outlived the lease it lost"
     assert renewed.is_set() and not exited.is_set()
+
+
+def _status_error(status):
+    request = httpx.Request("POST", "http://backend/workers/heartbeat")
+    return httpx.HTTPStatusError(str(status), request=request, response=httpx.Response(status, request=request))
+
+
+@pytest.mark.asyncio
+async def test_non_409_renewal_error_is_not_lease_loss():
+    """Only the 409 is the backend's dead-lease answer: a 503 that outlasted
+    the client's retries is a blip, and the next renewal keeps the lease."""
+    client = Client(lease_seconds=3)
+    exited = threading.Event()
+    shots = []
+
+    async def heartbeat(claim):
+        shots.append(time.monotonic())
+        if len(shots) == 1:
+            raise _status_error(503)
+        return client.response()
+
+    client.resource_heartbeat = heartbeat
+    lease = AttemptLease(client, None, client.claim, grace_s=0.1, on_hard_exit=exited.set)
+
+    async def owner():
+        async with lease:
+            await asyncio.sleep(3.5)
+
+    task = asyncio.create_task(owner())
+    done, _ = await asyncio.wait([task], timeout=8)
+    assert task in done and not task.cancelled(), "a 503 renewal was treated as lease loss"
+    task.result()
+    assert len(shots) >= 2 and not lease.lost.is_set() and not exited.is_set()
 
 
 @pytest.mark.asyncio

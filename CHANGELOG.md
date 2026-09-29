@@ -2,6 +2,15 @@
 
 ## 0.19.0.dev48
 
+- Treat a 409 lease renewal as lease loss. `AttemptLease._renew` expired the
+  lease only on `ProtocolError` and logged every other failure, so the
+  backend's `/workers/heartbeat` 409 (`lease_expired`, `attempt_fenced`) left
+  the handler and its staging/publication transfers running on a retired token
+  until the local deadline lapsed (up to 30s) and the watchdog cancelled the
+  owner and could hard-exit the worker. A 409 now marks the lease lost at once,
+  like `ProtocolError`, so `run()` raises `TaskCancelled`; other statuses are
+  still logged and retried on the next tick. Nothing changes on the wire.
+
 - Retry a truncated protocol-v2 input download. `resource_download` treated a
   body ending short of the admitted `size_bytes` as `ProtocolError("input
   differs from admitted digest")`, which `_retry` does not retry, so one early

@@ -14,6 +14,8 @@ import os
 import threading
 import time
 
+import httpx
+
 # _await_unless_cancelled is the v1 transfer path's race-and-drain helper: it
 # cancels the loser, drains it so cleanup actually finishes, and raises
 # TaskCancelled. The admitted path needs exactly that around its handler.
@@ -154,6 +156,16 @@ class AttemptLease:
                     self._mark_lost()
                     self._deadline = 0
                 return
+            except httpx.HTTPStatusError as exc:
+                # The backend answers a heartbeat 409 only for a dead lease
+                # (lease_expired, attempt_fenced); renewing on would burn the
+                # runway on a retired token. Other statuses log like any blip.
+                if exc.response.status_code == 409:
+                    with self._lock:
+                        self._mark_lost()
+                        self._deadline = 0
+                    return
+                log.warning("Attempt heartbeat failed; acknowledged lease still expires", exc_info=True)
             except Exception:
                 log.warning("Attempt heartbeat failed; acknowledged lease still expires", exc_info=True)
             if not self._active:
