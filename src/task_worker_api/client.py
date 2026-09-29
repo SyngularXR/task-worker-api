@@ -1264,7 +1264,11 @@ class BackendClient:
         *,
         cancelled: Optional["asyncio.Event"] = None,
     ):
-        """Fetch exactly the admitted input and reject truncated or changed bytes.
+        """Fetch exactly the admitted input and reject oversized or changed bytes.
+
+        A body that ends short of ``artifact.size_bytes`` is retried like any
+        transport error; oversize or a full-length digest mismatch is content
+        drift and fails immediately.
 
         ``cancelled`` (the attempt lease's loss event) is honoured exactly as
         ``download_file`` honours a ``CancelGuard``'s: checked before the
@@ -1328,7 +1332,15 @@ class BackendClient:
                             buf = bytearray()
                     if buf:
                         await _to_thread_complete(file.write, buf)
-                    if size != artifact.size_bytes or digest.hexdigest() != artifact.sha256:
+                    if size < artifact.size_bytes:
+                        # A proxy ending a chunked body early leaves h11 no
+                        # Content-Length to catch it; the backend still has the
+                        # bytes, so this is transient and _retry re-fetches
+                        # into a fresh "wb" file.
+                        raise httpx.RemoteProtocolError(
+                            f"input {artifact.filename} truncated: received "
+                            f"{size} of {artifact.size_bytes} bytes")
+                    if digest.hexdigest() != artifact.sha256:
                         raise ProtocolError("input differs from admitted digest")
                 finally:
                     await _to_thread_complete(file.close)

@@ -10,6 +10,15 @@
   "stays uncapped". Shorter hints pass through unchanged, and a missing or
   malformed header still gives 5s. Nothing changes on the wire.
 
+- Retry a truncated protocol-v2 input download. `resource_download` treated a
+  body ending short of the admitted `size_bytes` as `ProtocolError("input
+  differs from admitted digest")`, which `_retry` does not retry, so one early
+  close of a chunked response (a proxy or load balancer; h11 has no
+  Content-Length to catch it) failed staging for an admitted attempt. A short
+  body now raises `httpx.RemoteProtocolError` naming the received and expected
+  byte counts and is re-fetched into a fresh file; oversize and a full-length
+  digest mismatch still fail immediately. Nothing changes on the wire.
+
 - Bound each v1 heartbeat tick. `ProgressReporter`'s heartbeat awaited the
   retried `report_progress` with no end-to-end bound, so one report that never
   returned (or rode out 4 x `lifecycle_timeout_s` plus backoff, ~4 minutes)
