@@ -13,6 +13,17 @@
   checks). A failed attempt unlinks its temp file; retries, cancels and
   Retry-After handling are unchanged. Nothing changes on the wire.
 
+- Cap `Retry-After` on the retried lifecycle calls at 5 minutes
+  (`_LIFECYCLE_RETRY_AFTER_MAX_S`). v1 `complete`/`fail`/`get_box_id`/
+  `get_cancel_status` (via `_request`) and every retried v2 lifecycle call
+  (via `_resource_request`) took the six-hour ceiling, so a proxy or
+  restarting backend naming hours could hold a finished task's terminal
+  report across the raised terminal attempt budget — occupying the worker
+  slot, stalling shutdown and letting the stale sweeper recompute the task.
+  Shorter hints are still honoured exactly; the v1 heartbeat and claim keep
+  their 60s cap, and the v1/v2 file transfers keep six hours. Nothing changes
+  on the wire.
+
 - Treat a 409 lease renewal as lease loss. `AttemptLease._renew` expired the
   lease only on `ProtocolError` and logged every other failure, so the
   backend's `/workers/heartbeat` 409 (`lease_expired`, `attempt_fenced`) left
