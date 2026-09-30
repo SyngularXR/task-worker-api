@@ -460,8 +460,8 @@ async def test_v2_progress_stays_one_shot_under_a_degraded_backend(failure, no_b
 @pytest.mark.asyncio
 async def test_v2_progress_ignores_retry_after(no_blocking_sleep):
     """A 429 on the retried lifecycle path imposes a server-named sleep of up
-    to six hours. One-shot progress never honours it: a throttling backend
-    cannot park the handler for an hour."""
+    to the lifecycle ceiling. One-shot progress never honours it: a throttling
+    backend cannot park the handler at all."""
     claim = _admitted_claim(uuid4())
     sent: list = []
 
