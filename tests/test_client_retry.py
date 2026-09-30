@@ -4986,3 +4986,127 @@ async def test_v2_transfer_lease_loss_ends_retry_after_wait(monkeypatch, tmp_pat
     assert sleeps == [float(_MAX_RETRY_AFTER_S)]
     if kind == "download":
         assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# Downloads land atomically: temp file beside dest, os.replace on completion
+#
+# A hard kill (SIGKILL, OOM kill, power loss) runs no ``except`` cleanup, so
+# streaming straight into dest left a truncated file under its final name for
+# a reclaimed task to stage as a complete input.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_file_hard_kill_mid_stream_leaves_no_file_at_dest(
+    tmp_path, monkeypatch,
+):
+    import os
+    from pathlib import Path
+
+    from task_worker_api import client as client_mod
+
+    class _Killed(BaseException):
+        """Stands in for SIGKILL: nothing below may clean up after it."""
+
+    real_open = open
+    writes = {"n": 0}
+
+    class _DyingFile:
+        def __init__(self, f):
+            self._f = f
+
+        def write(self, data):
+            writes["n"] += 1
+            if writes["n"] == 2:
+                raise _Killed
+            return self._f.write(data[:len(data) // 2])  # part-way through
+
+        def close(self):
+            return self._f.close()
+
+    monkeypatch.setattr(
+        client_mod, "open",
+        lambda path, mode: _DyingFile(real_open(path, mode)), raising=False,
+    )
+    # A dead process unlinks nothing.
+    monkeypatch.setattr(Path, "unlink", lambda self, *a, **kw: None)
+    monkeypatch.setattr(os, "unlink", lambda *a, **kw: None)
+
+    async def body():
+        for _ in range(3):
+            yield b"x" * _DOWNLOAD_CHUNK_BYTES
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body())
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    with pytest.raises(_Killed):
+        await client.download_file(5, "scene.ply", dest)
+    await client.close()
+
+    assert not dest.exists(), "a killed download left a truncated file at dest"
+    left = list(tmp_path.iterdir())
+    assert len(left) == 1 and left[0].name.startswith(".scene.ply."), left
+
+
+@pytest.mark.asyncio
+async def test_resource_download_retry_uses_a_fresh_temp_file(tmp_path, monkeypatch):
+    import hashlib
+
+    from task_worker_api import client as client_mod
+    from task_worker_api.resources import InputArtifact
+
+    declared = b"0123456789" * 100
+    artifact = InputArtifact(
+        filename="scene.ply", path="inputs/scene.ply",
+        sha256=hashlib.sha256(declared).hexdigest(), size_bytes=len(declared),
+    )
+    claim = _download_claim(artifact)
+    requests = {"n": 0}
+    opened: list = []
+    real_open = open
+
+    def spy_open(path, mode):
+        opened.append(path)
+        return real_open(path, mode)
+
+    monkeypatch.setattr(client_mod, "open", spy_open, raising=False)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests["n"] += 1
+        return httpx.Response(200, content=_chunked(
+            declared[:300] if requests["n"] == 1 else declared))
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / "scene.ply"
+    await client.resource_download(claim, artifact, dest)
+    await client.close()
+
+    assert requests["n"] == 2
+    assert len(set(opened)) == 2 and dest not in opened, opened
+    assert list(tmp_path.iterdir()) == [dest]
+    assert dest.read_bytes() == declared
+
+
+@pytest.mark.asyncio
+async def test_download_file_cancel_removes_the_temp_file(tmp_path):
+    cancelled = asyncio.Event()
+
+    async def body():
+        for n in range(10):
+            if n == 2:
+                cancelled.set()
+            yield b"x" * 1024
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body())
+
+    client = _client_with_handler(handler)
+    with pytest.raises(TaskCancelled):
+        await client.download_file(
+            5, "scene.ply", tmp_path / "out.ply", cancelled=cancelled)
+    await client.close()
+
+    assert list(tmp_path.iterdir()) == []

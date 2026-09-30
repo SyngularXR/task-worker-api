@@ -2,6 +2,17 @@
 
 ## 0.19.0.dev48
 
+- Write downloads atomically. `BackendClient.download_file` and
+  `resource_download` streamed straight into `dest` and relied on an
+  `except BaseException` unlink to remove a partial, which never runs on
+  SIGKILL, an OOM kill, a container stop past its grace period or a power loss;
+  the truncated file stayed at its final name for a reclaimed task to stage as
+  a complete input. Both now stream into a hidden `.<name>.<random>.part` file
+  beside `dest`, fsync it off the event loop, and `os.replace` it onto `dest`
+  only once the whole body has arrived (for v2, after the size and digest
+  checks). A failed attempt unlinks its temp file; retries, cancels and
+  Retry-After handling are unchanged. Nothing changes on the wire.
+
 - Treat a 409 lease renewal as lease loss. `AttemptLease._renew` expired the
   lease only on `ProtocolError` and logged every other failure, so the
   backend's `/workers/heartbeat` 409 (`lease_expired`, `attempt_fenced`) left
