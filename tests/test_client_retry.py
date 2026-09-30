@@ -25,6 +25,7 @@ from task_worker_api.client import (
     _DOWNLOAD_CHUNK_BYTES,
     _HEARTBEAT_RETRY_AFTER_MAX_S,
     _MAX_FAIL_ERROR_BYTES,
+    _LIFECYCLE_RETRY_AFTER_MAX_S,
     _MAX_RETRY_AFTER_S,
     _UPLOAD_CHUNK_BYTES,
     BackendClient,
@@ -3450,7 +3451,7 @@ async def test_retry_after_is_not_shortened_by_backoff_ceiling(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             return httpx.Response(
-                429, headers={"Retry-After": "3600"}, text="slow down",
+                429, headers={"Retry-After": "120"}, text="slow down",
             )
         return httpx.Response(200)
 
@@ -3460,7 +3461,7 @@ async def test_retry_after_is_not_shortened_by_backoff_ceiling(monkeypatch):
     await client.complete(7, {"output": "done"})
     await client.close()
 
-    assert sleeps == [3600.0]
+    assert sleeps == [120.0]
     assert calls["n"] == 2
 
 
@@ -3481,7 +3482,7 @@ async def test_retry_after_has_distinct_remote_input_cap(monkeypatch):
         await client._request("GET", "/tasks/7")
     await client.close()
 
-    assert sleeps == [6 * 60 * 60]
+    assert sleeps == [_LIFECYCLE_RETRY_AFTER_MAX_S]
 
 
 @pytest.mark.asyncio
@@ -3555,9 +3556,9 @@ async def test_periodic_heartbeat_caps_retry_after(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_terminal_report_keeps_full_retry_after_ceiling(monkeypatch):
-    """The same response on complete() still waits the window out — nothing
-    else will ever re-send a terminal report."""
+async def test_terminal_report_caps_retry_after_at_lifecycle_ceiling(monkeypatch):
+    """The same response on complete() is held to the lifecycle ceiling: an
+    hour-long window must not park a finished task's terminal report."""
     sleeps = _sleep_recorder(monkeypatch)
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -3570,7 +3571,33 @@ async def test_terminal_report_keeps_full_retry_after_ceiling(monkeypatch):
         await client.complete(7, {"output": "done"})
     await client.close()
 
-    assert sleeps and set(sleeps) == {3600.0}
+    assert sleeps and set(sleeps) == {float(_LIFECYCLE_RETRY_AFTER_MAX_S)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("report", ["complete", "fail"])
+async def test_terminal_report_retries_six_hour_retry_after_to_success(monkeypatch, report):
+    """A 503 naming six hours on complete()/fail() sleeps at most the lifecycle
+    ceiling (jitter included) and still retries through to delivery."""
+    sleeps = _sleep_recorder(monkeypatch)
+    monkeypatch.setattr("task_worker_api.client.random.uniform", lambda low, high: high)
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(503, headers={"Retry-After": "21600"}, text="restarting")
+        return httpx.Response(200)
+
+    client = _client_with_handler(handler, max_retries=4, retry_backoff_s=2.0, retry_jitter=True)
+    if report == "complete":
+        await client.complete(7, {"output": "done"})
+    else:
+        await client.fail(7, "boom")
+    await client.close()
+
+    assert calls["n"] == 3
+    assert sleeps == [_LIFECYCLE_RETRY_AFTER_MAX_S] * 2
 
 
 @pytest.mark.asyncio
@@ -3792,9 +3819,9 @@ def test_init_defaults_retry_total_max_to_none():
 @pytest.mark.asyncio
 async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatch):
     """The motivating case: with the budget enabled, a complete() throttled
-    with Retry-After: 6h must not sleep it out — one such delay already
-    exceeds the whole budget, so the call gives up immediately rather than
-    pinning the polling loop for 30h."""
+    with Retry-After: 6h must not sleep it out — each delay is held to the
+    lifecycle ceiling, and the call gives up once the next one would overrun
+    the budget rather than spending the whole attempt budget."""
     sleeps = _sleep_recorder(monkeypatch)
     calls = {"n": 0}
 
@@ -3811,12 +3838,12 @@ async def test_terminal_report_gives_up_instead_of_sleeping_for_hours(monkeypatc
         await client.complete(7, {"output": "done"})
     await client.close()
 
-    # One attempt, no sleep — and the caller sees the same error it would
-    # have seen after exhausting the attempt budget, so the task is re-queued
-    # by the sweeper exactly as before.
+    # Two capped sleeps fill the budget, so the third attempt is the last —
+    # and the caller sees the same error it would have seen after exhausting
+    # the attempt budget, so the task is re-queued by the sweeper as before.
     assert exc_info.value.response.status_code == 429
-    assert calls["n"] == 1
-    assert sleeps == []
+    assert calls["n"] == 3
+    assert sleeps == [_LIFECYCLE_RETRY_AFTER_MAX_S] * 2
 
 
 @pytest.mark.asyncio
@@ -3956,14 +3983,14 @@ async def test_budget_charges_measured_time_and_admission_only(monkeypatch):
 )
 async def test_no_budget_keeps_unbounded_retrying(monkeypatch, budget):
     """No budget — omitted (the default) or an explicit None — leaves retrying
-    unbounded: the full attempt budget is spent on hour-long Retry-After
-    delays, exactly as before this knob existed. This is what every consumer
+    unbounded: the full attempt budget is spent on Retry-After delays,
+    exactly as before this knob existed. This is what every consumer
     gets from the SDK bump alone, until it opts in."""
     sleeps = _sleep_recorder(monkeypatch)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            429, headers={"Retry-After": "3600"}, text="Too Many Requests",
+            429, headers={"Retry-After": "120"}, text="Too Many Requests",
         )
 
     client = _client_with_handler(
@@ -3974,7 +4001,7 @@ async def test_no_budget_keeps_unbounded_retrying(monkeypatch, budget):
         await client._request("GET", "/tasks/7")
     await client.close()
 
-    assert sleeps == [3600.0, 3600.0]
+    assert sleeps == [120.0, 120.0]
 
 
 @pytest.mark.asyncio

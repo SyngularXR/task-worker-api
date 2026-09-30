@@ -8,7 +8,7 @@ import httpx
 from pydantic import ValidationError
 
 from task_worker_api.claim_journal import ClaimJournal
-from task_worker_api.client import BackendClient, _CLAIM_POLL_HINT_MAX_S, _MAX_FAIL_ERROR_BYTES, _MAX_RETRY_AFTER_S, _TERMINAL_MIN_ATTEMPTS
+from task_worker_api.client import BackendClient, _CLAIM_POLL_HINT_MAX_S, _LIFECYCLE_RETRY_AFTER_MAX_S, _MAX_FAIL_ERROR_BYTES, _TERMINAL_MIN_ATTEMPTS
 from task_worker_api.resources import AdmissionError
 from task_worker_api.resources import (AttemptOwnership, Capacity, ClaimRequest, ClaimResult,
                                         ResourceProfile, HostSnapshot)
@@ -103,7 +103,7 @@ def test_claim_journal_survives_lost_response_and_process_restart(tmp_path):
 @pytest.mark.asyncio
 async def test_v2_claim_poll_hint_and_its_retry_sleep_have_separate_caps(tmp_path, monkeypatch):
     """The 204's Retry-After is a poll interval, held to the poll-hint ceiling;
-    the 503's is a retry sleep inside ``_retry``, held to v1's six-hour ceiling."""
+    the 503's is a retry sleep inside ``_retry``, held to the lifecycle ceiling."""
     sleeps = []
 
     async def sleep(seconds):
@@ -125,7 +125,7 @@ async def test_v2_claim_poll_hint_and_its_retry_sleep_have_separate_caps(tmp_pat
         backend = BackendClient("http://test", "test", client=client, max_retries=2, retry_backoff_max_s=60)
         result, delay = await backend.resource_claim(ClaimJournal(tmp_path / "journal.sqlite"), uuid4(), ["test"], report)
     assert result is None and delay == _CLAIM_POLL_HINT_MAX_S
-    assert sleeps == [_MAX_RETRY_AFTER_S]
+    assert sleeps == [_LIFECYCLE_RETRY_AFTER_MAX_S]
     assert len(calls) == 2 and calls[0].content == calls[1].content
 
 
@@ -358,14 +358,14 @@ async def test_v2_non_terminal_operation_keeps_the_default_retry_contract(tmp_pa
 async def test_v2_lifecycle_caps_an_absurd_retry_after(tmp_path, no_blocking_sleep, kind, retry_after):
     """One 429 naming a year must not park the worker for a year — an admitted
     attempt would hold its GPU slot while its lease ran out, or a terminal
-    report would sit undelivered. The v1 ceiling applies, jitter included."""
+    report would sit undelivered. The lifecycle ceiling applies, jitter included."""
     journal, claim = _admitted_journal(tmp_path, uuid4())
     calls: list = []
     backend, transport = _flaky_backend(claim, [429], calls, retry_after=retry_after, retry_jitter=True)
     state = await backend.resource_operation(journal, kind, {} if kind == "start" else _terminal_payload(kind))
     await transport.aclose()
 
-    assert no_blocking_sleep == [_MAX_RETRY_AFTER_S]
+    assert no_blocking_sleep == [_LIFECYCLE_RETRY_AFTER_MAX_S]
     assert len(calls) == 2 and state.attempt_id == claim.ownership.attempt_id
 
 
