@@ -2,6 +2,15 @@
 
 ## 0.19.0.dev48
 
+- Treat a 409 lease renewal as lease loss. `AttemptLease._renew` expired the
+  lease only on `ProtocolError` and logged every other failure, so the
+  backend's `/workers/heartbeat` 409 (`lease_expired`, `attempt_fenced`) left
+  the handler and its staging/publication transfers running on a retired token
+  until the local deadline lapsed (up to 30s) and the watchdog cancelled the
+  owner and could hard-exit the worker. A 409 now marks the lease lost at once,
+  like `ProtocolError`, so `run()` raises `TaskCancelled`; other statuses are
+  still logged and retried on the next tick. Nothing changes on the wire.
+
 - Stop the v1 heartbeat reliably on Python 3.10/3.11. dev48's per-tick
   `asyncio.wait_for` bound swallows a cancel that lands in the loop pass its
   report completes in (fixed upstream in 3.12), so `ProgressReporter.stop()`

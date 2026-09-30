@@ -1085,8 +1085,9 @@ class BackendClient:
 
         410/426 becomes :class:`ProtocolError` rather than a raw
         ``HTTPStatusError``, because that is the distinction the attempt lease
-        acts on: ``AttemptLease`` expires the lease on ``ProtocolError`` and
-        merely logs anything else. :meth:`_resource_request` layers the retry
+        acts on: ``AttemptLease`` expires the lease on ``ProtocolError`` (and on
+        a heartbeat 409, the backend's dead-lease answer) and merely logs
+        anything else. :meth:`_resource_request` layers the retry
         loop on top; callers on a handler's critical path use this directly to
         stay one-shot (see :meth:`resource_progress`).
         """
