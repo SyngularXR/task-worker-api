@@ -7,8 +7,8 @@
   `except BaseException` unlink to remove a partial, which never runs on
   SIGKILL, an OOM kill, a container stop past its grace period or a power loss;
   the truncated file stayed at its final name for a reclaimed task to stage as
-  a complete input. Both now stream into a hidden `.<name>.<random>.part` file
-  beside `dest`, fsync it off the event loop, and `os.replace` it onto `dest`
+  a complete input. Both now stream into a hidden fixed-length
+  `.<random>.part` file beside `dest`, fsync it off the event loop, and `os.replace` it onto `dest`
   only once the whole body has arrived (for v2, after the size and digest
   checks). A failed attempt unlinks its temp file; retries, cancels and
   Retry-After handling are unchanged. Nothing changes on the wire.

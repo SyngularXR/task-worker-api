@@ -534,10 +534,10 @@ def _fsync_and_replace(tmp: Path, dest: Path) -> None:
 async def _stream_into(dest: Path, write_body) -> None:
     """Run ``write_body(file)`` against a temp file, then move it onto ``dest``.
 
-    The body lands in a hidden ``.<name>.<random>.part`` file beside ``dest``
-    and is fsynced and ``os.replace``d onto ``dest`` only once ``write_body``
-    returns, so ``dest`` only ever holds a complete file. A process that dies
-    hard mid-stream (SIGKILL, OOM kill, a container stop past its grace
+    The body lands in a hidden ``.<random>.part`` file beside ``dest`` and is
+    fsynced and ``os.replace``d onto ``dest`` only once ``write_body`` returns,
+    so ``dest`` only ever holds a complete file. A process that dies hard
+    mid-stream (SIGKILL, OOM kill, a container stop past its grace
     period, power loss) runs no cleanup at all; writing straight into
     ``dest`` would leave a truncated file under the final name for a
     reclaimed task to stage as a complete input. Any failure here unlinks the
@@ -548,7 +548,9 @@ async def _stream_into(dest: Path, write_body) -> None:
     on the cancel path, and a second cancel must not abandon the close or the
     unlink.
     """
-    tmp = dest.with_name(f".{dest.name}.{secrets.token_hex(8)}.part")
+    # Fixed length, not derived from dest.name: a 255-byte dest name (the
+    # NAME_MAX the v2 filename schema allows) must still get a valid temp name.
+    tmp = dest.with_name(f".{secrets.token_hex(8)}.part")
 
     def discard(opened) -> None:
         opened.close()

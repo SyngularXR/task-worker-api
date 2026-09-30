@@ -5075,7 +5075,7 @@ async def test_download_file_hard_kill_mid_stream_leaves_no_file_at_dest(
 
     assert not dest.exists(), "a killed download left a truncated file at dest"
     left = list(tmp_path.iterdir())
-    assert len(left) == 1 and left[0].name.startswith(".scene.ply."), left
+    assert len(left) == 1 and left[0].name.startswith(".") and left[0].name.endswith(".part"), left
 
 
 @pytest.mark.asyncio
@@ -5113,6 +5113,32 @@ async def test_resource_download_retry_uses_a_fresh_temp_file(tmp_path, monkeypa
 
     assert requests["n"] == 2
     assert len(set(opened)) == 2 and dest not in opened, opened
+    assert list(tmp_path.iterdir()) == [dest]
+    assert dest.read_bytes() == declared
+
+
+@pytest.mark.asyncio
+async def test_resource_download_accepts_a_name_max_filename(tmp_path):
+    """A 255-byte filename is valid; the temp name must not grow past it."""
+    import hashlib
+
+    from task_worker_api.resources import InputArtifact
+
+    name = "a" * 251 + ".ply"
+    declared = b"0123456789" * 100
+    artifact = InputArtifact(
+        filename=name, path="inputs/scene.ply",
+        sha256=hashlib.sha256(declared).hexdigest(), size_bytes=len(declared),
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_chunked(declared))
+
+    client = _client_with_handler(handler)
+    dest = tmp_path / name
+    await client.resource_download(_download_claim(artifact), artifact, dest)
+    await client.close()
+
     assert list(tmp_path.iterdir()) == [dest]
     assert dest.read_bytes() == declared
 
