@@ -2,6 +2,17 @@
 
 ## 0.19.0.dev48
 
+- Write downloads atomically. `BackendClient.download_file` and
+  `resource_download` streamed straight into `dest` and relied on an
+  `except BaseException` unlink to remove a partial, which never runs on
+  SIGKILL, an OOM kill, a container stop past its grace period or a power loss;
+  the truncated file stayed at its final name for a reclaimed task to stage as
+  a complete input. Both now stream into a hidden fixed-length
+  `.<random>.part` file beside `dest`, fsync it off the event loop, and `os.replace` it onto `dest`
+  only once the whole body has arrived (for v2, after the size and digest
+  checks). A failed attempt unlinks its temp file; retries, cancels and
+  Retry-After handling are unchanged. Nothing changes on the wire.
+
 - Cap `Retry-After` on the retried lifecycle calls at 5 minutes
   (`_LIFECYCLE_RETRY_AFTER_MAX_S`). v1 `complete`/`fail`/`get_box_id`/
   `get_cancel_status` (via `_request`) and every retried v2 lifecycle call

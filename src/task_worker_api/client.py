@@ -10,7 +10,9 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import os
 import random
+import secrets
 import time
 from contextlib import aclosing
 from datetime import datetime, timezone
@@ -517,6 +519,60 @@ async def _to_thread_complete(func, /, *args, cancel_cleanup=None):
         raise
 
 
+def _fsync_and_replace(tmp: Path, dest: Path) -> None:
+    # Through a fresh fd rather than the stream's fileno(): the stream is
+    # already closed (close() is what flushes its buffer). O_RDWR, not
+    # O_RDONLY, because Windows' FlushFileBuffers needs write access.
+    fd = os.open(tmp, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, dest)
+
+
+async def _stream_into(dest: Path, write_body) -> None:
+    """Run ``write_body(file)`` against a temp file, then move it onto ``dest``.
+
+    The body lands in a hidden ``.<random>.part`` file beside ``dest`` and is
+    fsynced and ``os.replace``d onto ``dest`` only once ``write_body`` returns,
+    so ``dest`` only ever holds a complete file. A process that dies hard
+    mid-stream (SIGKILL, OOM kill, a container stop past its grace
+    period, power loss) runs no cleanup at all; writing straight into
+    ``dest`` would leave a truncated file under the final name for a
+    reclaimed task to stage as a complete input. Any failure here unlinks the
+    temp file, never ``dest``, and each call gets a fresh temp file, so a
+    retry never appends to or reuses a previous attempt's partial.
+
+    Every blocking step goes through :func:`_to_thread_complete`: this runs
+    on the cancel path, and a second cancel must not abandon the close or the
+    unlink.
+    """
+    # Fixed length, not derived from dest.name: a 255-byte dest name (the
+    # NAME_MAX the v2 filename schema allows) must still get a valid temp name.
+    tmp = dest.with_name(f".{secrets.token_hex(8)}.part")
+
+    def discard(opened) -> None:
+        opened.close()
+        tmp.unlink(missing_ok=True)
+
+    # "xb" (O_EXCL) so a name collision fails rather than clobbering a file
+    # this call does not own.
+    file = await _to_thread_complete(open, tmp, "xb", cancel_cleanup=discard)
+    try:
+        try:
+            await write_body(file)
+        finally:
+            await _to_thread_complete(file.close)
+        await _to_thread_complete(_fsync_and_replace, tmp, dest)
+    except BaseException:
+        try:
+            await _to_thread_complete(functools.partial(tmp.unlink, missing_ok=True))
+        except OSError:
+            pass  # never mask the failure that got us here
+        raise
+
+
 def _multipart_frame(field: str, filename: str) -> tuple[str, bytes, bytes]:
     """Return ``(content_type, prologue, epilogue)`` for a one-file body.
 
@@ -856,8 +912,8 @@ class BackendClient:
         Shared by :meth:`_request` (buffered) and :meth:`download_file`
         (streaming).  ``fn`` is re-invoked from scratch on every attempt, so
         callers that mutate state mid-attempt (e.g. opening a file for write)
-        must be idempotent — ``download_file`` opens ``dest`` with ``"wb"``
-        which truncates, so a retry starts a clean file.
+        must be idempotent — ``download_file`` streams each attempt into a
+        fresh temp file, so a retry starts a clean file.
 
         Retries two classes of transient failure:
 
@@ -1291,8 +1347,13 @@ class BackendClient:
         ``prepare_admitted_inputs`` only looks between files, so a one-input
         claim (a lone colmap-splat PLY, a Neural-Canvas splat) never looked at
         all. ``TaskCancelled`` is not transient, so it leaves the retry loop
-        immediately without consuming retry budget, and the partial at
-        ``dest`` is removed by the same cleanup as any other failure.
+        immediately without consuming retry budget, and the partial temp file
+        is removed by the same cleanup as any other failure.
+
+        The body streams into a hidden temp file beside ``dest`` and is moved
+        onto ``dest`` only after the size and digest checks pass (see
+        :func:`_stream_into`), so a hard kill mid-transfer never leaves a
+        truncated input under its final name.
         """
         import hashlib
         from .files import _require_safe_filename
@@ -1318,8 +1379,9 @@ class BackendClient:
                 if response.status_code in (410, 426):
                     raise ProtocolError("worker_protocol_unsupported: coordinated worker upgrade required")
                 response.raise_for_status()
-                file = await _to_thread_complete(open, dest, "wb", cancel_cleanup=lambda opened: opened.close())
-                try:
+
+                async def write(file):
+                    nonlocal size
                     # Writes are batched into _DOWNLOAD_CHUNK_BYTES buffers for
                     # the same reason as download_file: aiter_bytes() yields the
                     # transport's ~64 KB chunks, and a blocking write per chunk
@@ -1348,14 +1410,16 @@ class BackendClient:
                         # A proxy ending a chunked body early leaves h11 no
                         # Content-Length to catch it; the backend still has the
                         # bytes, so this is transient and _retry re-fetches
-                        # into a fresh "wb" file.
+                        # into a fresh temp file.
                         raise httpx.RemoteProtocolError(
                             f"input {artifact.filename} truncated: received "
                             f"{size} of {artifact.size_bytes} bytes")
                     if digest.hexdigest() != artifact.sha256:
                         raise ProtocolError("input differs from admitted digest")
-                finally:
-                    await _to_thread_complete(file.close)
+
+                # dest only ever receives a body that passed the size and
+                # digest checks above.
+                await _stream_into(dest, write)
 
         # Default six-hour Retry-After ceiling, like download_file — not the
         # lifecycle path's uncapped guidance. The lease keeps renewing in the
@@ -1369,8 +1433,9 @@ class BackendClient:
             else:
                 await _await_unless_cancelled(operation, cancelled, cancel_message)
         except BaseException:
-            # Unlinking a multi-GB partial on a network-mounted scratch pool
-            # blocks, so it goes off the loop like every other file operation
+            # _stream_into already removed the attempt's temp file; this drops
+            # whatever an earlier run left at dest. Unlinking a multi-GB file
+            # on a network-mounted scratch pool blocks, so it goes off the loop like every other file operation
             # here — through _to_thread_complete, because this runs on the
             # cancel path and a bare to_thread would be abandoned by a second
             # cancel (shutdown landing on a task timeout), leaving behind the
@@ -1732,9 +1797,12 @@ class BackendClient:
 
         Retries on the same transient errors as every other backend call
         (``httpx.TransportError`` / ``httpx.TimeoutException``, plus transient
-        status codes 408/429/502/503/504).  Each attempt re-opens ``dest``
-        with ``"wb"`` (truncating), so a retry after a mid-stream failure
-        writes a clean file rather than appending to a partial one.  A
+        status codes 408/429/502/503/504).  Each attempt streams into a fresh
+        hidden temp file beside ``dest`` and ``os.replace``s it onto ``dest``
+        only once the whole body has arrived (see :func:`_stream_into`), so a
+        retry never appends to a partial, and a process killed mid-stream
+        (SIGKILL, OOM kill, power loss — where no cleanup runs) never leaves a
+        truncated file at ``dest``.  A
         non-transient HTTP status error (e.g. 404/500) is raised immediately
         without consuming retry budget, matching :meth:`_request`.
 
@@ -1743,7 +1811,7 @@ class BackendClient:
         timeout — GB-scale outputs can take minutes to stream, and the general
         timeout would spuriously abort large downloads.
 
-        Opening, writing and closing ``dest`` all run through
+        Opening, writing, closing, fsyncing and replacing all run through
         :func:`asyncio.to_thread`, mirroring ``files._copyfile_async``. They
         used to run inline on the event-loop thread, once per wire chunk: a
         multi-GB input (a colmap-splat PLY, a Neural-Canvas splat) landing on
@@ -1758,8 +1826,9 @@ class BackendClient:
 
         If the download does not finish — retries exhausted, a non-retryable
         error, a cancel, or the *caller* being cancelled (worker shutdown, or
-        the task watchdog unwinding a run) — any partial file left at ``dest``
-        is removed so callers never see a truncated/stale artifact. The
+        the task watchdog unwinding a run) — the attempt's temp file and any
+        file already at ``dest`` are removed so callers never see a
+        truncated/stale artifact. The
         caller-cancelled case is why the cleanup catches ``BaseException``
         rather than ``Exception``: ``asyncio.CancelledError`` is not an
         ``Exception``, and ``prepare_inputs`` stages into a stable per-task
@@ -1778,8 +1847,8 @@ class BackendClient:
         Neural-Canvas splat) streamed multi-GB to completion after the user
         had already cancelled. ``TaskCancelled`` is not a transient error, so
         it propagates out of the retry loop immediately without consuming
-        retry budget, and the partial file at ``dest`` is cleaned up by the
-        same path as any other failure.
+        retry budget, and the partial temp file is cleaned up by the same path
+        as any other failure.
         """
         path = f"/tasks/{task_id}/files/{filename}"
         cancel_message = (
@@ -1797,10 +1866,8 @@ class BackendClient:
                 timeout=self._file_timeout,
             ) as resp:
                 resp.raise_for_status()
-                f = await _to_thread_complete(
-                    open, dest, "wb", cancel_cleanup=lambda opened: opened.close(),
-                )
-                try:
+
+                async def write(f):
                     # The stream is iterated at the transport's own
                     # granularity (~64 KB) so ``cancelled`` is seen at every
                     # chunk that arrives; the writes are what get batched into
@@ -1817,10 +1884,8 @@ class BackendClient:
                             buf = bytearray()
                     if buf:
                         await _to_thread_complete(f.write, buf)
-                finally:
-                    # close() flushes the last buffered write, so it blocks
-                    # like any other write and belongs off the loop too.
-                    await _to_thread_complete(f.close)
+
+                await _stream_into(dest, write)
 
         operation = self._retry(_stream_once, method="GET", path=path)
         try:
@@ -1831,11 +1896,9 @@ class BackendClient:
                     operation, cancelled, cancel_message,
                 )
         except BaseException:
-            # A mid-stream transport failure, a cancel, or the caller being
-            # cancelled can leave a partial file at dest (each retry truncates
-            # via "wb", but the final unfinished attempt's partial content
-            # survives). Remove it so an unfinished download never leaves a
-            # truncated/stale artifact behind. FileNotFoundError is an OSError,
+            # _stream_into already removed the attempt's temp file; this drops
+            # whatever an earlier run left at dest, so an unfinished download
+            # never leaves a stale artifact behind. FileNotFoundError is an OSError,
             # so the one clause covers the already-absent case too.
             #
             # The unlink itself blocks — a multi-GB partial on a network mount
