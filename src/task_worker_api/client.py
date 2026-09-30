@@ -99,11 +99,20 @@ _MAX_RETRY_AFTER_S = 6 * 60 * 60
 # same state, so the only thing honouring the window buys is a frozen
 # ``updated_at`` — which is exactly what the backend's stale-task sweeper
 # reclaims and re-queues, handing the task to a second worker that recomputes
-# and republishes the same outcome. Terminal reports (complete/fail) keep the
-# six-hour ceiling: nothing else will ever re-send them. ``int`` because
-# ``_retry_after_delay`` compares delta-seconds as decimal *text* against
-# ``str(maximum_seconds)``, which a float's ``.0`` suffix would corrupt.
+# and republishes the same outcome. ``int`` because ``_retry_after_delay``
+# compares delta-seconds as decimal *text* against ``str(maximum_seconds)``,
+# which a float's ``.0`` suffix would corrupt.
 _HEARTBEAT_RETRY_AFTER_MAX_S = int(_DEFAULT_BACKOFF_MAX_S)
+
+# Ceiling on ``Retry-After`` for the retried one-shot lifecycle calls (v1
+# ``_request``: complete/fail/box-id/cancel-status; v2 ``_resource_request``).
+# A proxy or restarting backend naming hours would otherwise hold a finished
+# task's terminal report — across the raised terminal attempt budget — while
+# the worker slot stays occupied, shutdown stalls and the stale sweeper
+# reclaims the task. Waiting longer per sleep buys nothing: the retry
+# re-sends the same idempotent request. The v1/v2 file transfers call
+# ``_retry`` directly and keep ``_MAX_RETRY_AFTER_S``. ``int`` as above.
+_LIFECYCLE_RETRY_AFTER_MAX_S = 5 * 60
 
 # Ceiling on the v2 claim's 204 ``Retry-After`` poll hint. It is a poll
 # interval, not a retry, but the admission supervisor sleeps it unattended, so
@@ -1024,7 +1033,7 @@ class BackendClient:
         *,
         extra_transient: frozenset = frozenset(),
         attempts: Optional[int] = None,
-        retry_after_max_s: Optional[int] = _MAX_RETRY_AFTER_S,
+        retry_after_max_s: Optional[int] = _LIFECYCLE_RETRY_AFTER_MAX_S,
         **kwargs,
     ) -> httpx.Response:
         """Request with exponential-backoff retry on transient errors.
@@ -1037,7 +1046,8 @@ class BackendClient:
         ``extra_transient`` / ``attempts`` / ``retry_after_max_s`` are
         forwarded to :meth:`_retry` (terminal reports widen the transient set
         to include 500 and raise the attempt budget; the periodic heartbeat
-        lowers the ``Retry-After`` ceiling); all other kwargs go to httpx.
+        lowers the ``Retry-After`` ceiling below the lifecycle default); all
+        other kwargs go to httpx.
 
         ``raise_for_status()`` runs *inside* the retry closure so a transient
         5xx is seen by ``_retry`` and retried. ``claim_next`` does not use this
@@ -1099,15 +1109,16 @@ class BackendClient:
         return response
 
     async def _resource_request(self, method, path, *, extra_transient=frozenset(), attempts=None,
-                                retry_after_max_s=_MAX_RETRY_AFTER_S, **kwargs):
+                                retry_after_max_s=_LIFECYCLE_RETRY_AFTER_MAX_S, **kwargs):
         """Retried v2 lifecycle request.
 
         ``extra_transient`` / ``attempts`` / ``retry_after_max_s`` are forwarded
         to :meth:`_retry`, as on v1's :meth:`_request` — terminal reports use
         the first two to widen the transient set and raise the attempt budget.
-        ``Retry-After`` takes v1's six-hour ceiling: an uncapped 429/503 naming
-        hours or days parks the worker while an admitted attempt holds its GPU
-        slot and its lease runs out, or a terminal report sits undelivered.
+        ``Retry-After`` takes the lifecycle ceiling, as v1's: an uncapped
+        429/503 naming hours or days parks the worker while an admitted attempt
+        holds its GPU slot and its lease runs out, or a terminal report sits
+        undelivered.
         """
         return await self._retry(
             lambda: self._resource_request_once(method, path, **kwargs),
@@ -1221,7 +1232,7 @@ class BackendClient:
         handler's critical path (``AttemptLease.update``), and the retry loop
         would let a degraded backend block the handler for ``max_retries`` ×
         ``lifecycle_timeout_s`` plus backoff (~74s on defaults) — or for as
-        long as a 429's ``Retry-After`` names, up to the six-hour ceiling —
+        long as a 429's ``Retry-After`` names, up to the lifecycle ceiling —
         while the work being described sits idle.
         Dropping one display update is cheap: the lease's own background
         ``_renew`` heartbeat is what refreshes the deadline, and it keeps its
