@@ -5091,8 +5091,18 @@ async def test_resource_download_retry_uses_a_fresh_temp_file(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_download_file_cancel_removes_the_temp_file(tmp_path):
+async def test_download_file_cancel_removes_the_temp_file(tmp_path, monkeypatch):
+    from task_worker_api import client as client_mod
+
     cancelled = asyncio.Event()
+    opened: list = []
+    real_open = open
+
+    def spy_open(path, mode):
+        opened.append(path)
+        return real_open(path, mode)
+
+    monkeypatch.setattr(client_mod, "open", spy_open, raising=False)
 
     async def body():
         for n in range(10):
@@ -5109,4 +5119,5 @@ async def test_download_file_cancel_removes_the_temp_file(tmp_path):
             5, "scene.ply", tmp_path / "out.ply", cancelled=cancelled)
     await client.close()
 
+    assert len(opened) == 1 and not opened[0].exists(), opened
     assert list(tmp_path.iterdir()) == []
