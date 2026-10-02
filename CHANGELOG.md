@@ -2,6 +2,17 @@
 
 ## 0.19.0.dev48
 
+- Keep monitoring an admitted attempt through a status-poll blip. The trusted
+  supervisor's `run_cycle` loop let a `resource_status` failure escape once the
+  client's retries ran out, so a backend restart (connection refused or
+  502/503/504) ended the cycle. The retried cycle replayed the claim as
+  recovered, `docker stop`ped the still-running child and journaled a false
+  `fail` "supervised process exited without an outcome". A `TransportError` or
+  transient `HTTPStatusError` now logs a warning and the loop polls again after
+  its usual 2s delay. The child's own lease still ends it on cancel or fencing.
+  `ProtocolError` and non-transient statuses still end the cycle. Nothing
+  changes on the wire.
+
 - Write downloads atomically. `BackendClient.download_file` and
   `resource_download` streamed straight into `dest` and relied on an
   `except BaseException` unlink to remove a partial, which never runs on
