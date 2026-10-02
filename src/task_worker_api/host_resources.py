@@ -90,7 +90,8 @@ def nvidia_gpu_capacity(headroom_mib: dict[str, int], *, executable: str = "nvid
         return {}
     output = subprocess.run([executable, "--query-gpu=uuid,memory.total,memory.free",
                              "--format=csv,noheader,nounits"],
-                            check=True, capture_output=True, text=True, timeout=5).stdout
+                            check=True, capture_output=True, text=True, timeout=5,
+                            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {})).stdout
     measured = {}
     for row in csv.reader(output.splitlines(), skipinitialspace=True):
         if len(row) != 3:
