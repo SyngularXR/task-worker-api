@@ -11,6 +11,7 @@ import json
 import threading
 import time
 
+import httpx
 import pytest
 
 from task_worker_api import (
@@ -336,9 +337,11 @@ async def test_worker_writes_typed_record_even_on_schema_rejection(
 #
 # It is caught *before* the request on purpose. Once a complete request is on
 # the wire, its failure is ambiguous — the write may have committed with only
-# its response lost — so the worker must never follow it with a second
+# its response lost — so the worker must not follow it with a second
 # terminal write (no read-then-fail either: the write can commit in the gap).
-# The tests below pin both halves.
+# The one exception is a definitive refusal (400/413/422): the backend rejects
+# the body before any write, so the worker reports it via fail() at once.
+# The tests below pin all three.
 
 
 class _FlakyCompleteClient(FakeBackendClient):
@@ -401,6 +404,106 @@ async def test_worker_logs_error_when_complete_report_fails(
     msg = error_records[0].getMessage()
     assert "terminal complete report failed" in msg
     assert "backend unreachable" in msg
+
+
+def _http_error(code: int, text: str = "") -> httpx.HTTPStatusError:
+    req = httpx.Request("POST", "http://backend/api/tasks/1/complete")
+    return httpx.HTTPStatusError(
+        str(code), request=req,
+        response=httpx.Response(code, text=text, request=req),
+    )
+
+
+def _queue_detect(client, tmp_path) -> None:
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+
+async def _ok_handler(ctx, params):
+    return {"planes": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [400, 413, 422])
+async def test_worker_fails_task_when_complete_report_is_rejected(
+    make_worker, tmp_path, code,
+):
+    """A 400/413/422 on complete() is a definitive refusal made before any
+    write, so the worker reports it via exactly one fail() carrying the real
+    reason instead of leaving the task for the stale sweeper."""
+    flaky = _FlakyCompleteClient(_http_error(code, "result.output_path missing"))
+    _queue_detect(flaky, tmp_path)
+    worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: _ok_handler})
+    await worker.run_one()
+
+    assert flaky.completed_tasks == []
+    assert len(flaky.failed_tasks) == 1
+    error = flaky.failed_tasks[0]["error"]
+    assert f"HTTP {code}" in error
+    assert "result.output_path missing" in error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [
+    httpx.ConnectError("connection refused"),
+    _http_error(503),
+], ids=["connect-error", "http-503"])
+async def test_worker_does_not_fail_task_on_ambiguous_complete_error(
+    make_worker, tmp_path, exc,
+):
+    """Transport errors and 5xx may hide a committed write: no fail()."""
+    flaky = _FlakyCompleteClient(exc)
+    _queue_detect(flaky, tmp_path)
+    worker = make_worker(client=flaky, handlers={TaskType.DETECT_CUT_PLANES: _ok_handler})
+    await worker.run_one()
+
+    assert flaky.completed_tasks == []
+    assert flaky.failed_tasks == []
+
+
+class _RejectingClient(FakeBackendClient):
+    """complete() is refused with 422 for the first task; fail() always raises."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_calls = 0
+        self._rejected = False
+
+    async def complete(self, task_id: int, result: dict) -> None:
+        if not self._rejected:
+            self._rejected = True
+            raise _http_error(422, "bad result")
+        await super().complete(task_id, result)
+
+    async def fail(self, task_id: int, error: str) -> None:
+        self.fail_calls += 1
+        raise RuntimeError("backend unreachable")
+
+
+@pytest.mark.asyncio
+async def test_worker_survives_fail_raising_after_rejected_complete(
+    make_worker, tmp_path, caplog,
+):
+    """If the fail() reporting a refused complete itself raises, it is
+    logged at ERROR and the worker keeps polling: the next task completes."""
+    client = _RejectingClient()
+    _queue_detect(client, tmp_path)
+    _queue_detect(client, tmp_path)
+    worker = make_worker(client=client, handlers={TaskType.DETECT_CUT_PLANES: _ok_handler})
+
+    with caplog.at_level("ERROR"):
+        assert await worker.run_one()
+        assert await worker.run_one()
+
+    assert client.fail_calls == 1
+    assert len(client.completed_tasks) == 1
+    assert any(
+        "rejected complete" in r.getMessage() and "backend unreachable" in r.getMessage()
+        for r in caplog.records if r.levelname == "ERROR"
+    )
 
 
 @pytest.mark.asyncio
