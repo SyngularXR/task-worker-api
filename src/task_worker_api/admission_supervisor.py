@@ -16,6 +16,7 @@ from uuid import UUID
 
 import httpx
 
+from .client import _is_transient_status
 from .resources import AdmissionError
 from .errors import ProtocolError
 
@@ -75,9 +76,18 @@ async def run_cycle(client, journal, worker_instance_id, task_types, supervisor,
                 if monotonic() - last_sample >= 30:
                     await _log_resources(claim, read_report, "active", started)
                     last_sample = monotonic()
-                state = await client.resource_status(claim)
-                if state.state not in ("reserved", "running") or state.cancelled:
-                    break
+                try:
+                    state = await client.resource_status(claim)
+                except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                    if isinstance(exc, httpx.HTTPStatusError) and not _is_transient_status(exc):
+                        raise
+                    # An escaped blip would replay the claim as recovered and
+                    # stop the healthy child; its own lease still ends it on
+                    # cancel or fencing. ProtocolError still ends the cycle.
+                    logging.getLogger(__name__).warning("Admitted attempt status unavailable", exc_info=True)
+                else:
+                    if state.state not in ("reserved", "running") or state.cancelled:
+                        break
                 await asyncio.sleep(2)
         finally:
             heartbeat.cancel()

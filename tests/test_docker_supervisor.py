@@ -78,8 +78,8 @@ async def test_supervisor_renews_reservation_during_child_startup(tmp_path, monk
 
 
 
-def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None):
-    """run_cycle harness whose startup heartbeat and launch are scripted."""
+def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None, status=lambda: None):
+    """run_cycle harness whose startup heartbeat, launch and status polls are scripted."""
     state = dict(phase="reserved", polls=0)
     claim = SimpleNamespace(ownership=SimpleNamespace(attempt_id=uuid4()))
     sleep = asyncio.sleep
@@ -96,7 +96,7 @@ def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None):
             heartbeat()
             return SimpleNamespace(state="reserved", cancelled=False)
         async def resource_status(self, *args):
-            return SimpleNamespace(state=state["phase"], cancelled=False)
+            return status() or SimpleNamespace(state=state["phase"], cancelled=False)
         async def resource_recover_operations(self, *args):
             pass
         async def resource_operation(self, journal, operation, *args, **kwargs):
@@ -115,7 +115,7 @@ def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None):
             state["polls"] += 1
             return state["polls"] < 4
         def cleanup(self, *args):
-            state["cleaned"] = True
+            state["cleaned"] = state["polls"]  # Truthy; records how far monitoring got.
         def sign_cleanup(self, *args):
             return None
 
@@ -173,6 +173,51 @@ async def test_startup_heartbeat_error_does_not_mask_launch_error(tmp_path, monk
     _, cycle = _startup_cycle(tmp_path, monkeypatch, heartbeat, launch)
     with pytest.raises(RuntimeError, match="launch failed"):
         await cycle
+
+
+def _connect_error():
+    raise httpx.ConnectError("blip", request=httpx.Request("GET", "http://test/cancel-status"))
+
+
+def _status_503():
+    httpx.Response(503, request=httpx.Request("GET", "http://test/cancel-status")).raise_for_status()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blip", [_connect_error, _status_503])
+async def test_status_poll_blip_keeps_monitoring(tmp_path, monkeypatch, blip):
+    calls = []
+
+    def status():
+        calls.append(None)
+        if len(calls) == 1:
+            blip()
+        return SimpleNamespace(state="running", cancelled=False) if len(calls) < 4 else None
+
+    state, cycle = _startup_cycle(tmp_path, monkeypatch, lambda: None, status=status)
+    await cycle
+    assert state["cleaned"] == 4  # Cleanup waited for running() to return False.
+    assert len(calls) >= 2 and state["release"]
+
+
+def _protocol_error():
+    from task_worker_api.errors import ProtocolError
+    raise ProtocolError("foreign attempt")
+
+
+def _status_500():
+    httpx.Response(500, request=httpx.Request("GET", "http://test/cancel-status")).raise_for_status()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [_protocol_error, _status_500])
+async def test_status_poll_non_transient_error_ends_cycle(tmp_path, monkeypatch, error):
+    from task_worker_api.errors import ProtocolError
+
+    state, cycle = _startup_cycle(tmp_path, monkeypatch, lambda: None, status=error)
+    with pytest.raises((ProtocolError, httpx.HTTPStatusError)):
+        await cycle
+    assert "cleaned" not in state and "release" not in state
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("startup_failures", [0, 5])
