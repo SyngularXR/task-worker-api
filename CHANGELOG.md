@@ -22,6 +22,16 @@
   `ProtocolError` and non-transient statuses still end the cycle. Nothing
   changes on the wire.
 
+- Keep the admission supervisor's startup heartbeat alive across an exhausted
+  transient status. After a backend restart nginx answers 502/503/504 rather
+  than refusing the connection, so `resource_heartbeat` raised an
+  `HTTPStatusError` once the client's retries ran out. That killed the
+  heartbeat task, stopped renewing the reservation while the child was still
+  starting, and sent the cycle through recovery after the child exited. A
+  transient status (408/429/502/503/504) is now logged as a warning like a
+  `TransportError` and the 5s heartbeat continues. A 409 still ends
+  heartbeating; other statuses and `ProtocolError` still end the cycle.
+
 - Write downloads atomically. `BackendClient.download_file` and
   `resource_download` streamed straight into `dest` and relied on an
   `except BaseException` unlink to remove a partial, which never runs on
