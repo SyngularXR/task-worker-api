@@ -127,14 +127,23 @@ def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None, status
     return state, run_cycle(Client(), journal, uuid4(), ["gs_build"], Supervisor(), {}, report, b"key")
 
 
+def _connect_error():
+    raise httpx.ConnectError("blip", request=httpx.Request("GET", "http://test/cancel-status"))
+
+
+def _status_503():
+    httpx.Response(503, request=httpx.Request("GET", "http://test/cancel-status")).raise_for_status()
+
+
 @pytest.mark.asyncio
-async def test_startup_heartbeat_survives_transport_error(tmp_path, monkeypatch):
+@pytest.mark.parametrize("blip", [_connect_error, _status_503])
+async def test_startup_heartbeat_survives_blip(tmp_path, monkeypatch, blip):
     calls = []
 
     def heartbeat():
         calls.append(None)
         if len(calls) == 1:
-            raise httpx.ConnectError("blip", request=httpx.Request("POST", "http://test/heartbeat"))
+            blip()
 
     state, cycle = _startup_cycle(tmp_path, monkeypatch, heartbeat)
     await cycle
@@ -173,14 +182,6 @@ async def test_startup_heartbeat_error_does_not_mask_launch_error(tmp_path, monk
     _, cycle = _startup_cycle(tmp_path, monkeypatch, heartbeat, launch)
     with pytest.raises(RuntimeError, match="launch failed"):
         await cycle
-
-
-def _connect_error():
-    raise httpx.ConnectError("blip", request=httpx.Request("GET", "http://test/cancel-status"))
-
-
-def _status_503():
-    httpx.Response(503, request=httpx.Request("GET", "http://test/cancel-status")).raise_for_status()
 
 
 @pytest.mark.asyncio
