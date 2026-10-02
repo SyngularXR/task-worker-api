@@ -62,14 +62,19 @@ def test_gpu_collector_rejects_missing_or_invalid_measurements(monkeypatch, row)
         nvidia_gpu_capacity({"GPU-00000000-0000-0000-0000-000000000001": 10})
 
 
-def test_gpu_collector_uses_uuid_headroom_and_bounded_command(monkeypatch):
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+def test_gpu_collector_uses_uuid_headroom_and_bounded_command(monkeypatch, platform):
     import types
+    from task_worker_api import host_resources
     from task_worker_api.host_resources import nvidia_gpu_capacity
 
+    monkeypatch.setattr(host_resources, "os", types.SimpleNamespace(name=platform))
+    monkeypatch.setattr(host_resources.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
     device = "GPU-00000000-0000-0000-0000-000000000001"
     def measure(command, **kwargs):
         assert "uuid,memory.total,memory.free" in command[1]
         assert kwargs["timeout"] == 5 and kwargs["check"]
+        assert kwargs.get("creationflags", 0) == (0x08000000 if platform == "nt" else 0)
         return types.SimpleNamespace(stdout=f"{device}, 24000, 21000\n")
     monkeypatch.setattr("task_worker_api.host_resources.subprocess.run", measure)
     assert nvidia_gpu_capacity({device: 1000}) == {device: Capacity(allocatable=23000, available=20000)}
