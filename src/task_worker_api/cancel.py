@@ -23,6 +23,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Callable, Optional, TYPE_CHECKING
 
+from .enums import TaskStatus
 from .errors import TaskCancelled
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -44,6 +45,12 @@ _warned_legacy_cancel_client = False
 #: escalation; not a ``Worker`` knob because there is nothing to tune per
 #: deployment.
 _POLL_WARN_THRESHOLD = 3
+
+#: Backend statuses the guard treats like a cancel. ``cancel-status`` sets
+#: ``cancelled`` only for CANCELLED, but a row the stale sweeper already
+#: FAILED (or that is otherwise terminal) ignores any later ``complete()`` —
+#: computing on is hours of wasted GPU time with the slot blocked.
+_TERMINAL_STATUSES = (TaskStatus.FAILED, TaskStatus.COMPLETED)
 
 
 def _cancel_status_poller(client: "BackendClient"):
@@ -126,6 +133,10 @@ async def CancelGuard(
     remove the workdir while the GPU/CLI work ran on. Handlers stop their
     own work; the guard only tells them to.
 
+    A poll reporting ``status`` FAILED or COMPLETED counts as a cancel too:
+    the backend already terminated the task (e.g. the stale sweeper after an
+    outage) and will ignore its ``complete()``.
+
     Timing: cancel visibility is bounded by ``poll_interval_s`` (default 2s)
     plus ``cancel_timeout_s`` (default 5s) on a degraded backend. Long C
     extension calls that don't yield to the event loop will see the cancel
@@ -143,7 +154,14 @@ async def CancelGuard(
         while not cancelled.is_set():
             try:
                 resp = await poll_status(task_id)
-                if resp.get("cancelled"):
+                status = resp.get("status")
+                terminal = status in _TERMINAL_STATUSES
+                if terminal:
+                    log.warning(
+                        "task %s is already %s on the backend; stopping it "
+                        "as cancelled", task_id, TaskStatus(status).name,
+                    )
+                if terminal or resp.get("cancelled"):
                     cancelled.set()
                     if on_cancel is not None:
                         try:

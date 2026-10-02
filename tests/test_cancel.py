@@ -337,3 +337,36 @@ async def test_warns_on_sustained_malformed_response(caplog):
 
     assert [r.levelname for r in records] == ["DEBUG", "DEBUG", "WARNING"]
     assert "3 consecutive failures" in records[-1].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resp, stops", [
+    ({"cancelled": False, "status": TaskStatus.FAILED}, True),
+    ({"cancelled": False, "status": TaskStatus.COMPLETED}, True),
+    ({"cancelled": False, "status": TaskStatus.PENDING}, False),
+    ({"cancelled": False, "status": TaskStatus.CLAIMED}, False),
+    ({"cancelled": False, "status": TaskStatus.IN_PROGRESS}, False),
+    ({"cancelled": False}, False),
+])
+async def test_terminal_backend_status_counts_as_cancel(resp, stops, caplog):
+    """The stale sweeper FAILs a task without setting ``cancelled``; the
+    backend then ignores its ``complete()``, so the guard must stop it."""
+    client = _ScriptedPollClient([resp])
+    called = []
+    with caplog.at_level("WARNING", logger="task_worker_api.cancel"):
+        try:
+            async with CancelGuard(
+                client, task_id=7, poll_interval_s=0.001,
+                on_cancel=lambda: called.append(True),
+            ) as cancelled:
+                await asyncio.wait_for(client.done.wait(), timeout=5)
+                await asyncio.sleep(0)
+                assert cancelled.is_set() is stops
+        except TaskCancelled:
+            assert stops
+
+    assert called == ([True] if stops else [])
+    warned = [r for r in caplog.records if "already" in r.message]
+    assert len(warned) == (1 if stops else 0)
+    if stops:
+        assert TaskStatus(resp["status"]).name in warned[0].getMessage()

@@ -16,6 +16,7 @@ import pytest
 from task_worker_api import (
     TaskCancelled,
     TaskContext,
+    TaskStatus,
     TaskType,
     Worker,
 )
@@ -997,6 +998,54 @@ async def test_cancel_guard_propagates_to_progress_is_cancelled(
     assert "cancelled" in client.failed_tasks[0]["error"].lower()
     # The cancel was detected via the guard, not the heartbeat.
     assert client._cancel_poll_count >= 1
+
+
+class _SweptTaskClient(_CancelGuardPropagationClient):
+    """The stale sweeper FAILs the task mid-run: cancel-status keeps
+    ``cancelled: False`` but reports ``status`` FAILED."""
+
+    async def poll_cancel_status(self, task_id: int) -> dict:
+        if self.handler_running.is_set():
+            return {"cancelled": False, "status": int(TaskStatus.FAILED)}
+        return {"cancelled": False, "status": int(TaskStatus.IN_PROGRESS)}
+
+
+@pytest.mark.asyncio
+async def test_backend_failed_status_stops_handler(
+    make_worker, tmp_path, monkeypatch,
+):
+    """A task the backend already FAILED must stop, not run to complete()."""
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _SweptTaskClient()
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+    saw_cancelled = asyncio.Event()
+
+    async def handler(ctx, params):
+        client.handler_running.set()
+        for _ in range(100):
+            if ctx.progress.is_cancelled:
+                saw_cancelled.set()
+                raise TaskCancelled(f"task {ctx.task.id} cancelled by user")
+            await asyncio.sleep(0.02)
+        return {}  # pragma: no cover — should never reach
+
+    worker = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        cancel_poll_interval_s=0.01,
+        heartbeat_interval_s=10.0,
+    )
+    await worker.run_one()
+
+    assert saw_cancelled.is_set()
+    assert client.completed_tasks == []
+    assert len(client.failed_tasks) == 1
 
 
 @pytest.mark.asyncio

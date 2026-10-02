@@ -2,6 +2,15 @@
 
 ## 0.19.0.dev48
 
+- Stop computing a v1 task the backend has already terminated. The stale
+  sweeper marks a task FAILED without setting `cancelled`, and
+  `PUT /progress` reports `cancelled: false` for terminal rows, so the worker
+  ran the handler and uploads to the end on a task whose `complete()` the
+  backend ignores. `CancelGuard` now treats a cancel-status `status` of
+  FAILED or COMPLETED like `cancelled: true` (sets the event, calls
+  `on_cancel`, logs one WARNING naming the status). PENDING, CLAIMED and
+  IN_PROGRESS are ignored. Nothing changes on the wire.
+
 - Keep monitoring an admitted attempt through a status-poll blip. The trusted
   supervisor's `run_cycle` loop let a `resource_status` failure escape once the
   client's retries ran out, so a backend restart (connection refused or
