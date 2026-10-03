@@ -2,6 +2,16 @@
 
 ## 0.19.0.dev48
 
+- Keep monitoring an admitted attempt through a transient Docker CLI failure.
+  The trusted supervisor's `run_cycle` loop let a `docker inspect` failure from
+  `DockerSupervisor.running` escape, so one daemon hiccup (`CalledProcessError`)
+  or a slow daemon (`TimeoutExpired`) ended the cycle. The retried cycle
+  replayed the claim as recovered, `docker stop`ped the still-running child and
+  journaled a false `fail`. Those two errors now log a warning and the loop
+  keeps polling the backend status, which stays the exit condition.
+  `AdmissionError` (fencing, changed launch configuration) and other probe
+  failures still end the cycle. Nothing changes on the wire.
+
 - Stop computing a v1 task the backend has already terminated. The stale
   sweeper marks a task FAILED without setting `cancelled`, and
   `PUT /progress` reports `cancelled: false` for terminal rows, so the worker
