@@ -1696,9 +1696,10 @@ class Worker:
                     # lands terminal carrying the real cause.
                     #
                     # Deciding this *before* the request is what makes it safe,
-                    # and is why there is no post-hoc "complete() raised, so
-                    # fail() it" fallback in the handler below. Once a complete
-                    # request has gone out, its failure is ambiguous — the write
+                    # and is why the handler below has no general "complete()
+                    # raised, so fail() it" fallback (only the narrow
+                    # definitive-refusal case, see there). Once a complete
+                    # request has gone out, its failure is usually ambiguous — the write
                     # may have committed with only the response lost — and no
                     # amount of reading the task back closes that window: the
                     # write can still commit (or a cancel/requeue land) between
@@ -1798,16 +1799,44 @@ class Worker:
                         # re-raise: a single failed terminal report must not
                         # kill the polling loop and strand every subsequent task.
                         #
-                        # And we do NOT retry the other terminal route here (see
-                        # the encode pre-check above): the request is already on
-                        # the wire, so this failure can't tell a lost write from
-                        # a lost *response*, and a second terminal write would
-                        # risk stamping ``failed`` over a completion that landed.
+                        # In general we do NOT retry the other terminal route
+                        # here (see the encode pre-check above): the request is
+                        # already on the wire, so this failure can't tell a lost
+                        # write from a lost *response*, and a second terminal
+                        # write would risk stamping ``failed`` over a completion
+                        # that landed. The one exception is a definitive
+                        # refusal of the complete body — 400, 413 or 422. The
+                        # backend rejects those before any write (request
+                        # validation, the result validators, the proxy's body
+                        # limit), so nothing landed; and its mark_failed is a
+                        # guarded no-op on a terminal row, so even a 422 on an
+                        # already-completed row can't be overwritten. Report
+                        # the refusal through fail() so the task lands terminal
+                        # with the real reason now, instead of sitting
+                        # in_progress until the sweeper fails it as stale.
                         log.error(
                             "task %s: terminal %s report failed after retries; "
                             "backend did not record outcome=%r: %s",
                             task.id, terminal, outcome[1], report_exc,
                         )
+                        if (
+                            terminal == "complete"
+                            and isinstance(report_exc, httpx.HTTPStatusError)
+                            and report_exc.response.status_code in (400, 413, 422)
+                        ):
+                            try:
+                                await bounded(target.client.fail(
+                                    task.id,
+                                    "backend rejected the complete report: "
+                                    f"HTTP {report_exc.response.status_code}: "
+                                    f"{report_exc.response.text}",
+                                ))
+                            except Exception as fail_exc:  # noqa: BLE001
+                                log.error(
+                                    "task %s: reporting the rejected complete "
+                                    "as failed also failed: %s",
+                                    task.id, fail_exc,
+                                )
             finally:
                 # Always tear the heartbeat down, even if the report block
                 # raised something the except above doesn't catch (guard.claim
