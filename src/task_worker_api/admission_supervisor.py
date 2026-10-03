@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
 from time import monotonic
 from uuid import UUID
@@ -74,7 +75,15 @@ async def run_cycle(client, journal, worker_instance_id, task_types, supervisor,
         heartbeat = asyncio.create_task(startup_heartbeat())
         try:
             await asyncio.to_thread(supervisor.launch, claim, **launch, journal_directory=journal.path.parent)
-            while await asyncio.to_thread(supervisor.running, claim):
+            while True:
+                try:
+                    if not await asyncio.to_thread(supervisor.running, claim):
+                        break
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    # A Docker CLI hiccup is not an exit: escaping would replay the
+                    # claim as recovered and stop the healthy child. The backend
+                    # status below stays the exit condition; fencing still raises.
+                    logging.getLogger(__name__).warning("Admitted container probe unavailable", exc_info=True)
                 if monotonic() - last_sample >= 30:
                     await _log_resources(claim, read_report, "active", started)
                     last_sample = monotonic()
