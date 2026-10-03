@@ -1,5 +1,6 @@
 import json
 import asyncio
+import subprocess
 import httpx
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -78,8 +79,8 @@ async def test_supervisor_renews_reservation_during_child_startup(tmp_path, monk
 
 
 
-def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None, status=lambda: None):
-    """run_cycle harness whose startup heartbeat, launch and status polls are scripted."""
+def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None, status=lambda: None, running=lambda polls: None):
+    """run_cycle harness whose startup heartbeat, launch, running probes and status polls are scripted."""
     state = dict(phase="reserved", polls=0)
     claim = SimpleNamespace(ownership=SimpleNamespace(attempt_id=uuid4()))
     sleep = asyncio.sleep
@@ -113,6 +114,7 @@ def _startup_cycle(tmp_path, monkeypatch, heartbeat, launch=lambda: None, status
             launch()
         def running(self, *args):
             state["polls"] += 1
+            running(state["polls"])
             return state["polls"] < 4
         def cleanup(self, *args):
             state["cleaned"] = state["polls"]  # Truthy; records how far monitoring got.
@@ -219,6 +221,32 @@ async def test_status_poll_non_transient_error_ends_cycle(tmp_path, monkeypatch,
     with pytest.raises((ProtocolError, httpx.HTTPStatusError)):
         await cycle
     assert "cleaned" not in state and "release" not in state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blip", [subprocess.CalledProcessError(1, ["docker", "inspect"]),
+                                  subprocess.TimeoutExpired(["docker", "inspect"], 30)])
+async def test_running_probe_blip_keeps_monitoring(tmp_path, monkeypatch, blip):
+    def running(polls):
+        if polls == 1:
+            raise blip
+
+    state, cycle = _startup_cycle(tmp_path, monkeypatch, lambda: None, running=running)
+    await cycle
+    assert state["cleaned"] == 4  # Cleanup waited for running() to return False.
+    assert state["release"]
+
+
+@pytest.mark.asyncio
+async def test_running_probe_fencing_error_ends_cycle(tmp_path, monkeypatch):
+    def running(polls):
+        raise AdmissionError("attempt_fenced")
+
+    state, cycle = _startup_cycle(tmp_path, monkeypatch, lambda: None, running=running)
+    with pytest.raises(AdmissionError, match="attempt_fenced"):
+        await cycle
+    assert "cleaned" not in state and "release" not in state
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("startup_failures", [0, 5])
