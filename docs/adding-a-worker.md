@@ -311,7 +311,8 @@ Don't swallow errors. Raising is the right signal.
 ## Picking a cancel pattern
 
 When the backend flips a task to CANCELLED (user hit cancel, or admin
-dashboard clicked stop), the SDK's `CancelGuard` polls
+dashboard clicked stop) — or reports it already FAILED/COMPLETED (e.g. the
+stale sweeper failed it after an outage) — the SDK's `CancelGuard` polls
 `/tasks/{id}/cancel-status` every 2 seconds. It sets
 `ctx.progress.is_cancelled = True`, and raises `TaskCancelled` on the way
 *out* of your handler, so the attempt reports "cancelled by user".
