@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import operator
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
+
+import httpx
+
+from .client import _ENCODE_PROBE_URL, _progress_body
 
 if TYPE_CHECKING:  # pragma: no cover
     from .client import BackendClient
@@ -113,7 +118,33 @@ class ProgressReporter:
         stage-transition latency only: the new state is already in
         ``self._state``, and the background heartbeat re-sends it on its next
         tick, which is what keeps ``updated_at`` fresh across a backend blip.
+
+        A value httpx cannot JSON-encode is rejected before it reaches
+        ``self._state``: the heartbeat re-sends that state every tick, so one
+        bad value would fail every later tick and freeze ``updated_at`` until
+        the stale sweeper reclaimed the live task. Integer-like scalars that
+        are not ``int`` (numpy, torch) go through ``operator.index`` first.
+        The check builds a request without sending it, as
+        ``worker._result_encode_exc`` does, so it matches the real encoder.
         """
+        try:
+            current, total = (
+                v if isinstance(v, int) or not hasattr(type(v), "__index__")
+                else operator.index(v)
+                for v in (current, total)
+            )
+            httpx.Request(
+                "PUT", _ENCODE_PROBE_URL,
+                json=_progress_body(stage, current, total, _REMOTE_KILL_HANDLE),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "progress update rejected for task %s: stage=%r current=%r "
+                "total=%r cannot be JSON-encoded (%r); keeping the previous "
+                "progress state",
+                self._task_id, stage, current, total, e,
+            )
+            return
         self._state.stage = stage
         self._state.current = current
         self._state.total = total

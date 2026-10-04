@@ -520,3 +520,71 @@ def test_link_cancelled_safe_before_or_after_start():
     ext = asyncio.Event()
     pr.link_cancelled(ext)
     pr.link_cancelled(None)
+
+
+# ----- values httpx cannot encode --------------------------------------------
+
+
+class IndexOnly:
+    """Stand-in for a numpy integer: has ``__index__`` but is not an ``int``."""
+
+    def __init__(self, v):
+        self.v = v
+
+    def __index__(self):
+        return self.v
+
+
+def _recording_client(bodies):
+    import json
+
+    import httpx
+
+    from task_worker_api.client import BackendClient
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"cancelled": False})
+
+    http = httpx.AsyncClient(
+        base_url="http://fake/api/v1",
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer x"},
+    )
+    return BackendClient("http://fake/api/v1", "x", client=http)
+
+
+@pytest.mark.asyncio
+async def test_update_index_values_are_sent_as_ints():
+    bodies = []
+    pr = ProgressReporter(_recording_client(bodies), task_id=1, heartbeat_interval_s=0.01)
+    await pr.update("step", current=IndexOnly(3), total=IndexOnly(10))
+    await pr.start_heartbeat()
+    await asyncio.sleep(0.05)
+    await pr.stop()
+
+    assert len(bodies) >= 2  # the immediate report plus at least one tick
+    assert all((b["stage"], b["current"], b["total"]) == ("step", 3, 10) for b in bodies)
+    assert pr._heartbeat_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_update_unencodable_value_keeps_previous_state(caplog):
+    bodies = []
+    pr = ProgressReporter(_recording_client(bodies), task_id=1, heartbeat_interval_s=0.01)
+    await pr.update("good", current=1, total=2)
+    with caplog.at_level("WARNING", logger="task_worker_api.progress"):
+        await pr.update("x", current=object())
+    assert any("rejected" in r.getMessage() for r in caplog.records)
+    assert (pr._state.stage, pr._state.current, pr._state.total) == ("good", 1, 2)
+    assert len(bodies) == 1  # nothing was sent for the rejected update
+
+    await pr.start_heartbeat()
+    await asyncio.sleep(0.05)
+    await pr.stop()
+    assert len(bodies) >= 2
+    assert bodies[-1] == {
+        "stage": "good", "current": 1, "total": 2,
+        "kill_handle": {"pid": None, "container": None, "host": "remote"},
+    }
+    assert pr._heartbeat_failures == 0

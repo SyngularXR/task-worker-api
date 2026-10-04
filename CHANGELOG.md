@@ -2,6 +2,18 @@
 
 ## 0.19.0.dev48
 
+- Stop one bad progress value from blocking every later v1 heartbeat.
+  `ProgressReporter.update` stored `stage`/`current`/`total` before anything
+  checked them, and the heartbeat re-sends that state every tick, so a value
+  httpx cannot JSON-encode (a numpy integer, any non-JSON object, NaN under
+  httpx 0.28) failed every later tick while the request was being built. The
+  progress PUT is the v1 heartbeat, so `updated_at` froze and the stale sweeper
+  reclaimed a live task. `update` now passes integer-like non-`int` values
+  (numpy, torch) through `operator.index`, then builds the request body
+  without sending it. If encoding fails, it logs a WARNING and keeps the
+  previous state, and the heartbeat goes on sending it. Plain `int`, `bool`
+  and `float` values go on the wire unchanged.
+
 - Keep monitoring an admitted attempt through a transient Docker CLI failure.
   The trusted supervisor's `run_cycle` loop let a `docker inspect` failure from
   `DockerSupervisor.running` escape, so one daemon hiccup (`CalledProcessError`)
