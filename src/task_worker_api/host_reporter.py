@@ -57,7 +57,8 @@ def _snapshot(config, sequence):
         scopes = {}
         if "vm_command" in config:
             # Operator-provisioned argv, never shell text or a worker request.
-            raw = subprocess.run(config["vm_command"], check=True, capture_output=True, text=True, timeout=10).stdout
+            raw = subprocess.run(config["vm_command"], check=True, capture_output=True, text=True, timeout=10,
+                                 creationflags=subprocess.CREATE_NO_WINDOW).stdout
             scopes = json.loads(raw)["execution_scopes"]
         if "native_scope" in config:
             native = config["native_scope"]
