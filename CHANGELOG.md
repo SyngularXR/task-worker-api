@@ -8,7 +8,10 @@
   so the lease watchdog could cancel the owner task on its next 50ms tick
   before `run` raised `TaskCancelled`. The deadline now stays as acknowledged;
   `run` stops the handler through the loss event and the watchdog remains the
-  backstop at the real deadline.
+  backstop at the real deadline. In the normal path the watchdog no longer
+  fires at all; for an owner that ignores cancellation, its cancel and the
+  `grace_s` hard exit now start at the acknowledged deadline (at most 30s
+  after the last accepted renewal) instead of about 50ms after the report.
 
 - Stop one bad progress value from blocking every later v1 heartbeat.
   `ProgressReporter.update` stored `stage`/`current`/`total` before anything
