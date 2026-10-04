@@ -2,6 +2,29 @@
 
 ## 0.19.0.dev48
 
+- Report a lost admitted-attempt lease as a cancel, not a bare
+  `CancelledError`. On a reported loss (cancelled or unworkable attempt,
+  heartbeat 409, rejected progress) `AttemptLease` also zeroed its deadline,
+  so the lease watchdog could cancel the owner task on its next 50ms tick
+  before `run` raised `TaskCancelled`. The deadline now stays as acknowledged;
+  `run` stops the handler through the loss event and the watchdog remains the
+  backstop at the real deadline. In the normal path the watchdog no longer
+  fires at all; for an owner that ignores cancellation, its cancel and the
+  `grace_s` hard exit now start at the acknowledged deadline (at most 30s
+  after the last accepted renewal) instead of about 50ms after the report.
+
+- Stop one bad progress value from blocking every later v1 heartbeat.
+  `ProgressReporter.update` stored `stage`/`current`/`total` before anything
+  checked them, and the heartbeat re-sends that state every tick, so a value
+  httpx cannot JSON-encode (a numpy integer, any non-JSON object, NaN under
+  httpx 0.28) failed every later tick while the request was being built. The
+  progress PUT is the v1 heartbeat, so `updated_at` froze and the stale sweeper
+  reclaimed a live task. `update` now passes integer-like non-`int` values
+  (numpy, torch) through `operator.index`, then builds the request body
+  without sending it. If encoding fails, it logs a WARNING and keeps the
+  previous state, and the heartbeat goes on sending it. Plain `int`, `bool`
+  and `float` values go on the wire unchanged.
+
 - Keep monitoring an admitted attempt through a transient Docker CLI failure.
   The trusted supervisor's `run_cycle` loop let a `docker inspect` failure from
   `DockerSupervisor.running` escape, so one daemon hiccup (`CalledProcessError`)

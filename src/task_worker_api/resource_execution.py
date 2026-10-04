@@ -51,10 +51,11 @@ class AttemptLease:
     def _mark_lost(self):
         """Record that this lease is dead and wake `run`; safe from any thread.
 
-        ``_lost`` is the event-loop mirror of ``_expired``. The handler race in
-        :meth:`run` wakes on the pass the loss is recorded in, ahead of
-        ``_watch``'s 50ms tick, so an interrupted attempt reports the cancel
-        rather than the watchdog's bare owner-task cancel.
+        ``_lost`` is the event-loop mirror of ``_expired``. A reported loss
+        leaves the acknowledged deadline alone: zeroing it would let ``_watch``
+        cancel the owner task on its next tick, racing :meth:`run` and handing
+        the caller a bare ``CancelledError`` instead of the cancel. The
+        watchdog stays the backstop at the real deadline.
         """
         self._expired.set()
         if self._loop is not None:
@@ -152,18 +153,14 @@ class AttemptLease:
                 self._accept(await asyncio.wait_for(
                     self.client.resource_heartbeat(self.claim), allowance), sent)
             except ProtocolError:
-                with self._lock:
-                    self._mark_lost()
-                    self._deadline = 0
+                self._mark_lost()
                 return
             except httpx.HTTPStatusError as exc:
                 # The backend answers a heartbeat 409 only for a dead lease
                 # (lease_expired, attempt_fenced); renewing on would burn the
                 # runway on a retired token. Other statuses log like any blip.
                 if exc.response.status_code == 409:
-                    with self._lock:
-                        self._mark_lost()
-                        self._deadline = 0
+                    self._mark_lost()
                     return
                 log.warning("Attempt heartbeat failed; acknowledged lease still expires", exc_info=True)
             except Exception:
@@ -229,8 +226,6 @@ class AttemptLease:
                 {"stage": stage, "current": current, "total": total}), sent)
         except ProtocolError:
             self._mark_lost()
-            with self._lock:
-                self._deadline = 0
             raise
         except Exception:
             log.warning("Attempt progress update failed", exc_info=True)
