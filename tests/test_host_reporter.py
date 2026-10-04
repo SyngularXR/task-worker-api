@@ -64,8 +64,10 @@ def test_windows_execution_scopes_share_measured_host_budget(monkeypatch, native
     monkeypatch.setattr(host_reporter, "windows_host_capacity", lambda **kwargs: (ram, 18000))
     monkeypatch.setattr(host_reporter, "nvidia_gpu_capacity", lambda *args: {})
     monkeypatch.setattr(host_reporter, "scratch_capacities", lambda *args, **kwargs: {})
+    monkeypatch.setattr(host_reporter.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
     calls = []
     def collect_vm(argv, **kwargs):
+        assert kwargs["creationflags"] == 0x08000000  # no console flash every report tick
         calls.append(argv)
         return SimpleNamespace(stdout='{"execution_scopes":{"vm":{"ram":{"allocatable":8000,"available":4000},"cpu_millicores":4000}}}')
     monkeypatch.setattr(host_reporter.subprocess, "run", collect_vm)
