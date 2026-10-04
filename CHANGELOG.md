@@ -2,6 +2,14 @@
 
 ## 0.19.0.dev48
 
+- Report a lost admitted-attempt lease as a cancel, not a bare
+  `CancelledError`. On a reported loss (cancelled or unworkable attempt,
+  heartbeat 409, rejected progress) `AttemptLease` also zeroed its deadline,
+  so the lease watchdog could cancel the owner task on its next 50ms tick
+  before `run` raised `TaskCancelled`. The deadline now stays as acknowledged;
+  `run` stops the handler through the loss event and the watchdog remains the
+  backstop at the real deadline.
+
 - Stop one bad progress value from blocking every later v1 heartbeat.
   `ProgressReporter.update` stored `stage`/`current`/`total` before anything
   checked them, and the heartbeat re-sends that state every tick, so a value
