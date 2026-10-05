@@ -118,7 +118,7 @@ changes alone do not require a GPU or Android benchmark.
 ### Backend compute — `s4-backend-compute`
 
 - Tasks: `render`, `gs4d_build`, `prepare_deploy` in
-  [SynPusher-Vue backend services](https://github.com/SyngularXR/SynPusher-Vue/tree/main/services/backend/src/services).
+  [backend compute workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-compute-worker.md).
 - Quality: verify rendered cameras, color/exposure, volume orientation and
   COLMAP inputs; GS4D phase ordering, transforms and temporal stability; deploy
   snapshots preserve every required asset and its metadata. GS4D preparation
@@ -136,7 +136,7 @@ changes alone do not require a GPU or Android benchmark.
 - Tasks: `finalize_cinematic`, `finalize_deploy`, `finalize_deploy_prep`,
   `finalize_gs`, `finalize_gs4d`, `finalize_model`, `finalize_render`,
   `finalize_segment`, `finalize_spatial`, `finalize_synthetic`; implemented by
-  [trusted backend finalizers](https://github.com/SyngularXR/SynPusher-Vue/blob/main/services/backend/src/services/resource_finalizer_worker.py).
+  [trusted finalizer workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-finalizer-worker.md).
 - Quality: publication must preserve the committed artifacts, units, transforms,
   labels, intensity windows and associations. Check final client-visible data,
   not just successful worker uploads. Never silently accept incomplete outputs.
@@ -170,7 +170,7 @@ changes alone do not require a GPU or Android benchmark.
 ### Synthetic reconstruction — `s4-synthetic`
 
 - Task: `generate_synthetic` in
-  [synthetic-generator](https://github.com/SyngularXR/synthetic-generator).
+  [synthetic reconstruction workflow](https://github.com/SyngularXR/synthetic-generator/blob/main/docs/worker-pipeline.md).
 - Quality: compare reconstructed anatomy/detail, artifacts and intensity on
   matched orthogonal slices and 3D views; verify reference-frame ROI placement,
   coverage, voxel spacing/origin/direction and windowing after DICOM publication.
