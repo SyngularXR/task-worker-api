@@ -10,6 +10,7 @@ This is the central reference for every `task-worker-api` consumer in the Syngul
 | [`README.md`](README.md) (this file) | Human-readable index and quick reference | Operators, new contributors |
 | [`conventions.md`](conventions.md) | Fleet-wide conventions: dep pinning style, env var contract, `shared_volume_path` wiring, payload logging | Worker repo authors |
 | [`workflow-standard.md`](workflow-standard.md) | Common workflow diagram format, SDK lifecycle reference and improvement evidence rules | Agents, worker authors and reviewers |
+| [`improvement-scopes.md`](improvement-scopes.md) | Per-worker improvement scopes, visual/Android performance gates, defect checks and upstream review contract | Agents, worker authors and reviewers |
 | [`runbooks/sdk-upgrade.md`](runbooks/sdk-upgrade.md) | Step-by-step playbook for bumping `task-worker-api` across the fleet | Anyone shipping an SDK release |
 | [`runbooks/local-testing.md`](runbooks/local-testing.md) | Pull latest worker images and restart the local compose stack | Dev box / staging operators |
 | [`runbooks/debugging-with-payload-logs.md`](runbooks/debugging-with-payload-logs.md) | Replay captured task envelopes for reproducing bugs | Worker debuggers |
@@ -20,6 +21,8 @@ The companion [`docs/adding-a-worker.md`](../adding-a-worker.md) is the deeper "
 
 All worker diagrams follow the [workflow documentation standard](workflow-standard.md).
 Agents should read it first, then the current guide and its linked implementation.
+Apply the [improvement scopes](improvement-scopes.md) when proposing quality,
+generation-speed, real-time performance, dependency or bug-fix changes.
 The guides distinguish source behavior from deployed images, and identify SDK,
 handler/child and backend publication ownership consistently.
 
@@ -29,6 +32,9 @@ handler/child and backend publication ownership consistently.
 | Neural-Canvas | [Worker task pipelines](https://github.com/SyngularXR/Neural-Canvas/blob/main/docs/guide/worker-pipelines.md) | Segmentation, spatial reconstruction and conditional synthetic dispatch |
 | colmap-splat | [Gaussian build pipelines](https://github.com/SyngularXR/colmap-splat/blob/main/docs/worker-pipelines.md) | Scene/spatial builds, COLMAP/cache paths, training, export and cropping |
 | AssetBundle builder | [Bundle pipeline](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/blob/main/docs/worker-pipeline.md) | Snapshot/Unity build, licensing, validation, publication and measured timings |
+| Backend compute | [Admitted compute workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-compute-worker.md) | Render, GS4D phase preparation/sequence assembly and deploy snapshot preparation |
+| Backend finalizer | [Trusted publication workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-finalizer-worker.md) | Ten CPU finalizer routes, publication ownership, validation and recovery boundaries |
+| Synthetic reconstruction | [Synthetic pipeline](https://github.com/SyngularXR/synthetic-generator/blob/main/docs/worker-pipeline.md) | Input/ROI preparation, NiftyMIC reconstruction, volume output, admitted cleanup and DICOM publication handoff |
 | Visual tracking foundation | [Benchmark workflow](https://github.com/SyngularXR/visual-tracking-worker/blob/main/docs/worker-pipeline.md) | CPU protocol-control replay, independent evaluation and admitted adapter; not enrolled/deployed, no real tracker |
 
 For an improvement, identify the affected stage and output contract, compare the
@@ -36,6 +42,12 @@ same original input with recorded settings/source/image/hardware, and attach
 timing plus final-quality evidence to the PR. Update the worker guide with the
 change. Handler availability, heartbeat, child completion, artifact commit,
 backend publication and resource release are distinct facts.
+
+These guides cover all seven operational roles (`s4-blender`, `s4-gs`,
+`s4-neural`, `s4-assetbundle`, `s4-backend-compute`, `s4-backend-finalizer`,
+`s4-synthetic`) plus the tracking foundation. They are a source index, not an
+enrollment record. Apply each role's [improvement scope](improvement-scopes.md#worker-scopes)
+and verify live deployment separately; the manifest below is a narrower inventory.
 
 ## The fleet at a glance
 
