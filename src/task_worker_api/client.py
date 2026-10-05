@@ -1584,6 +1584,23 @@ class BackendClient:
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
+            # The backend already assigned this task to us before answering,
+            # so report it failed with the real reason instead of leaving it
+            # in progress for the stale sweeper. Without an integer id there
+            # is no task to name.
+            task_id = body.get("id") if isinstance(body, dict) else None
+            if isinstance(task_id, int) and not isinstance(task_id, bool):
+                try:
+                    await self.fail(
+                        task_id,
+                        "worker could not parse the claimed task envelope: "
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    log.exception(
+                        "failed to report unparseable claimed task %s as failed",
+                        task_id,
+                    )
             raise ProtocolError(
                 f"claim_next returned an unexpected envelope: {resp.text[:500]!r}"
             ) from exc

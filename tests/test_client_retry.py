@@ -133,6 +133,42 @@ async def test_request_retries_on_timeout_exception_then_succeeds():
     assert calls["n"] == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_status", [200, 403])
+async def test_claim_next_unparseable_envelope_fails_the_claimed_task(fail_status):
+    """The backend assigns the task before answering, so an envelope that
+    ClaimedTask.from_dict rejects must be reported via PUT /fail with the
+    real reason. A failing fail call is logged, and the same ProtocolError
+    still reaches the caller."""
+    from task_worker_api.errors import ProtocolError
+
+    fails: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            fails.append(request)
+            return httpx.Response(fail_status, json={})
+        return httpx.Response(200, json={
+            "id": 7,
+            "task_type": "detect_cut_planes",
+            "status": 99,
+            "case_id": None,
+            "item_key": "",
+            "params": {},
+        })
+
+    client = _client_with_handler(handler, max_retries=4)
+    with pytest.raises(ProtocolError, match="unexpected envelope"):
+        await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    await client.close()
+
+    assert [r.url.path for r in fails] == ["/api/v1/tasks/7/fail"]
+    error = json.loads(fails[0].content)["error"]
+    assert error.startswith(
+        "worker could not parse the claimed task envelope: ValueError:"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Retry — exhaustion
 # ---------------------------------------------------------------------------
