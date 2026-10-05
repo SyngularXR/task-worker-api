@@ -46,9 +46,14 @@ backend publication and resource release are distinct facts.
 | `colmap-splat-worker` | [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `syngular/colmap-splat-worker` | `gs_build`, `spatial_gs_build` | polling | horizontal |
 | `assetbundle-builder-worker` | [syngar-ml-assetbundle-builder](https://github.com/SyngularXR/syngar-ml-assetbundle-builder) | `syngular/assetbundle-builder-worker` | `deploy_case` | polling | single |
 
-For the canonical, machine-readable version of this table — **including current SDK pin per worker, env var contracts, and links** — see [`workers.json`](workers.json).
+For machine-readable fleet configuration, SDK pins and environment contracts,
+see [`workers.json`](workers.json). Inventory can lag handler changes; use the
+maintained guides and linked registration code to verify current support, and
+check the deployed image separately for a live host.
 
-The deployment lives in [`syngar-deployment-scripts/surgiclaw`](https://github.com/SyngularXR/syngar-deployment-scripts/tree/main/surgiclaw): every worker mounts `${SHARED_DATA_PATH}:/app/shared` cross-platform on Linux Docker and Windows Docker Desktop.
+Deploy Surgiclaw services through [`surgiclaw-deploy`](https://github.com/SyngularXR/surgiclaw-deploy).
+Its [compose bundle](https://github.com/SyngularXR/surgiclaw-deploy/blob/main/bundle/compose/docker-compose.yml)
+defines the worker mounts and service configuration.
 
 ## Reading the manifest from automation
 
@@ -59,6 +64,7 @@ The deployment lives in [`syngar-deployment-scripts/surgiclaw`](https://github.c
 curl -s https://raw.githubusercontent.com/SyngularXR/task-worker-api/main/docs/fleet/workers.json | jq '.workers[].id'
 # → "neural-canvas"
 # → "blender-worker"
+# → "assetbundle-builder-worker"
 # → "colmap-splat-worker"
 
 # Which worker handles a given task type?
