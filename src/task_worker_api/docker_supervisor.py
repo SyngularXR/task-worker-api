@@ -114,13 +114,29 @@ class DockerSupervisor:
             return False
         return self._inspect(container or plan["name"], plan)["State"]["Running"]
 
+    def _record_refusal(self, claim):
+        if claim.state == "running":
+            return
+        plan = dict(id=str(uuid4()), name="synpusher-attempt-" + claim.ownership.attempt_id.hex,
+            ownership=claim.ownership.model_dump(mode="json"), root=str(self.root),
+            host=str(self.host_id), boot=str(self.boot_id), scope=self.execution_scope,
+            cgroup_parent=self.cgroup_parent, network_id=self.network_id,
+            authority=str(self.authority_id), epoch=self.epoch)
+        with closing(sqlite3.connect(self.journal)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            # A refusal cannot replace an existing, possibly live launch.
+            db.execute("INSERT INTO launches VALUES(?,?,'removed',NULL,NULL) ON CONFLICT(attempt) DO NOTHING",
+                       [str(claim.ownership.attempt_id), json.dumps(plan)])
+
     def launch(self, claim, *, image: str, command: list[str], read_only_mounts: dict[str, str], journal_directory: Path | None = None, environment: dict[str, str] | None = None, publication_directory: Path | None = None):
         self._binding(claim)
         if not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or not command:
             raise ValueError("launch requires an inspected image ID and command")
         if claim.state != "reserved":
+            self._record_refusal(claim)
             raise AdmissionError("launch_requires_reserved_attempt")
         if claim.profile.gpu_backend == "dx12":
+            self._record_refusal(claim)
             raise AdmissionError("unsupported_gpu_backend")
         attempt = str(claim.ownership.attempt_id)
         # Numeric host UIDs need not exist in the image's passwd database.
@@ -165,6 +181,7 @@ class DockerSupervisor:
                 raise ValueError("publication mount overlaps a read-only mount")
         remaining = (claim.staging_deadline - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0:
+            self._record_refusal(claim)
             raise AdmissionError("staging_deadline_exceeded")
         plan = dict(id=str(uuid4()), name="synpusher-attempt-" + claim.ownership.attempt_id.hex,
             ownership=claim.ownership.model_dump(mode="json"), image=image, command=command,
@@ -249,7 +266,7 @@ class DockerSupervisor:
         proof = CleanupEvidence(attempt_id=claim.ownership.attempt_id, boot_id=self.boot_id,
             processes_stopped=True, models_evicted=True, scratch_cleaned=True,
             out_of_memory=out_of_memory,
-            evidence_id=hashlib.sha256((plan["id"] + container).encode()).hexdigest())
+            evidence_id=hashlib.sha256((plan["id"] + (container or "")).encode()).hexdigest())
         self._record(claim, "cleaned", container, proof.model_dump_json())
         return proof
 

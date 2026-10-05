@@ -102,6 +102,8 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 flowchart TD
     backend["Backend: reserve admitted task and frozen input/profile"] --> supervisor["Supervisor: journal claim and launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and stage private inputs"]
+    supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
+    refused --> reconcile
     stage --> start["SDK / backend: acknowledge start with host report and input digest"]
     start --> handler["Handler: compute inside attempt storage under lease"]
     handler --> outputs["SDK: validate declared output filenames and sources; upload attempt artifacts"]
@@ -117,6 +119,14 @@ distinct responsibilities. Do not substitute this route for polling, or imply
 an adapter is deployed because `run_admitted` exists. Staging failures before
 start acknowledgement are reconciled by the supervisor, not failed as started
 compute. The SDK entrypoint imports the handler only after start acknowledgement.
+
+Docker refusals for an expired staging deadline, a non-reserved attempt or an
+unsupported GPU backend record a `removed` launch in the private host journal,
+unless the claim is `running`. Existing launch rows are preserved. On the next
+cycle, recovery cleans attempt scratch, signs cleanup evidence and releases the
+reservation through the existing backend protocol. Fencing and configuration
+errors do not create this recovery record. This describes SDK source behavior,
+not deployed host status; the Windows adapter has its own phase machine.
 
 | Shared responsibility | Source |
 |---|---|
