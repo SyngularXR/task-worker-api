@@ -16,13 +16,35 @@ This is the central reference for every `task-worker-api` consumer in the Syngul
 
 The companion [`docs/adding-a-worker.md`](../adding-a-worker.md) is the deeper "build a new worker from scratch" guide; this directory focuses on **fleet-wide concerns** rather than per-worker SDK usage.
 
+## Worker workflow guides
+
+All worker diagrams follow the [workflow documentation standard](workflow-standard.md).
+Agents should read it first, then the current guide and its linked implementation.
+The guides distinguish source behavior from deployed images, and identify SDK,
+handler/child and backend publication ownership consistently.
+
+| Worker | Maintained workflow guide | Implemented scope |
+|---|---|---|
+| Blender | [Model build pipeline](https://github.com/SyngularXR/Blender-CLI/blob/main/docs/model-build-pipeline.md) | Initialization, cinematic baking and cut-plane detection; geometry/UV/bake budgets |
+| Neural-Canvas | [Worker task pipelines](https://github.com/SyngularXR/Neural-Canvas/blob/main/docs/guide/worker-pipelines.md) | Segmentation, spatial reconstruction and conditional synthetic dispatch |
+| colmap-splat | [Gaussian build pipelines](https://github.com/SyngularXR/colmap-splat/blob/main/docs/worker-pipelines.md) | Scene/spatial builds, COLMAP/cache paths, training, export and cropping |
+| AssetBundle builder | [Bundle pipeline](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/blob/main/docs/worker-pipeline.md) | Snapshot/Unity build, licensing, validation, publication and measured timings |
+| Visual tracking foundation | [Benchmark workflow](https://github.com/SyngularXR/visual-tracking-worker/blob/main/docs/worker-pipeline.md) | CPU protocol-control replay, independent evaluation and admitted adapter; not enrolled/deployed, no real tracker |
+
+For an improvement, identify the affected stage and output contract, compare the
+same original input with recorded settings/source/image/hardware, and attach
+timing plus final-quality evidence to the PR. Update the worker guide with the
+change. Handler availability, heartbeat, child completion, artifact commit,
+backend publication and resource release are distinct facts.
+
 ## The fleet at a glance
 
 | Worker | Repo | Image | Task types | Mode | Scaling |
 |---|---|---|---|---|---|
-| `neural-canvas` | [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `syngular/neural-canvas` | `segmentation`, `spatial_recon` | hybrid (FastAPI + worker) | single |
-| `blender-worker` | [Blender-CLI](https://github.com/SyngularXR/Blender-CLI) | `syngular/blender-worker` | `optimize`, `uv_unwrap`, `render`, `pipeline`, `cinematic_baking`, `model_initializing`, `detect_cut_planes` | polling | single |
+| `neural-canvas` | [Neural-Canvas](https://github.com/SyngularXR/Neural-Canvas) | `syngular/neural-canvas` | `segmentation`, conditional `spatial_recon` and `generate_synthetic` (see guide) | hybrid (FastAPI + worker) | single |
+| `blender-worker` | [Blender-CLI](https://github.com/SyngularXR/Blender-CLI) | `syngular/blender-worker` | `cinematic_baking`, `model_initializing`, `detect_cut_planes` | polling | single |
 | `colmap-splat-worker` | [colmap-splat](https://github.com/SyngularXR/colmap-splat) | `syngular/colmap-splat-worker` | `gs_build`, `spatial_gs_build` | polling | horizontal |
+| `assetbundle-builder-worker` | [syngar-ml-assetbundle-builder](https://github.com/SyngularXR/syngar-ml-assetbundle-builder) | `syngular/assetbundle-builder-worker` | `deploy_case` | polling | single |
 
 For the canonical, machine-readable version of this table — **including current SDK pin per worker, env var contracts, and links** — see [`workers.json`](workers.json).
 
@@ -63,6 +85,7 @@ A SynPusher-Vue backend that wants to render a "fleet status" page or drive depl
 | The SDK release version | Each worker's `sdk_pin.version` in `workers.json` (one per row) |
 | The required env var contract | `workers.json` `common_env_vars` (if fleet-wide) or per-worker `env.required` |
 | A new shared convention (e.g., new env var, new directory layout) | [`conventions.md`](conventions.md) |
+| A workflow stage, gate, budget, output or lifecycle boundary | The worker's maintained guide using [`workflow-standard.md`](workflow-standard.md); keep its README/AGENTS links current |
 | The SDK upgrade procedure | [`runbooks/sdk-upgrade.md`](runbooks/sdk-upgrade.md) |
 
 ## Stale-detection
