@@ -27,6 +27,7 @@ output manifests, so they are the file-transfer trust boundary.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import ntpath
@@ -36,6 +37,7 @@ import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from .client import _to_thread_complete
 from .context import ClaimedTask, FileContext
 from .errors import CrossBoxLocalModeError, ProtocolError, TaskCancelled
 
@@ -275,9 +277,14 @@ async def _copyfile_async(
     the worker is actively copying in — and the ``CancelGuard`` poll
     freezes, so a user cancel stays invisible until the copy finishes.
 
-    Opening, reading, writing, closing, and copying metadata all run through
-    :func:`asyncio.to_thread`, so a slow filesystem operation cannot block the
-    event loop. Chunk boundaries let ``cancelled`` abort mid-file instead of
+    Opening, reading, writing, closing, copying metadata and the partial-dest
+    unlink all run through :func:`~task_worker_api.client._to_thread_complete`,
+    so a slow filesystem operation cannot block the event loop, and a cancel —
+    even a repeated one, shutdown on top of a task timeout — waits for the
+    in-flight thread instead of abandoning it. A cancel that lands while
+    ``open(dest, "wb")`` is still running closes and unlinks the handle it
+    returns; one that lands mid-write closes ``dest`` only after the write
+    finished. Chunk boundaries let ``cancelled`` abort mid-file instead of
     only between files.
 
     Metadata and error semantics match ``copy2``: ``copystat`` runs on
@@ -299,18 +306,28 @@ async def _copyfile_async(
     def _samefile() -> bool:
         return dest.exists() and os.path.samefile(src, dest)
 
+    def _close(opened) -> None:
+        opened.close()
+
+    def _discard_dest(opened) -> None:
+        # "wb" already truncated whatever was at dest, so unlinking is right.
+        opened.close()
+        dest.unlink(missing_ok=True)
+
     try:
-        if await asyncio.to_thread(_samefile):
+        if await _to_thread_complete(_samefile):
             raise shutil.SameFileError(
                 f"{src!r} and {dest!r} are the same file"
             )
 
-        fsrc = await asyncio.to_thread(open, src, "rb")
+        fsrc = await _to_thread_complete(open, src, "rb", cancel_cleanup=_close)
         try:
-            fdst = await asyncio.to_thread(open, dest, "wb")
+            fdst = await _to_thread_complete(
+                open, dest, "wb", cancel_cleanup=_discard_dest,
+            )
             dest_touched = True
             while True:
-                chunk = await asyncio.to_thread(fsrc.read, _COPY_CHUNK_BYTES)
+                chunk = await _to_thread_complete(fsrc.read, _COPY_CHUNK_BYTES)
                 if not chunk:
                     break
                 # Apply the state sampled before this read only after a
@@ -319,24 +336,26 @@ async def _copyfile_async(
                 # a cancel detected after its final write.
                 if cancelled_before_read:
                     raise TaskCancelled(cancel_message)
-                await asyncio.to_thread(fdst.write, chunk)
+                await _to_thread_complete(fdst.write, chunk)
                 cancelled_before_read = (
                     cancelled is not None and cancelled.is_set()
                 )
         finally:
             try:
                 if fdst is not None:
-                    await asyncio.to_thread(fdst.close)
+                    await _to_thread_complete(fdst.close)
             finally:
-                await asyncio.to_thread(fsrc.close)
+                await _to_thread_complete(fsrc.close)
 
-        await asyncio.to_thread(shutil.copystat, src, dest)
+        await _to_thread_complete(shutil.copystat, src, dest)
     except BaseException:
         if dest_touched:
             # A partial copy would otherwise be picked up as a complete input
             # by a retried task, or linger in the output staging directory.
             try:
-                await asyncio.to_thread(dest.unlink)
+                await _to_thread_complete(
+                    functools.partial(dest.unlink, missing_ok=True)
+                )
             except OSError:
                 pass
         raise
@@ -752,7 +771,11 @@ async def upload_outputs(
             # splats), and unlinking them synchronously would freeze the
             # heartbeat and the CancelGuard poll while the failure is being
             # reported. ``ignore_errors=True`` keeps this non-raising.
-            await asyncio.to_thread(shutil.rmtree, dest_dir, ignore_errors=True)
+            # ``_to_thread_complete`` so a second cancel (shutdown on top of
+            # a timeout) waits for the delete instead of abandoning it.
+            await _to_thread_complete(
+                functools.partial(shutil.rmtree, dest_dir, ignore_errors=True)
+            )
             raise
         return manifest
 

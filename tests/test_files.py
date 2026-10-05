@@ -1247,6 +1247,175 @@ async def test_local_mode_staging_cleanup_runs_off_the_event_loop(
 
 
 # ---------------------------------------------------------------------------#
+# Local-mode staging survives repeated cancellation.
+#
+# A bare ``to_thread`` is abandoned by a cancel: the open/write/unlink/rmtree
+# keeps running detached while the task unwinds past it, and a second cancel
+# (worker shutdown on top of a task timeout) abandons even the cleanup —
+# stranding partial outputs in shared temp/<task_id>, which the backend never
+# sweeps for a task it did not record as complete.
+# ---------------------------------------------------------------------------#
+
+
+@pytest.mark.asyncio
+async def test_local_mode_staging_cleanup_survives_a_second_cancel(
+    tmp_path, monkeypatch,
+):
+    """Two cancels landing on the staging-dir rmtree must not abandon it."""
+    import asyncio
+    import shutil
+    import threading
+    from task_worker_api import files as files_mod
+
+    entered = threading.Event()
+    release = threading.Event()
+    removed = threading.Event()
+    real_rmtree = shutil.rmtree
+
+    def slow_rmtree(path, **kwargs):
+        entered.set()
+        assert release.wait(2), "test never released the blocked rmtree"
+        real_rmtree(path, **kwargs)
+        removed.set()
+
+    monkeypatch.setattr(files_mod.shutil, "rmtree", slow_rmtree)
+
+    shared = tmp_path / "shared"
+    out_dir = tmp_path / "work" / "out"
+    out_dir.mkdir(parents=True)
+    (out_dir / "a.stl").write_bytes(b"aaa")
+    # "b.stl" missing → the second copy raises, triggering the cleanup.
+
+    task = asyncio.create_task(upload_outputs(
+        _claimed(72, params={"input_path": "/ignored"}),
+        FakeBackendClient(), _file_ctx(out_dir),
+        output_files={"a": "a.stl", "b": "b.stl"},
+        shared_volume_path=str(shared),
+    ))
+    assert await asyncio.to_thread(entered.wait, 2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()  # shutdown on top of the timeout that is already unwinding
+    await asyncio.sleep(0)
+    assert not removed.is_set()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert removed.is_set(), "the second cancel abandoned the staging cleanup"
+    assert not (shared / "temp" / "72").exists()
+
+
+@pytest.mark.asyncio
+async def test_copyfile_async_dest_open_cancel_removes_dest(
+    tmp_path, monkeypatch,
+):
+    """A cancel landing while ``open(dest, "wb")`` runs must close and unlink
+    the handle that open goes on to return."""
+    import asyncio
+    import builtins
+    import threading
+    from task_worker_api import files as files_mod
+
+    src = tmp_path / "source.bin"
+    dest = tmp_path / "dest.bin"
+    src.write_bytes(b"payload")
+
+    entered = threading.Event()
+    release = threading.Event()
+    handles = []
+    real_open = builtins.open
+
+    def slow_dest_open(path, mode):
+        opened = real_open(path, mode)
+        if Path(path) == dest and mode == "wb":
+            handles.append(opened)
+            entered.set()
+            assert release.wait(2), "test never released the blocked open"
+        return opened
+
+    monkeypatch.setattr(builtins, "open", slow_dest_open)
+
+    task = asyncio.create_task(files_mod._copyfile_async(src, dest))
+    assert await asyncio.to_thread(entered.wait, 2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert handles and handles[0].closed, "the dest handle leaked"
+    assert not dest.exists(), "the cancelled open left an empty dest behind"
+
+
+@pytest.mark.asyncio
+async def test_copyfile_async_write_second_cancel_waits_for_write(
+    tmp_path, monkeypatch,
+):
+    """Cancels landing mid-write must let the write finish before ``dest`` is
+    closed and unlinked, rather than racing the still-running thread."""
+    import asyncio
+    import builtins
+    import threading
+    from task_worker_api import files as files_mod
+
+    src = tmp_path / "source.bin"
+    dest = tmp_path / "dest.bin"
+    src.write_bytes(b"payload")
+
+    entered = threading.Event()
+    release = threading.Event()
+    written = threading.Event()
+    closed_mid_write = []
+    real_open = builtins.open
+
+    class SlowWriter:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def write(self, data):
+            entered.set()
+            assert release.wait(2), "test never released the blocked write"
+            result = self._wrapped.write(data)
+            written.set()
+            return result
+
+        def close(self):
+            closed_mid_write.append(not written.is_set())
+            self._wrapped.close()
+
+    def open_slow_dest(path, mode):
+        opened = real_open(path, mode)
+        if Path(path) == dest and mode == "wb":
+            return SlowWriter(opened)
+        return opened
+
+    monkeypatch.setattr(builtins, "open", open_slow_dest)
+
+    task = asyncio.create_task(files_mod._copyfile_async(src, dest))
+    assert await asyncio.to_thread(entered.wait, 2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not closed_mid_write, "dest was closed while the write was running"
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed_mid_write == [False], "dest was closed mid-write"
+    assert not dest.exists(), "the cancelled copy left a partial dest behind"
+
+
+# ---------------------------------------------------------------------------#
 # The staging/publish path's remaining probes run off the event loop.
 #
 # ``prepare_inputs``' in/out mkdir pair and ``input_path`` is_file probe, and

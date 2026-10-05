@@ -2,6 +2,18 @@
 
 ## 0.19.0.dev48
 
+- Keep local-mode file staging from leaving partial files behind under
+  repeated cancellation. `_copyfile_async` ran its open/read/write/close,
+  `copystat` and partial-dest unlink through bare `asyncio.to_thread`, so a
+  cancel during `open(dest, "wb")` left an empty `dest` and a leaked handle, a
+  cancel mid-write closed and unlinked `dest` while the write thread was still
+  running, and a second cancel (shutdown on top of a timeout) abandoned the
+  unlink. `upload_outputs` abandoned its staging-dir `rmtree` the same way,
+  orphaning partial outputs in shared `temp/<task_id>`. Each step now goes
+  through the client's `_to_thread_complete`, which waits out the thread on
+  every cancel. A cancelled `dest` open closes and unlinks the new handle.
+  Nothing changes on the wire.
+
 - Report a lost admitted-attempt lease as a cancel, not a bare
   `CancelledError`. On a reported loss (cancelled or unworkable attempt,
   heartbeat 409, rejected progress) `AttemptLease` also zeroed its deadline,
