@@ -3,6 +3,10 @@
 This guide walks you through building a worker that claims tasks from
 SynPusher and runs them. The goal is a running worker in ~30 minutes.
 
+Document its implemented pipeline using the fleet's
+[workflow documentation standard](fleet/workflow-standard.md), and link that
+guide from the worker README and AGENTS.md.
+
 Use this when you have some interesting piece of work — a new ML model,
 a CAD export, a geometry processor, anything — and you want it to be a
 first-class citizen of the task queue. Your worker claims jobs, reports

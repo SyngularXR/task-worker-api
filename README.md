@@ -4,6 +4,8 @@ Shared contract + worker SDK for the [SynPusher](https://github.com/SyngularXR/S
 
 **Build a new worker in ~30 minutes →** [docs/adding-a-worker.md](docs/adding-a-worker.md)
 
+**Understand or improve worker pipelines →** [workflow documentation standard](docs/fleet/workflow-standard.md)
+
 ## What this is
 
 One Python package consumed by three kinds of callers:
