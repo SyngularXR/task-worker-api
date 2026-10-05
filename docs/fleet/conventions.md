@@ -102,3 +102,12 @@ Three modes:
 The SDK never raises out of payload-logging code paths (including `__init__`). Disk full, fs flap, permission errors, and serialization failures all produce one WARNING log per process lifetime; subsequent failures are silent. **Worker keeps polling and running tasks regardless** — payload logging is a debug aid, not a correctness feature.
 
 If you implement a custom `BackendClient` subclass or override `Worker._run_one`, preserve this property: don't let logging machinery propagate exceptions out to break the polling loop.
+
+## 9. Workflow and pipeline documentation
+
+Every worker maintains a source-grounded guide linked from README and AGENTS.md.
+Follow the [workflow documentation standard](workflow-standard.md) for diagram
+notation, task/SDK/handler ownership, progress counters, output publication,
+cancellation and quality comparisons. Update the guide in the same PR as changes
+to stages, gates, budgets or output contracts. Read the worker's current code and
+installed SDK pin; inventory and historical plans do not prove deployed behavior.

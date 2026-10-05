@@ -9,6 +9,7 @@ This is the central reference for every `task-worker-api` consumer in the Syngul
 | [`workers.json`](workers.json) | Machine-readable manifest of every worker — repo, image, task types, env contract, current SDK pin. **Source of truth** for backends/automation. | Backend code (SynPusher-Vue's Nexus Core), CI tooling, fleet automation |
 | [`README.md`](README.md) (this file) | Human-readable index and quick reference | Operators, new contributors |
 | [`conventions.md`](conventions.md) | Fleet-wide conventions: dep pinning style, env var contract, `shared_volume_path` wiring, payload logging | Worker repo authors |
+| [`workflow-standard.md`](workflow-standard.md) | Common workflow diagram format, SDK lifecycle reference and improvement evidence rules | Agents, worker authors and reviewers |
 | [`runbooks/sdk-upgrade.md`](runbooks/sdk-upgrade.md) | Step-by-step playbook for bumping `task-worker-api` across the fleet | Anyone shipping an SDK release |
 | [`runbooks/local-testing.md`](runbooks/local-testing.md) | Pull latest worker images and restart the local compose stack | Dev box / staging operators |
 | [`runbooks/debugging-with-payload-logs.md`](runbooks/debugging-with-payload-logs.md) | Replay captured task envelopes for reproducing bugs | Worker debuggers |
