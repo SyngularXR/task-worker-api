@@ -141,3 +141,8 @@ the same original input, record effective settings/source/image/hardware, then
 compare stage timing and final output quality. Link that evidence in the PR and
 update the affected diagram or table. Keep worker algorithms in their own repos;
 keep this shared format and SDK lifecycle reference here.
+
+Apply the [worker improvement scopes and acceptance gates](improvement-scopes.md)
+for visual fidelity, real-time Android rendering, generation measurements,
+regression reproduction and Surgiclaw integration. Dependency reviews must
+identify a relevant benefit and compare final outputs before adopting a change.
