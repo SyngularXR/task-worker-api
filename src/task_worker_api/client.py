@@ -1283,6 +1283,10 @@ class BackendClient:
     async def resource_progress(self, claim, progress):
         """One-shot display update; lease renewal runs independently.
 
+        The single request is bounded by ``lifecycle_timeout_s`` (default 15s;
+        ``None`` inherits the injected client's timeout), the same deadline as
+        v1's :meth:`report_progress_once`.
+
         Deliberately *not* on the retried :meth:`_resource_request` path, for
         the same reason as v1's :meth:`report_progress_once`: this runs on the
         handler's critical path (``AttemptLease.update``), and the retry loop
@@ -1301,7 +1305,7 @@ class BackendClient:
         swallowing the error in its generic handler and letting the worker keep
         executing an attempt the backend no longer honours.
         """
-        response = await self._resource_request_once("PUT", f"/tasks/{claim.task_id}/progress", timeout=5,
+        response = await self._resource_request_once("PUT", f"/tasks/{claim.task_id}/progress",
             json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
         return self._resource_state(claim, response)
 

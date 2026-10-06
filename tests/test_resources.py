@@ -496,6 +496,28 @@ async def test_v2_progress_returns_the_attempt_state_it_was_given():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kwargs, expected", [
+    ({"lifecycle_timeout_s": 42}, 42.0),
+    ({"lifecycle_timeout_s": None}, 30.0),  # inherits the injected client's timeout
+    ({}, 15.0),  # the lifecycle_timeout_s default, same as v1 report_progress_once
+], ids=["configured", "none_inherits_client", "default"])
+async def test_v2_progress_timeout_follows_lifecycle_timeout_s(kwargs, expected):
+    claim = _admitted_claim(uuid4())
+    seen: list = []
+
+    def handle(request):
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, json=_running_state(claim))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test",
+                                 timeout=30.0) as client:
+        backend = BackendClient("http://test", "test", client=client, **kwargs)
+        await backend.resource_progress(claim, {"stage": "compute"})
+
+    assert len(seen) == 1 and seen[0]["read"] == expected
+
+
+@pytest.mark.asyncio
 async def test_v2_lifecycle_calls_other_than_progress_still_retry(no_blocking_sleep):
     """The one-shot carve-out is progress only — heartbeat renews the lease from
     a background task, where riding out a blip is worth the wait (bounded, there,
