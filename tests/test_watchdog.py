@@ -581,3 +581,54 @@ def test_sync_fail_retries_transient_http_error(monkeypatch):
     assert excinfo.value.code == 503
     assert calls["n"] == 3
     assert sleeps == [2.0, 2.0]
+
+
+def test_on_deadline_runs_once_before_first_kill():
+    events = []
+    wd = TaskWatchdog(
+        timeout_s=0.05,
+        grace_s=0.05,
+        guard=TerminalGuard(),
+        sync_fail=lambda err: None,
+        on_hard_exit=lambda: events.append("hard_exit"),
+        children_before=set(),
+        list_descendants_fn=lambda pid: set(),
+        kill_fn=lambda procs, sig: events.append(("kill", sig)),
+        tick_s=0.01,
+        worker_pid=1234,
+        on_deadline=lambda: events.append("deadline"),
+    )
+    wd.start()
+    wd._thread.join(timeout=5)
+    assert events.count("deadline") == 1
+    assert events[0] == "deadline"
+    assert events[1] == ("kill", _SIGTERM)
+
+
+def test_raising_on_deadline_still_reaches_kill():
+    kill_calls = []
+
+    def boom():
+        raise RuntimeError("Event loop is closed")
+
+    wd = TaskWatchdog(
+        timeout_s=0.05,
+        grace_s=5.0,
+        guard=TerminalGuard(),
+        sync_fail=lambda err: None,
+        on_hard_exit=lambda: None,
+        children_before=set(),
+        list_descendants_fn=lambda pid: set(),
+        kill_fn=lambda procs, sig: kill_calls.append(sig),
+        tick_s=0.01,
+        worker_pid=1234,
+        on_deadline=boom,
+    )
+    wd.start()
+    deadline = _time.monotonic() + 5
+    while not kill_calls and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+    wd.stop()
+    wd._thread.join(timeout=5)
+    assert wd.fired is True
+    assert kill_calls[0] == _SIGTERM

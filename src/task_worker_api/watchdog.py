@@ -142,6 +142,7 @@ class TaskWatchdog:
         sleep_fn: Callable[[float], None] = time.sleep,
         tick_s: float = 0.5,
         worker_pid: Optional[int] = None,
+        on_deadline: Optional[Callable[[], None]] = None,
     ):
         self.timeout_s = timeout_s
         self.grace_s = grace_s
@@ -155,6 +156,7 @@ class TaskWatchdog:
         self._sleep = sleep_fn
         self._tick = tick_s
         self._pid = worker_pid if worker_pid is not None else os.getpid()
+        self._on_deadline = on_deadline
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.fired = False
@@ -194,6 +196,12 @@ class TaskWatchdog:
             "task watchdog: deadline %.0fs exceeded; terminating task work",
             self.timeout_s,
         )
+        # Ask a cooperative in-process handler to stop; it has no child to kill.
+        if self._on_deadline is not None:
+            try:
+                self._on_deadline()
+            except Exception as e:  # noqa: BLE001
+                log.warning("watchdog on_deadline failed: %s", e)
         # Phase 1 — SIGTERM the task-spawned children.
         self._kill(self._task_spawned(), _SIGTERM)
         if self._wait(self.grace_s):
