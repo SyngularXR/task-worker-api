@@ -2,6 +2,13 @@
 
 ## 0.19.0.dev48
 
+- Bound v2 `resource_progress` by `lifecycle_timeout_s`, like v1
+  `report_progress_once`. It hardcoded `timeout=5`, so a consumer could not
+  raise the deadline for a slow link, `lifecycle_timeout_s=None` did not
+  inherit the injected client's timeout, and the value skipped
+  `_validate_timeout_s`. The default deadline is now 15s instead of 5s; the
+  call stays one-shot (no retry, backoff or `Retry-After` sleep). Nothing
+  changes on the wire.
 - Tell a cooperative v1 handler to stop when its task deadline passes.
   `TaskWatchdog` only signalled task-spawned children, so an in-process
   handler polling `ctx.progress.is_cancelled` ran on until the watchdog
