@@ -2,6 +2,14 @@
 
 ## 0.19.0.dev48
 
+- Tell a cooperative v1 handler to stop when its task deadline passes.
+  `TaskWatchdog` only signalled task-spawned children, so an in-process
+  handler polling `ctx.progress.is_cancelled` ran on until the watchdog
+  called `on_hard_exit` (`os._exit(75)`) and took the whole worker down. The
+  watchdog now takes an optional `on_deadline` callback, run once when the
+  deadline fires and before the kill ladder; the worker uses it to set the
+  same cancel flag a user cancel sets. The task still fails with
+  `timeout: exceeded Ns` and the worker keeps claiming work.
 - Keep local-mode file staging from leaving partial files behind under
   repeated cancellation. `_copyfile_async` ran its open/read/write/close,
   `copystat` and partial-dest unlink through bare `asyncio.to_thread`, so a

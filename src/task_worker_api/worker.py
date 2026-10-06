@@ -1485,6 +1485,7 @@ class Worker:
                 "task %s: %s timeout=%.0fs",
                 task.id, task.task_type.value, timeout_s,
             )
+            loop = asyncio.get_running_loop()
             wd = self._watchdog_factory(
                 timeout_s=timeout_s,
                 grace_s=self.timeout_grace_s,
@@ -1494,6 +1495,11 @@ class Worker:
                 ),
                 on_hard_exit=self._on_hard_exit,
                 children_before=list_descendants(os.getpid()),
+                # Set the same flag a user cancel sets, from the watchdog
+                # thread (asyncio.Event is not thread-safe).
+                on_deadline=lambda: loop.call_soon_threadsafe(
+                    progress._state.cancelled.set,
+                ),
             )
             wd.start()
 

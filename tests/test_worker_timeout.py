@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -198,3 +199,31 @@ async def test_per_type_env_override_resolved(
     await w.run_one()
     assert built["n"] == 0
     assert len(fake_client.completed_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_deadline_cancels_cooperative_handler_without_hard_exit(
+    make_worker, fake_client, tmp_path,
+):
+    # Real TaskWatchdog: an in-process handler has no child to kill, so the
+    # deadline must set the cancel flag it already polls.
+    _queue(fake_client, tmp_path)
+    hard_exits = []
+
+    async def handler(ctx, params):
+        while True:
+            ctx.progress.raise_if_cancelled()
+            await asyncio.sleep(0.02)
+
+    w = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        task_timeout_s=0.2,
+        timeout_grace_s=5.0,
+        on_hard_exit=lambda: hard_exits.append(True),
+    )
+    await asyncio.wait_for(w.run_one(), timeout=10)
+    assert hard_exits == []
+    assert fake_client.completed_tasks == []
+    assert len(fake_client.failed_tasks) == 1
+    assert fake_client.failed_tasks[0]["error"].startswith("timeout: exceeded")
