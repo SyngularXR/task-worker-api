@@ -397,11 +397,12 @@ def test_docker_rejects_dx12_and_vulkan_capability_overrides(tmp_path, monkeypat
     claim.profile.gpu_backend = "dx12"
     with pytest.raises(AdmissionError, match="unsupported_gpu_backend"):
         instance.launch(claim, **options)
+    assert instance._row(claim)[1:3] == ("removed", None)
+    row = instance._row(claim)
     claim.profile.gpu_backend = "vulkan"
     with pytest.raises(ValueError, match="supervisor-owned"):
         instance.launch(claim, **options, environment={"NVIDIA_DRIVER_CAPABILITIES": "all"})
-    with pytest.raises(AdmissionError, match="launch_unknown"):
-        instance._row(claim)
+    assert instance._row(claim) == row
 
 
 def test_operator_model_settings_cannot_override_gpu_or_authority(tmp_path, monkeypatch):
@@ -538,11 +539,119 @@ def test_oom_evidence_survives_ambiguous_removal(tmp_path, monkeypatch):
     assert instance.cleanup(claim) == proof
 
 
-def test_expired_staging_never_creates_launch_intent(tmp_path, monkeypatch):
+def test_expired_staging_records_refused_launch_without_docker(tmp_path, monkeypatch):
     instance, claim = supervisor(tmp_path, monkeypatch)
     claim.staging_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
     monkeypatch.setattr(instance, "_docker", lambda *args, **kwargs: pytest.fail("expired launch reached Docker"))
     with pytest.raises(AdmissionError, match="staging_deadline_exceeded"):
         instance.launch(claim, image="sha256:" + "b" * 64, command=["python", "-V"], read_only_mounts={})
+    assert instance._row(claim)[1:3] == ("removed", None)
+    directory = instance.root / str(claim.ownership.attempt_id)
+    assert not directory.exists()
+    assert not instance.running(claim)
+    # Cleanup must also remove scratch left before this refusal.
+    directory.mkdir()
+    (directory / "scratch").write_text("old attempt")
+    proof = instance.cleanup(claim)
+    assert proof.processes_stopped and proof.models_evicted and proof.scratch_cleaned
+    assert not directory.exists()
+    assert instance.cleanup(claim) == proof
+    assert instance.sign_cleanup(claim, b"k" * 32).observation.evidence == proof
+
+
+@pytest.mark.parametrize("state,backend,error", [
+    ("reserved", "cuda", "staging_deadline_exceeded"),
+    ("reserved", "dx12", "unsupported_gpu_backend"),
+    ("recovering", "cuda", "launch_requires_reserved_attempt"),
+    ("releasing", "cuda", "launch_requires_reserved_attempt"),
+])
+@pytest.mark.asyncio
+async def test_refused_launch_recovers_and_releases_next_cycle(tmp_path, monkeypatch, state, backend, error):
+    from task_worker_api.admission_supervisor import run_cycle
+
+    instance, claim = supervisor(tmp_path, monkeypatch)
+    claim.state, claim.profile.gpu_backend = state, backend
+    claim.staging_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+    monkeypatch.setattr(instance, "_docker", lambda *args, **kwargs: pytest.fail("refused launch reached Docker"))
+    events = []
+
+    class Client:
+        async def resource_claim(self, *args):
+            return claim, 0
+        async def resource_heartbeat(self, *args):
+            return SimpleNamespace(state=state, cancelled=False)
+        async def resource_status(self, *args):
+            return SimpleNamespace(state=state, cancelled=False)
+        async def resource_recover_operations(self, *args):
+            events.append("recover")
+        async def resource_operation(self, journal, operation, *args, **kwargs):
+            events.append(operation)
+            if operation == "release":
+                proof = kwargs["cleanup"].observation.evidence
+                assert proof.attempt_id == claim.ownership.attempt_id and proof.scratch_cleaned
+            return SimpleNamespace(state="released" if operation == "release" else "releasing")
+        async def resource_ready(self, *args):
+            events.append("ready")
+
+    async def report():
+        return None
+
+    journal = SimpleNamespace(path=tmp_path / "worker-journal" / "claim.sqlite",
+        acknowledge_release=lambda attempt: events.append(("acknowledge", attempt)))
+    journal.path.parent.mkdir()
+    options = dict(image="sha256:" + "b" * 64, command=["python", "-V"], read_only_mounts={})
+    client, worker = Client(), claim.ownership.worker_instance_id
+    with pytest.raises(AdmissionError, match=error):
+        await run_cycle(client, journal, worker, ["gs_build"], instance, options, report, b"k" * 32)
+    assert events == []
+    # Replay through a new adapter to exercise the persisted recovery path.
+    recovered = DockerSupervisor(instance.journal, instance.root, authority_id=instance.authority_id,
+        host_id=instance.host_id, boot_id=instance.boot_id, epoch=instance.epoch,
+        execution_scope=instance.execution_scope, cgroup_parent=instance.cgroup_parent, network_id=instance.network_id)
+    monkeypatch.setattr(recovered, "_docker", lambda *args, **kwargs: pytest.fail("refusal recovery reached Docker"))
+    monkeypatch.setattr(recovered, "launch", lambda *args, **kwargs: pytest.fail("recovery retried launch"))
+    assert await run_cycle(client, journal, worker, ["gs_build"], recovered, options, report, b"k" * 32) == 0
+    assert events == ["recover", *(["decline"] if state == "reserved" else []), "release",
+                      ("acknowledge", claim.ownership.attempt_id), "ready"]
+    assert instance._row(claim)[1:3] == ("cleaned", None)
+
+
+@pytest.mark.parametrize("state,backend,error", [
+    ("reserved", "cuda", "staging_deadline_exceeded"),
+    ("reserved", "dx12", "unsupported_gpu_backend"),
+    ("recovering", "cuda", "launch_requires_reserved_attempt"),
+])
+def test_refused_launch_preserves_existing_row(tmp_path, monkeypatch, state, backend, error):
+    import sqlite3
+
+    instance, claim = supervisor(tmp_path, monkeypatch)
+    plan = dict(id="launch", ownership=claim.ownership.model_dump(mode="json"), root=str(instance.root),
+                host=str(instance.host_id), boot=str(instance.boot_id), authority=str(instance.authority_id), epoch=1,
+                scope="test-scope", cgroup_parent="", network_id=instance.network_id)
+    container = "c" * 64
+    with sqlite3.connect(instance.journal) as db:
+        db.execute("INSERT INTO launches VALUES(?,?,'started',?,?)",
+                   [str(claim.ownership.attempt_id), json.dumps(plan), container, "existing evidence"])
+    original = instance._row(claim)
+    claim.state, claim.profile.gpu_backend = state, backend
+    claim.staging_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+    monkeypatch.setattr(instance, "_docker", lambda *args, **kwargs: pytest.fail("refused launch reached Docker"))
+    with pytest.raises(AdmissionError, match=error):
+        instance.launch(claim, image="sha256:" + "b" * 64, command=["python", "-V"], read_only_mounts={})
+    assert instance._row(claim) == original
+
+
+@pytest.mark.parametrize("refusal,error", [("running", AdmissionError), ("fenced", AdmissionError), ("config", ValueError)])
+def test_refused_launch_does_not_record_running_fenced_or_invalid_config(tmp_path, monkeypatch, refusal, error):
+    instance, claim = supervisor(tmp_path, monkeypatch)
+    if refusal == "running":
+        claim.state = "running"
+    elif refusal == "fenced":
+        claim.boot_id = uuid4()
+    options = dict(image="sha256:" + "b" * 64, command=["python", "-V"], read_only_mounts={})
+    if refusal == "config":
+        options["environment"] = {"CUDA_VISIBLE_DEVICES": "all"}
+    with pytest.raises(error):
+        instance.launch(claim, **options)
     with pytest.raises(AdmissionError, match="launch_unknown"):
         instance._row(claim)
