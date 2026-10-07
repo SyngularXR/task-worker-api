@@ -2,6 +2,14 @@
 
 ## 0.19.0.dev48
 
+- Abort a v1 file transfer that is still running when the task deadline
+  passes. `download_file` and `upload_file` race only the `CancelGuard`
+  event, which the deadline did not set, so a stalled or `Retry-After`-parked
+  transfer in `prepare_inputs` or `upload_outputs` ran on until
+  `os._exit(75)`. The deadline now sets the guard event too (and a deadline
+  that passed before the guard was entered pre-sets it), so the transfer
+  aborts through the user-cancel path, the task fails with
+  `timeout: exceeded Ns`, and the worker keeps claiming work.
 - Bound v2 `resource_progress` by `lifecycle_timeout_s`, like v1
   `report_progress_once`. It hardcoded `timeout=5`, so a consumer could not
   raise the deadline for a slow link, `lifecycle_timeout_s=None` did not

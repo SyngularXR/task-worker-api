@@ -4,8 +4,12 @@ import asyncio
 import json
 
 import pytest
+from pydantic import ConfigDict
 
-from task_worker_api import TaskType, Worker
+from task_worker_api import TaskCancelled, TaskType, Worker
+from task_worker_api.schemas import TASK_PARAMS_SCHEMAS
+from task_worker_api.schemas._base import TaskParamsBase
+from task_worker_api.testing import FakeBackendClient
 from task_worker_api.worker import _make_sync_fail
 
 
@@ -227,3 +231,63 @@ async def test_deadline_cancels_cooperative_handler_without_hard_exit(
     assert fake_client.completed_tasks == []
     assert len(fake_client.failed_tasks) == 1
     assert fake_client.failed_tasks[0]["error"].startswith("timeout: exceeded")
+
+
+class _PermissiveParams(TaskParamsBase):
+    model_config = ConfigDict(extra="allow")
+
+
+class _StalledTransferClient(FakeBackendClient):
+    """Transfers park until the guard's ``cancelled`` event is set, like a
+    stalled or Retry-After-parked BackendClient request raced against it."""
+
+    async def _stall(self, task_id, cancelled):
+        assert cancelled is not None
+        await cancelled.wait()
+        raise TaskCancelled(f"task {task_id} cancelled mid-transfer")
+
+    async def download_file(self, task_id, filename, dest, *, cancelled=None):
+        if filename == "stall.ply":
+            await self._stall(task_id, cancelled)
+        await super().download_file(task_id, filename, dest, cancelled=cancelled)
+
+    async def upload_file(self, task_id, filename, src, *, cancelled=None):
+        await self._stall(task_id, cancelled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stall", ["download", "upload"])
+async def test_deadline_aborts_stalled_transfer_without_hard_exit(
+    make_worker, monkeypatch, stall,
+):
+    # Timeout design decision 6: the deadline covers input staging and
+    # output upload, so a parked transfer must abort, not reach os._exit.
+    monkeypatch.setitem(
+        TASK_PARAMS_SCHEMAS, TaskType.DETECT_CUT_PLANES, _PermissiveParams,
+    )
+    client = _StalledTransferClient()
+    name = "stall.ply" if stall == "download" else "in.ply"
+    task = client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_files": {"mesh": name}},
+    )
+    client.queue_file(task.id, "in.ply", b"pretend-PLY")
+    hard_exits = []
+
+    async def handler(ctx, params):
+        (ctx.files.output_dir / "a.stl").write_bytes(b"out")
+        return {"output_files": {"a": "a.stl"}}
+
+    w = make_worker(
+        client=client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+        task_timeout_s=0.2,
+        timeout_grace_s=5.0,
+        on_hard_exit=lambda: hard_exits.append(True),
+    )
+    await asyncio.wait_for(w.run_one(), timeout=10)
+    assert hard_exits == []
+    assert client.completed_tasks == []
+    assert client.uploaded_files == {}
+    assert len(client.failed_tasks) == 1
+    assert client.failed_tasks[0]["error"].startswith("timeout: exceeded")
