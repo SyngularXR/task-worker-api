@@ -2,6 +2,10 @@
 
 ## 0.19.0.dev48
 
+- Log a WARNING for each `WORKER_TASK_TIMEOUTS` key that is neither a task
+  type nor `default`. `resolve_task_timeout` never reads such a key, so a typo
+  like `gsbuild=7200` silently left the task on the 1800s default. The entry
+  is still kept in the parsed dict and nothing raises.
 - Abort a v1 file transfer that is still running when the task deadline
   passes. `download_file` and `upload_file` race only the `CancelGuard`
   event, which the deadline did not set, so a stalled or `Retry-After`-parked
