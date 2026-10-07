@@ -70,3 +70,19 @@ def test_zero_disables():
 
 def test_default_constant():
     assert DEFAULT_TASK_TIMEOUT_S == 1800.0
+
+
+def test_parse_env_warns_on_unknown_key(caplog):
+    # A typo like `gsbuild` is never read by resolve_task_timeout, so the task
+    # silently falls back to the default — make it visible, keep the entry.
+    with caplog.at_level("WARNING"):
+        out = parse_timeouts_env("gsbuild=7200")
+    assert out == {"gsbuild": 7200.0}
+    assert [r for r in caplog.records if "'gsbuild'" in r.message]
+
+
+def test_parse_env_known_keys_do_not_warn(caplog):
+    with caplog.at_level("WARNING"):
+        out = parse_timeouts_env("default=5400,generate_synthetic=7200")
+    assert out == {"default": 5400.0, "generate_synthetic": 7200.0}
+    assert not caplog.records

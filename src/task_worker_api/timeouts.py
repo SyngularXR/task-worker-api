@@ -20,6 +20,8 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TASK_TIMEOUT_S = 1800.0  # 30 minutes
 
+_KNOWN_KEYS = frozenset(t.value for t in TaskType) | {"default"}
+
 
 def parse_timeouts_env(raw: Optional[str]) -> dict[str, float]:
     """Parse ``WORKER_TASK_TIMEOUTS='default=1800,gs_build=7200'`` into a dict.
@@ -29,7 +31,8 @@ def parse_timeouts_env(raw: Optional[str]) -> dict[str, float]:
     env var must not crash worker startup). Non-finite values are rejected
     because they defeat the timeout silently: ``nan`` fails ``_run_one``'s
     ``timeout_s > 0`` check so the watchdog is never started, and ``inf``
-    starts one whose deadline never arrives.
+    starts one whose deadline never arrives. A key that is neither a task type
+    nor ``default`` is kept but logged at WARNING, since nothing ever reads it.
     """
     result: dict[str, float] = {}
     if not raw:
@@ -57,6 +60,11 @@ def parse_timeouts_env(raw: Optional[str]) -> dict[str, float]:
                 "WORKER_TASK_TIMEOUTS: ignoring non-finite value in %r", part
             )
             continue
+        if key not in _KNOWN_KEYS:
+            log.warning(
+                "WORKER_TASK_TIMEOUTS: unknown key %r in %r has no effect "
+                "(not a task type or 'default')", key, part
+            )
         result[key] = value
     return result
 
