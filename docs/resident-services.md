@@ -94,5 +94,5 @@ Sources: [contracts](../src/task_worker_api/service_protocol.py),
 [owned Docker adapter](../src/task_worker_api/docker_supervisor.py),
 [shared budgets](../src/task_worker_api/resources.py),
 [tests](../tests/test_services.py). Update this guide with lifecycle/API changes.
-The foundation starts from accepted SDK commit
-`db4fdcb9158fa3238f24f77e03b35d18f868ac8a`; it is not a published SDK pin.
+This foundation builds on accepted SDK source
+`c38f1a2e60714af39d13ce9af48b987aed041cc1`; it is not a published SDK pin.

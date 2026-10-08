@@ -268,3 +268,22 @@ def test_prelaunch_proof_requires_recorded_fresh_registration(tmp_path,monkeypat
     with pytest.raises(AdmissionError,match='service_not_running'):supervisor.service_address(value)
     assert supervisor.sign_cleanup_service(value,KEY).observation.evidence.processes_stopped
     with pytest.raises(AdmissionError,match='reconciliation'):supervisor.register_service(value)
+
+
+@pytest.mark.parametrize('refusal',['expired','unsupported'])
+def test_refused_service_keeps_registered_prelaunch_proof(tmp_path,monkeypatch,refusal):
+    value=grant()
+    if refusal=='unsupported':
+        value=grant(profile=profile(gpu_count=1,gpu_backend='dx12',gpu_vram_mib=100),gpu_uuid='GPU-'+str(uuid4()))
+    else:
+        value=value.model_copy(update={'lease_expires_at':datetime.now(timezone.utc)-timedelta(seconds=1)})
+    monkeypatch.setattr('task_worker_api.docker_supervisor.physical_boot_id',lambda *_:value.boot_id)
+    supervisor=DockerSupervisor(tmp_path/'private.sqlite',tmp_path/'work',authority_id=value.authority_id,
+        host_id=value.host_id,boot_id=value.boot_id,epoch=value.epoch,execution_scope=value.execution_scope,
+        cgroup_parent='',network_id='d'*64)
+    monkeypatch.setattr(supervisor,'_docker',lambda *_a,**_k:pytest.fail('refused service must not launch'))
+    live=SimpleNamespace(grant=value,require_live=lambda:None)
+    with pytest.raises(AdmissionError):
+        supervisor.launch_service(value,live,image='sha256:'+'a'*64,command=['synthetic-engine'],read_only_mounts={})
+    assert supervisor._row(value)[1]=='registered'
+    assert supervisor.cleanup_service(value).models_evicted
