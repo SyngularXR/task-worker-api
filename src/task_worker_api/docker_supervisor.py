@@ -6,6 +6,7 @@ PID namespace or privileges are granted. Ambiguous launches are reconciled, neve
 restarted. All methods are blocking and belong outside the worker event loop.
 """
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from uuid import uuid4
 from .host_reporter import physical_boot_id
 from .resources import AdmissionError, CleanupEvidence
 from .resource_protocol import CleanupObservation, SignedCleanup, observation_signature
+from .service_protocol import ServiceGrant
 
 
 class DockerSupervisor:
@@ -45,6 +47,8 @@ class DockerSupervisor:
         if (claim.host_id != self.host_id or claim.boot_id != self.boot_id or claim.execution_scope != self.execution_scope
                 or physical_boot_id(self.host_id, Path("/proc")) != self.boot_id):
             raise AdmissionError("attempt_fenced")
+        if isinstance(claim, ServiceGrant) and (claim.authority_id != self.authority_id or claim.epoch != self.epoch):
+            raise AdmissionError("attempt_fenced")
 
     def _row(self, claim):
         with closing(sqlite3.connect(self.journal)) as db:
@@ -59,13 +63,94 @@ class DockerSupervisor:
                 or plan["network_id"] != self.network_id
                 or plan["authority"] != str(self.authority_id) or plan["epoch"] != self.epoch):
             raise AdmissionError("attempt_fenced")
+        if isinstance(claim, ServiceGrant) and plan.get('service') != self._service_binding(claim):
+            raise AdmissionError("attempt_fenced")
         return plan, *row[1:]
+
+    @staticmethod
+    def _service_binding(grant):
+        return {'engine_epoch':str(grant.engine_epoch), 'profile':grant.profile.model_dump(mode='json')}
+
+    def launch_service(self, grant, lease, **kwargs):
+        if not isinstance(grant, ServiceGrant) or lease.grant != grant:
+            raise AdmissionError('service_grant_required')
+        lease.require_live()
+        self.register_service(grant)
+        return self.launch(grant, **kwargs)
+
+    def register_service(self, grant):
+        """Journal fresh ownership before configuration/loading; absence is unknown."""
+        self._binding(grant)
+        if not isinstance(grant, ServiceGrant) or grant.state != 'warming':
+            raise AdmissionError('service_grant_required')
+        with closing(sqlite3.connect(self.journal)) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT phase FROM launches WHERE attempt=?', [str(grant.ownership.attempt_id)]).fetchone()
+            if row:
+                self._row(grant)
+                if row[0] != 'registered':
+                    raise AdmissionError('launch_requires_reconciliation')
+                return
+            if (self.root/str(grant.ownership.attempt_id)).exists():
+                raise AdmissionError('launch_requires_reconciliation')
+            plan = dict(id=str(uuid4()), name='synpusher-attempt-'+grant.ownership.attempt_id.hex,
+                ownership=grant.ownership.model_dump(mode='json'),
+                root=str(self.root), scope=self.execution_scope, cgroup_parent=self.cgroup_parent,
+                network_id=self.network_id, host=str(self.host_id), boot=str(self.boot_id),
+                authority=str(self.authority_id), epoch=self.epoch, service=self._service_binding(grant))
+            db.execute("INSERT INTO launches VALUES(?,?,'registered',NULL,NULL)",
+                       [str(grant.ownership.attempt_id),json.dumps(plan)])
+
+    def running_service(self, grant):
+        return self.running(grant)
+
+    def service_address(self, grant):
+        self._binding(grant)
+        plan, phase, container, _ = self._row(grant)
+        if phase != 'started':
+            raise AdmissionError('service_not_running')
+        data = self._inspect(container, plan)
+        if not data['State']['Running']:
+            raise AdmissionError('service_not_running')
+        networks = data['NetworkSettings']['Networks']
+        if len(networks) != 1:
+            raise AdmissionError('launch_configuration_changed')
+        return str(ipaddress.ip_address(next(iter(networks.values()))['IPAddress']))
+
+    def cleanup_service(self, grant):
+        self._binding(grant)
+        plan, phase, _, _ = self._row(grant)
+        if phase == 'registered':
+            if (self.root/str(grant.ownership.attempt_id)).exists():
+                raise AdmissionError('cleanup_unverified')
+            proof = CleanupEvidence(attempt_id=grant.ownership.attempt_id,boot_id=self.boot_id,
+                processes_stopped=True,models_evicted=True,scratch_cleaned=True,
+                evidence_id=hashlib.sha256((plan['id']+'not_launched').encode()).hexdigest())
+            self._record(grant,'cleaned',None,proof.model_dump_json())
+            return proof
+        return self.cleanup(grant)
+
+    def sign_cleanup_service(self, grant, key):
+        proof = self.cleanup_service(grant)
+        observation = CleanupObservation(host_id=self.host_id,issued_at=datetime.now(timezone.utc),evidence=proof)
+        return SignedCleanup(authority_id=self.authority_id,epoch=self.epoch,observation=observation,
+            signature=observation_signature('cleanup',self.authority_id,self.epoch,observation.model_dump(mode='json'),key))
+
+    def force_stop_service(self, grant):
+        """Kill only the exact owned container; failures retain unknown ownership."""
+        self._binding(grant)
+        plan, phase, container, _ = self._row(grant)
+        if phase not in ('registered', 'removed', 'cleaned'):
+            data = self._inspect(container or plan['name'], plan)
+            if data['State']['Running']:
+                self._docker('kill', '--signal=KILL', data['Id'], timeout=grant.profile.reclaim_timeout_seconds)
+        return self.cleanup_service(grant)
 
     def _record(self, claim, phase, container, evidence=None):
         with closing(sqlite3.connect(self.journal)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT phase FROM launches WHERE attempt=?", [str(claim.ownership.attempt_id)]).fetchone()
-            allowed = {"creating": {"starting", "removing"}, "starting": {"started", "removing"},
+            allowed = {"registered": {"cleaned"}, "creating": {"starting", "removing"}, "starting": {"started", "removing"},
                        "started": {"removing"}, "removing": {"removed"}, "removed": {"cleaned"}, "cleaned": set()}
             if old is None or (phase != old[0] and phase not in allowed[old[0]]):
                 raise AdmissionError("launch_requires_reconciliation")
@@ -110,7 +195,7 @@ class DockerSupervisor:
 
     def running(self, claim):
         plan, phase, container, _ = self._row(claim)
-        if phase in ("removed", "cleaned"):
+        if phase in ("registered", "removed", "cleaned"):
             return False
         return self._inspect(container or plan["name"], plan)["State"]["Running"]
 
@@ -132,11 +217,14 @@ class DockerSupervisor:
         self._binding(claim)
         if not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or not command:
             raise ValueError("launch requires an inspected image ID and command")
-        if claim.state != "reserved":
-            self._record_refusal(claim)
+        service = isinstance(claim, ServiceGrant)
+        if claim.state != ('warming' if service else 'reserved'):
+            if not service:
+                self._record_refusal(claim)
             raise AdmissionError("launch_requires_reserved_attempt")
         if claim.profile.gpu_backend == "dx12":
-            self._record_refusal(claim)
+            if not service:
+                self._record_refusal(claim)
             raise AdmissionError("unsupported_gpu_backend")
         attempt = str(claim.ownership.attempt_id)
         # Numeric host UIDs need not exist in the image's passwd database.
@@ -157,7 +245,7 @@ class DockerSupervisor:
         directory = self.root / attempt
         if publication_directory is not None:
             publication_directory = publication_directory.resolve(strict=True)
-            if (claim.gpu_uuid is not None or claim.profile.gpu_count != 0
+            if (service or claim.gpu_uuid is not None or claim.profile.gpu_count != 0
                     or claim.task.task_type not in ("finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep")
                     or command != ["python", "-m", "src.services.resource_finalizer_worker", "/run/worker-config.json"]):
                 raise ValueError("publication mount requires the backend CPU finalizer")
@@ -179,9 +267,11 @@ class DockerSupervisor:
                 raise ValueError("unsafe worker mount")
             if publication_directory is not None and (target == "/app" or target == "/app/shared" or target.startswith("/app/shared/")):
                 raise ValueError("publication mount overlaps a read-only mount")
-        remaining = (claim.staging_deadline - datetime.now(timezone.utc)).total_seconds()
+        deadline = min(claim.lease_expires_at, claim.residence_deadline) if service else claim.staging_deadline
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0:
-            self._record_refusal(claim)
+            if not service:
+                self._record_refusal(claim)
             raise AdmissionError("staging_deadline_exceeded")
         plan = dict(id=str(uuid4()), name="synpusher-attempt-" + claim.ownership.attempt_id.hex,
             ownership=claim.ownership.model_dump(mode="json"), image=image, command=command,
@@ -190,11 +280,18 @@ class DockerSupervisor:
             mounts=read_only_mounts, environment=environment, publication=str(publication_directory) if publication_directory else None,
             root=str(self.root), scope=self.execution_scope, cgroup_parent=self.cgroup_parent, network_id=self.network_id,
             host=str(self.host_id), boot=str(self.boot_id), authority=str(self.authority_id), epoch=self.epoch)
+        if service:
+            plan['service'] = self._service_binding(claim)
         with closing(sqlite3.connect(self.journal)) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT 1 FROM launches WHERE attempt=?", [attempt]).fetchone():
-                raise AdmissionError("launch_requires_reconciliation")
-            db.execute("INSERT INTO launches VALUES(?,?,'creating',NULL,NULL)", [attempt, json.dumps(plan)])
+            old = db.execute("SELECT phase FROM launches WHERE attempt=?", [attempt]).fetchone()
+            if old:
+                if not service or old[0] != 'registered':
+                    raise AdmissionError("launch_requires_reconciliation")
+                self._row(claim)
+                db.execute("UPDATE launches SET plan=?,phase='creating' WHERE attempt=?", [json.dumps(plan),attempt])
+            else:
+                db.execute("INSERT INTO launches VALUES(?,?,'creating',NULL,NULL)", [attempt, json.dumps(plan)])
         directory.mkdir(exist_ok=False)
         args = ["create", "--network", plan["network_id"], "--name", plan["name"], "--label", "synpusher.launch=" + plan["id"],
                 # Match host-owned scratch and journal permissions without capabilities.

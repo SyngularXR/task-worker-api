@@ -1124,6 +1124,54 @@ class BackendClient:
 
     # ----- task lifecycle --------------------------------------------
 
+    async def service_claim(self, body, grant_key: bytes):
+        """Caller durably records request_id before calling; never invent a task."""
+        from .service_protocol import ServiceClaimBody, SignedServiceGrant, verify_service_grant
+        body = ServiceClaimBody.model_validate(body)
+        response = await self._resource_request("POST", "/services/claim", json=body.model_dump(mode="json"))
+        if response.status_code == 204:
+            return None
+        signed = SignedServiceGrant.model_validate(response.json())
+        grant = verify_service_grant(signed, grant_key)
+        report = body.host_report
+        if (grant.ownership.worker_instance_id != body.worker_instance_id
+                or grant.profile.service_id != body.service_id or grant.state != "warming"
+                or (grant.authority_id, grant.epoch, grant.host_id, grant.boot_id)
+                != (report.authority_id, report.epoch, report.report.host_id, report.report.boot_id)):
+            raise ProtocolError("service grant differs from requested enrollment")
+        return signed
+
+    async def _service_operation(self, grant, kind, body):
+        from .service_protocol import ServiceState, validate_service_state
+        response = await self._resource_request("POST", f"/services/{grant.ownership.attempt_id}/{kind}",
+                                                json=body.model_dump(mode="json"))
+        return validate_service_state(grant, ServiceState.model_validate(response.json()))
+
+    async def service_ready(self, grant, operation_id, host_report):
+        from .service_protocol import ServiceReadyBody
+        return await self._service_operation(grant, "ready", ServiceReadyBody(protocol_version=2,
+            operation_id=operation_id, ownership=grant.ownership, host_report=host_report))
+
+    async def service_renew(self, grant, operation_id, host_report):
+        from .service_protocol import ServiceRenewBody
+        return await self._service_operation(grant, "renew", ServiceRenewBody(protocol_version=2,
+            operation_id=operation_id, ownership=grant.ownership, host_report=host_report))
+
+    async def service_status(self, grant):
+        from .resource_protocol import OwnedBody
+        return await self._service_operation(grant, "status", OwnedBody(protocol_version=2,
+                                                                       ownership=grant.ownership))
+
+    async def service_release(self, grant, operation_id, host_report, cleanup):
+        from .service_protocol import ServiceReleaseBody
+        if (cleanup.authority_id != grant.authority_id or cleanup.epoch != grant.epoch
+                or cleanup.observation.host_id != grant.host_id
+                or cleanup.observation.evidence.boot_id != grant.boot_id
+                or cleanup.observation.evidence.attempt_id != grant.ownership.attempt_id):
+            raise ProtocolError("service cleanup belongs to another ownership epoch")
+        return await self._service_operation(grant, "release", ServiceReleaseBody(protocol_version=2,
+            operation_id=operation_id, ownership=grant.ownership, host_report=host_report, cleanup=cleanup))
+
     async def resource_claim(self, journal, worker_instance_id, task_types, host_report):
         """V2 claim transport; returns (claim or None, minimum next-poll delay).
 
