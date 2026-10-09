@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from task_worker_api.context import FileContext, TaskContext
@@ -53,6 +54,63 @@ async def test_handler_receives_granted_profile_without_changing_payload(monkeyp
     assert client.resource_operation.call_args.args[1] == "complete"
     assert claim.model_dump_json() == original
     assert input_snapshot_digest(claim.task) == claim.input_digest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code, retried", [
+    ("hardware_report_replayed", True),
+    ("hardware_report_stale", True),
+    # Not caused by the start's host report: a fresh one cannot fix it.
+    ("cleanup_evidence_stale", False),
+    ("attempt_fenced", False),
+])
+async def test_start_rejected_for_its_host_report_retries_with_a_fresh_one(monkeypatch, tmp_path, code, retried):
+    task = AdmittedTask(id=1, task_type="model_initializing", case_id=None, item_key="mesh",
+                        params=dict(job_id="job", input_path="mesh.stl", base_name="mesh"), inputs={})
+    claim = _admitted_claim(uuid4()).model_copy(update={
+        "task": task, "profile": cpu_profile(profile_id="p", task_type=task.task_type),
+        "input_digest": input_snapshot_digest(task), "state": "reserved"})
+    journal = SimpleNamespace(pending=lambda: ("claim", {"claim": claim.model_dump(mode="json")}))
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+    response = httpx.Response(409, json={"code": code}, request=httpx.Request("POST", "http://test/start"))
+    reports = []
+
+    class Lease:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def start(self, report, digest):
+            reports.append(report)
+            if len(reports) == 1:
+                raise httpx.HTTPStatusError("rejected", request=response.request, response=response)
+        async def run(self, handler, ctx, params): return await handler(ctx, params)
+        def raise_if_cancelled(self): pass
+        is_cancelled = False
+        lost = asyncio.Event()
+
+    async def handler(ctx, params):
+        return {}
+
+    client = FakeBackendClient()
+    client.resource_operation = AsyncMock()
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", Lease)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", AsyncMock(return_value=files))
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    monkeypatch.setattr("task_worker_api.worker._START_REPORT_RETRY_DELAY_S", 0)
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=client,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+    read_report = AsyncMock(side_effect=["old", "fresh"])
+    if not retried:
+        with pytest.raises(httpx.HTTPStatusError):
+            await worker.run_admitted_attempt(claim, journal, read_report)
+        assert reports == ["old"]
+        client.resource_operation.assert_not_called()
+        return
+    await worker.run_admitted_attempt(claim, journal, read_report)
+    assert reports == ["old", "fresh"]
+    assert read_report.await_count == 2
+    assert client.resource_operation.call_args.args[1] == "complete"
 
 
 @pytest.mark.asyncio
