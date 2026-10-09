@@ -14,6 +14,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -120,10 +121,11 @@ class DockerSupervisor:
         """Withdraw only an exactly attributed inference container; never release accounting."""
         if owner.role != "inference":
             raise AdmissionError("service_grant_required")
+        deadline = time.monotonic()+timeout
         proof = self.verified_gpu_launch(owner, proc_root=proc_root, profile_digest=profile_digest,inspection_timeout=timeout)
         if proof is None:
             return False
-        self._docker("kill", "--signal=KILL", proof["container_id"], timeout=timeout)
+        self._docker("kill", "--signal=KILL", proof["container_id"], timeout=max(0,deadline-time.monotonic()))
         return True
 
     @staticmethod

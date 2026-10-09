@@ -670,3 +670,38 @@ def test_local_inspection_and_clear_reject_nonidle_or_foreign_physical_view(jour
     with pytest.raises(ProtocolError):journal.inspection(owners,KEY,physical,primary_owner=False)
     with pytest.raises(ProtocolError):journal.apply_clear(receipt,GRANT_KEY,KEY,owners,physical,primary_owner=False)
     assert len(journal.pending())==1
+
+
+@pytest.mark.asyncio
+async def test_established_observer_task_exit_records_hold_while_primary_reports_continue(journal,tmp_path,monkeypatch):
+    import httpx
+    from task_worker_api import host_reporter
+    from task_worker_api.resources import HostSnapshot
+    b=journal.binding;observed(journal)
+    (tmp_path/'reporter.key').write_bytes(KEY)
+    config=dict(authority_id=str(b.authority_id),host_id=str(b.host_id),boot_id=str(b.boot_id),epoch=b.epoch,
+        signing_key_file=str(tmp_path/'reporter.key'),state_file=str(tmp_path/'primary.sqlite'),
+        report_file=str(tmp_path/'primary.json'),backend_url='http://fixture/api/v1',borrowing={})
+    observer=BorrowingObserver.__new__(BorrowingObserver)
+    observer.binding=b;observer.policy=policy();observer.key=KEY;observer.journal=journal
+    observer.latest_owners=journal.owner_view();observer.supervisors={}
+    async def failed(*args):raise RuntimeError('synthetic observer task stopped')
+    observer.run=failed
+    monkeypatch.setattr('task_worker_api.borrowing_observer.BorrowingObserver',lambda config:observer)
+    def snapshot(config,sequence):
+        return HostSnapshot(host_id=b.host_id,boot_id=b.boot_id,sequence=sequence,captured_at=datetime.now(timezone.utc),
+            host_ram={'allocatable':100,'available':100},cpu_millicores=100,execution_scopes={},scratch_pools={},gpus={})
+    monkeypatch.setattr(host_reporter,'_snapshot',snapshot)
+    sent=[];real_client=httpx.AsyncClient;real_sleep=asyncio.sleep
+    def reply(request):
+        body=json.loads(request.content);sequence=body['report']['sequence'];sent.append(sequence)
+        return httpx.Response(200,json={'sequence':sequence,'borrowing_owners':[view(b,sequence).model_dump(mode='json')]})
+    async def tick(seconds):
+        if len(sent)>=4:raise asyncio.CancelledError
+        await real_sleep(.002)
+    monkeypatch.setattr(host_reporter.asyncio,'sleep',tick)
+    monkeypatch.setattr(host_reporter.httpx,'AsyncClient',lambda **kw:real_client(transport=httpx.MockTransport(reply),**kw))
+    with pytest.raises(asyncio.CancelledError):await host_reporter.run(config)
+    assert sent==[1,2,3,4]
+    assert len(journal.pending())==1
+    assert not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))

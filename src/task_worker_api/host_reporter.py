@@ -131,6 +131,20 @@ async def run(config):
     async with httpx.AsyncClient(timeout=5) as client:
         next_post = 0.0
         publication = asyncio.Lock()
+        withdrawal = None
+
+        async def borrowing_lost():
+            nonlocal withdrawal
+            try:
+                await asyncio.to_thread(observer.delivery_lost,stop=False)
+            finally:
+                if withdrawal is None or withdrawal.done():
+                    if withdrawal is not None:
+                        with suppress(asyncio.CancelledError):
+                            error = withdrawal.exception()
+                            if error is not None:
+                                log.error("Borrowed owned stop failed; inference remains held")
+                    withdrawal = asyncio.create_task(asyncio.to_thread(observer.stop_borrowed))
 
         async def post_report():
             # A race refresh uses the same hardware sequence/POST ordering as the ordinary tick.
@@ -148,7 +162,7 @@ async def run(config):
                         raise ValueError("borrowing owner ACK exceeded qualified bound")
                     return await asyncio.to_thread(observer.accept_report_ack,response.json(),report.report.sequence)
                 except Exception:
-                    await asyncio.to_thread(observer.delivery_lost)
+                    await borrowing_lost()
                     log.error("Borrowing owner ACK failed; inference remains held")
                     return None
 
@@ -166,7 +180,7 @@ async def run(config):
                 except Exception as exc:
                     if observer is not None:
                         try:
-                            await asyncio.to_thread(observer.delivery_lost)
+                            await borrowing_lost()
                         except Exception:
                             log.error("Borrowing observation persistence failed; inference remains held")
                     if isinstance(exc,httpx.HTTPStatusError):
@@ -177,6 +191,10 @@ async def run(config):
                 if task is not None and task.done():
                     with suppress(asyncio.CancelledError):
                         task.exception()
+                    try:
+                        await borrowing_lost()
+                    except Exception:
+                        log.error("Borrowing observation persistence failed; inference remains held")
                     log.error("Borrowing observer stopped; inference remains held")
                     task = None
                 await asyncio.sleep(5)
@@ -185,6 +203,11 @@ async def run(config):
                 task.cancel()
                 with suppress(asyncio.CancelledError,Exception):
                     await task
+            if withdrawal is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(withdrawal),timeout=observer.policy.reclaim_timeout_seconds)
+                except Exception:
+                    log.error("Borrowed shutdown cleanup unproved; inference remains held")
 
 
 if __name__ == "__main__":

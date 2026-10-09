@@ -174,11 +174,12 @@ class BorrowingObserver:
                 supervisor.stop_verified_gpu_inference(owner,profile_digest=self.binding.profile_digest,
                     timeout=self.policy.reclaim_timeout_seconds)
 
-    def hold(self,sequence,reason,digest):
+    def hold(self,sequence,reason,digest,*,stop=True):
         try:
             self.journal.fault(sequence,reason,digest)
         finally:
-            self.stop_borrowed()  # Failed persistence must still withdraw exact owned inference.
+            if stop:
+                self.stop_borrowed()  # Failed persistence must still withdraw exact owned inference.
 
     def accept_report_ack(self, body, sequence):
         rows = body.get("borrowing_owners") if isinstance(body,dict) else None
@@ -189,12 +190,12 @@ class BorrowingObserver:
             raise ProtocolError("prepared borrowing owner ACK does not match report")
         return self.accept_owners(matching[0].model_dump(mode="json"))
 
-    def delivery_lost(self):
+    def delivery_lost(self,*,stop=True):
         if self.journal.has_observation():
             signed = self.latest_owners or self.journal.owner_view()
             if signed is not None:
                 self.hold(signed.observation.report_sequence,"ownership_unverified",
-                    policy_digest({"condition":"authority_delivery_lost"}))
+                    policy_digest({"condition":"authority_delivery_lost"}),stop=stop)
 
     async def observe_once(self, refresh):
         signed = self.latest_owners or self.journal.owner_view()
