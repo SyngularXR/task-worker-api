@@ -195,8 +195,16 @@ class AttemptLease:
         # async with cleanup finishes before TaskCancelled reaches
         # run_admitted_attempt as the terminal reason. A handler that finished
         # first still wins the tie and still faces _require_running.
-        result = await _await_unless_cancelled(
-            handler(*args), self._lost, "attempt lease no longer permits work")
+        try:
+            result = await _await_unless_cancelled(
+                handler(*args), self._lost, "attempt lease no longer permits work")
+        except httpx.HTTPStatusError as exc:
+            # A handler that lets update's fenced 409 escape finishes before
+            # _lost (set one loop pass later) can win the race; _expired is
+            # already set, so report the loss rather than a stray HTTP error.
+            if exc.response.status_code == 409 and self._expired.is_set():
+                raise TaskCancelled("attempt lease no longer permits work") from exc
+            raise
         self._require_running()
         return result
 

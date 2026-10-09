@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -228,13 +229,15 @@ async def test_non_409_renewal_error_is_not_lease_loss():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [409, 503])
-async def test_progress_409_is_lease_loss_and_other_statuses_are_not(status):
+@pytest.mark.parametrize("status", [409, 500, 503, "transport"])
+async def test_progress_409_is_lease_loss_and_other_statuses_are_not(status, caplog):
     """A progress 409 is the backend's attempt_fenced: update raises and the
-    lease is lost, as on a heartbeat 409. Any other status only logs."""
+    lease is lost, as on a heartbeat 409. Any other failure only logs."""
     client = Client()
 
     async def progress(claim, payload):
+        if status == "transport":
+            raise httpx.ConnectError("unreachable")
         raise _status_error(status)
 
     client.resource_progress = progress
@@ -248,6 +251,43 @@ async def test_progress_409_is_lease_loss_and_other_statuses_are_not(status):
         await asyncio.sleep(0)
         assert lease.lost.is_set() is (status == 409)
         assert lease.is_cancelled is (status == 409)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == (0 if status == 409 else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", ["escapes", "catches"])
+async def test_fenced_progress_stops_the_handler_as_task_cancelled(handler):
+    """A progress 409 inside the handler ends run with TaskCancelled, whether
+    the handler lets update's error escape or catches it and waits on: its
+    cleanup finishes and no work runs past the fenced update."""
+    client = Client()
+    cleaned, worked_on = asyncio.Event(), asyncio.Event()
+
+    async def progress(claim, payload):
+        raise _status_error(409)
+
+    client.resource_progress = progress
+
+    async def compute():
+        try:
+            if handler == "escapes":
+                await lease.update("compute")
+            else:
+                with contextlib.suppress(httpx.HTTPStatusError):
+                    await lease.update("compute")
+                await asyncio.Event().wait()  # carries on as if nothing happened
+            worked_on.set()
+        finally:
+            await asyncio.sleep(0)  # asynchronous cleanup still completes
+            cleaned.set()
+
+    lease = AttemptLease(client, None, client.claim, grace_s=0.1, on_hard_exit=lambda: None)
+    async with lease:
+        await lease.start(None, "staged-inputs")
+        with pytest.raises(TaskCancelled):
+            await asyncio.wait_for(lease.run(compute), 2)
+        assert lease.lost.is_set() and cleaned.is_set() and not worked_on.is_set()
 
 
 @pytest.mark.asyncio
