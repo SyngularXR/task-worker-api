@@ -3203,6 +3203,34 @@ async def test_fail_retries_on_500_then_succeeds():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content, expected", [
+    (b'{"id": 7, "status": 4}', {"id": 7, "status": 4}),
+    (b"", {}),
+    (b"not JSON", {}),
+    (b"[]", {}),
+    (b"null", {}),
+    (b"4", {}),
+])
+async def test_complete_returns_response_object_or_empty_dict(content, expected):
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.method == "PUT"
+        assert request.url.path == "/api/v1/tasks/7/complete"
+        assert json.loads(request.content) == {"result": {"output": "done"}}
+        return httpx.Response(200, content=content)
+
+    client = _client_with_handler(handler)
+    try:
+        assert await client.complete(7, {"output": "done"}) == expected
+    finally:
+        await client.close()
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_complete_retries_on_500_then_succeeds():
     """A 500 on PUT /tasks/{id}/complete is retried, same as fail()."""
     calls = {"n": 0}

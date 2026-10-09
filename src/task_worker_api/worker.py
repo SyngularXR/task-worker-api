@@ -40,7 +40,7 @@ import httpx
 from .cancel import CancelGuard
 from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD, _REJECTED_REPORT_CODES, _rejection_code
 from .context import ClaimedTask, TaskContext
-from .enums import TaskType
+from .enums import TaskStatus, TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
 from .files import prepare_inputs, upload_outputs
 from .payload_log import PayloadLogger, sanitize_worker_id
@@ -1817,11 +1817,20 @@ class Worker:
                                 task.id, task.task_type.value,
                             )
                         elif outcome[0] == "complete":
-                            await target.client.complete(task.id, outcome[1])
-                            log.info(
-                                "task %s completed (%s)",
-                                task.id, task.task_type.value,
-                            )
+                            body = await target.client.complete(task.id, outcome[1])
+                            if isinstance(body, dict) and body.get("status") in (
+                                TaskStatus.FAILED, TaskStatus.CANCELLED,
+                            ):
+                                log.warning(
+                                    "task %s: backend kept status %s; "
+                                    "did not record the result",
+                                    task.id, TaskStatus(body["status"]).name,
+                                )
+                            else:
+                                log.info(
+                                    "task %s completed (%s)",
+                                    task.id, task.task_type.value,
+                                )
                         else:
                             await bounded(target.client.fail(task.id, outcome[1]))
                             if outcome[1] == "cancelled by user":

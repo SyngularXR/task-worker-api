@@ -1825,8 +1825,10 @@ class BackendClient:
         resp.raise_for_status()
         return resp.json() or {}
 
-    async def complete(self, task_id: int, result: dict) -> None:
+    async def complete(self, task_id: int, result: dict) -> dict:
         """PUT /tasks/{id}/complete — final success payload.
+
+        Return the backend task envelope, or {} for a non-object/absent body.
 
         Uses the dedicated ``lifecycle_timeout_s`` deadline (default 15s) so
         a stalled complete call fails fast instead of blocking the polling
@@ -1838,13 +1840,18 @@ class BackendClient:
         budget is raised to at least ``_TERMINAL_MIN_ATTEMPTS`` so the retry
         window (~60s jittered) rides out a backend restart.
         """
-        await self._request(
+        resp = await self._request(
             "PUT", f"/tasks/{task_id}/complete", json={"result": result},
             params=self._worker_params,
             timeout=self._lifecycle_timeout,
             extra_transient=_TERMINAL_EXTRA_TRANSIENT,
             attempts=max(self.max_retries, _TERMINAL_MIN_ATTEMPTS),
         )
+        try:
+            body = resp.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
 
     async def fail(self, task_id: int, error: str) -> None:
         """PUT /tasks/{id}/fail — final failure payload.
