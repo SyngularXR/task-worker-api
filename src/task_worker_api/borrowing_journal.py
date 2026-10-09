@@ -134,10 +134,14 @@ class BorrowingJournal:
             return db.execute("SELECT established FROM state WHERE id=1").fetchone()[0] == 1
 
     def _fault(self,db,sequence,reason,evidence_digest,observed_at):
-        for row in self._pending(db):
-            old=BorrowingIncident.model_validate_json(row[1])
-            if old.reason==reason and old.evidence_digest==evidence_digest:
-                return old
+        physical = db.execute("SELECT inspection FROM state WHERE id=1").fetchone()[0]
+        # A fault invalidates current physical progress, never retained incident history.
+        db.execute("UPDATE state SET inspection=NULL,inspected_at=NULL WHERE id=1")
+        if physical is None:
+            for row in reversed(self._pending(db)):
+                old=BorrowingIncident.model_validate_json(row[1])
+                if old.reason==reason and old.evidence_digest==evidence_digest:
+                    return old
         generation=db.execute("SELECT generation FROM state WHERE id=1").fetchone()[0]+1
         incident=BorrowingIncident(binding=self.binding,incident_id=uuid4(),hold_generation=generation,
             observed_sequence=sequence,observed_at=observed_at,reason=reason,evidence_digest=evidence_digest)
@@ -154,18 +158,29 @@ class BorrowingJournal:
         view = verify_borrowing(signed,key,self.binding)
         if not fresh_observation(now,view.server_time) or not fresh_observation(now,view.report_captured_at):
             raise ProtocolError("authority owner ACK is stale")
-        with self._write() as db:
+        with self._write(check_binding=False) as db:
+            retained = BorrowingBinding.model_validate_json(db.execute("SELECT payload FROM binding WHERE id=1").fetchone()[0])
+            if retained.authority_id != self.binding.authority_id:
+                raise ProtocolError("authority owner ACK differs from retained authority")
             old = db.execute("SELECT received_owners FROM state WHERE id=1").fetchone()[0]
             if old:
                 previous = SignedBorrowingOwners.model_validate_json(old).observation
-                if view.report_sequence < previous.report_sequence or view.server_time < previous.server_time:
+                same_binding = previous.binding == view.binding
+                if ((same_binding and (view.report_sequence < previous.report_sequence or view.server_time < previous.server_time))
+                        or (not same_binding and view.server_time <= previous.server_time)):
                     raise ProtocolError("authority owner ACK was replayed")
             db.execute("UPDATE state SET received_owners=? WHERE id=1",[signed.model_dump_json()])
 
     def owner_view(self):
-        with self._mutex, closing(self._connect()) as db:
+        with self._mutex, closing(self._connect(check_binding=False)) as db:
+            retained = BorrowingBinding.model_validate_json(db.execute("SELECT payload FROM binding WHERE id=1").fetchone()[0])
+            if retained.authority_id != self.binding.authority_id:
+                raise ProtocolError("authority owner ACK differs from retained authority")
             row=db.execute("SELECT received_owners FROM state WHERE id=1").fetchone()[0]
-        return SignedBorrowingOwners.model_validate_json(row) if row else None
+        signed = SignedBorrowingOwners.model_validate_json(row) if row else None
+        if signed and signed.observation.binding != self.binding:
+            raise ProtocolError("authority owner ACK differs from current binding")
+        return signed
 
     def observe(self, signed: SignedBorrowingOwners, key, inspection: dict, *, primary_owner: bool, now=None):
         now = now or datetime.now(timezone.utc)
@@ -234,15 +249,18 @@ class BorrowingJournal:
                 or not view.complete or not fresh_observation(now, view.server_time)
                 or not fresh_observation(now, view.report_captured_at)):
             raise ProtocolError("requalification requires fresh complete idle ownership")
-        with self._mutex, closing(self._connect(check_binding=False)) as db:
-            db.execute("BEGIN")
+        with self._write(check_binding=False) as db:
             generation = db.execute("SELECT generation FROM state WHERE id=1").fetchone()[0]
             previous = BorrowingBinding.model_validate_json(db.execute("SELECT payload FROM binding WHERE id=1").fetchone()[0])
             pending = {row[0]: row[2] for row in self._pending(db)}
-        return sign_borrowing(BorrowingInspection(binding=self.binding,
-            previous_binding_digest=policy_digest(previous.model_dump(mode="json")),
-            hold_generation=generation, incidents=pending, owners=owners, inspected_at=now,
-            inspection_digest=policy_digest(physical), idle=True), reporter_key)
+            inspected = sign_borrowing(BorrowingInspection(binding=self.binding,
+                previous_binding_digest=policy_digest(previous.model_dump(mode="json")),
+                hold_generation=generation, incidents=pending, owners=owners, inspected_at=now,
+                inspection_digest=policy_digest(physical), idle=True), reporter_key)
+            # Passive restoration boundary; pending holds and owner/proof/run pins stay intact.
+            db.execute("UPDATE state SET inspection=?,inspected_at=? WHERE id=1",
+                [json.dumps(physical,sort_keys=True,separators=(",", ":")),now.isoformat()])
+        return inspected
 
     def apply_clear(self, signed: SignedBorrowingClear, key, reporter_key,
                     owners: SignedBorrowingOwners, physical: dict, *, primary_owner, now=None):

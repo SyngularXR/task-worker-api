@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.19.0.dev51
+
+- Retain a new incident generation when the same ownership fault recurs after
+  verified physical restoration or trusted idle inspection. Repeated failures
+  within one unresolved episode still coalesce to the latest immutable incident.
+- Strict nonempty idle inspection atomically records only a passive restoration
+  boundary. It does not clear holds, rebind ownership or establish admission; an
+  older lost clear receipt cannot erase a later same-class incident. Wire/SQL
+  schemas and primary hardware reporting remain unchanged. No host is activated.
+- Retain a fresh authenticated owner frame for trusted reenrollment of the same
+  authority/host/GPU while the old binding and incident hold remain intact. Sequence
+  comparisons remain binding-specific; authoritative server time cannot roll back.
+  Only strict full-set requalification can rebind the retained journal.
+
 ## 0.19.0.dev50
 
 - Add strict signed borrowed-GPU owner views, incident delivery and exact trusted
