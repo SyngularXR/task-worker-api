@@ -52,6 +52,7 @@ class BorrowingOwner(ResourceModel):
     gpu_uuid: PhysicalGPU
     state: Literal["reserved", "running", "releasing", "recovering"]
     lease_expires_at: AwareDatetime
+    reclaim_deadline: AwareDatetime | None
     role: Literal["primary", "inference"]
     service_id: Identifier | None
     engine_epoch: UUID | None
@@ -62,6 +63,11 @@ class BorrowingOwner(ResourceModel):
             raise ValueError("owner role differs from service binding")
         if self.role == "primary" and (self.service_id is not None or self.engine_epoch is not None):
             raise ValueError("primary owner has service fields")
+        if self.role == "primary" and self.reclaim_deadline is not None:
+            raise ValueError("primary owner cannot have a resident reclaim deadline")
+        if self.role == "inference" and ((self.state in ("reserved", "running") and self.reclaim_deadline is not None)
+                or (self.state == "recovering" and self.reclaim_deadline is None)):
+            raise ValueError("resident reclaim deadline differs from lifecycle state")
         return self
 
 
