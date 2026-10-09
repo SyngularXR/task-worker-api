@@ -158,18 +158,29 @@ class BorrowingJournal:
         view = verify_borrowing(signed,key,self.binding)
         if not fresh_observation(now,view.server_time) or not fresh_observation(now,view.report_captured_at):
             raise ProtocolError("authority owner ACK is stale")
-        with self._write() as db:
+        with self._write(check_binding=False) as db:
+            retained = BorrowingBinding.model_validate_json(db.execute("SELECT payload FROM binding WHERE id=1").fetchone()[0])
+            if retained.authority_id != self.binding.authority_id:
+                raise ProtocolError("authority owner ACK differs from retained authority")
             old = db.execute("SELECT received_owners FROM state WHERE id=1").fetchone()[0]
             if old:
                 previous = SignedBorrowingOwners.model_validate_json(old).observation
-                if view.report_sequence < previous.report_sequence or view.server_time < previous.server_time:
+                same_binding = previous.binding == view.binding
+                if ((same_binding and (view.report_sequence < previous.report_sequence or view.server_time < previous.server_time))
+                        or (not same_binding and view.server_time <= previous.server_time)):
                     raise ProtocolError("authority owner ACK was replayed")
             db.execute("UPDATE state SET received_owners=? WHERE id=1",[signed.model_dump_json()])
 
     def owner_view(self):
-        with self._mutex, closing(self._connect()) as db:
+        with self._mutex, closing(self._connect(check_binding=False)) as db:
+            retained = BorrowingBinding.model_validate_json(db.execute("SELECT payload FROM binding WHERE id=1").fetchone()[0])
+            if retained.authority_id != self.binding.authority_id:
+                raise ProtocolError("authority owner ACK differs from retained authority")
             row=db.execute("SELECT received_owners FROM state WHERE id=1").fetchone()[0]
-        return SignedBorrowingOwners.model_validate_json(row) if row else None
+        signed = SignedBorrowingOwners.model_validate_json(row) if row else None
+        if signed and signed.observation.binding != self.binding:
+            raise ProtocolError("authority owner ACK differs from current binding")
+        return signed
 
     def observe(self, signed: SignedBorrowingOwners, key, inspection: dict, *, primary_owner: bool, now=None):
         now = now or datetime.now(timezone.utc)

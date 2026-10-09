@@ -99,3 +99,17 @@ and generation read. It changes no binding, generation, owner/proof/run marker,
 incident/ACK/clear history, pending delivery or eligibility. Empty/bootstrap, foreign
 or nonidle inspection cannot record that boundary. The observer and worker still
 need a fresh approved run and continuing action/progress proofs after local clear.
+
+
+Trusted reenrollment on the same authority/host/physical GPU may retain and read
+a fresh owner frame for the current complete binding before ordinary drained
+requalification. Receiving that metadata changes only `received_owners`; it does
+not rebind the journal or establish physical admission. Report sequence may reset
+between bindings, but the signed authority time must be strictly later. Same-binding
+sequence/time rollback and delayed old frames are refused. Readers return only
+their prepared current binding, and callers must still verify its signature.
+The strict inspection and full-set clear retain the old previous-binding digest
+and original incident pins. A clear sets running/proof inactive; a separately
+authorized observer run and fresh physical proof remain necessary. This path covers
+an old pending hold whose authority clear has not yet committed. An already
+committed old clear with a lost receipt followed by a binding change remains fenced.

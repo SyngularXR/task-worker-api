@@ -885,3 +885,125 @@ def test_failed_idle_inspection_write_cannot_fabricate_episode_boundary(journal)
             journal.inspection(view(journal.binding),KEY,{'gpu_uuid':journal.binding.gpu_uuid,'processes':[]},primary_owner=False)
         blocker.rollback()
     assert episode_state(journal)==before and not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
+
+
+def owner_frame_snapshot(journal):
+    with sqlite3.connect(journal.path) as db:
+        return {table:db.execute('SELECT * FROM '+table).fetchall()
+            for table in ('binding','state','incidents','clears','incident_clear')}
+
+
+def reenrolled_owner_frame(journal):
+    now=datetime.now(timezone.utc)
+    prior=view(journal.binding,100,now=now-timedelta(seconds=2))
+    journal.record_owner_view(prior,KEY,now=now)
+    journal.observe(prior,KEY,{'gpu_uuid':journal.binding.gpu_uuid,'processes':[]},primary_owner=False,now=now)
+    original=journal.fault(100,'untracked_owner','b'*64)
+    journal.acknowledge(sign_borrowing(BorrowingAck(incident=original,recorded_at=now,disabled=True),KEY),KEY)
+    current=journal.binding.model_copy(update={'boot_id':uuid4(),'epoch':2,'worker_instance_id':uuid4(),
+        'profile_digest':'c'*64})
+    held=BorrowingJournal(journal.path,current)
+    signed=view(current,1,True,now=now-timedelta(seconds=1))
+    return held,signed,original,prior,now
+
+
+def test_current_owner_frame_reenrollment_metadata_only(journal):
+    current,signed,original,prior,now=reenrolled_owner_frame(journal)
+    before=owner_frame_snapshot(journal);state=episode_state(journal)
+    current.record_owner_view(signed,KEY,now=now)
+    assert current.owner_view()==signed and verify_borrowing(current.owner_view(),KEY,current.binding)==signed.observation
+    after=episode_state(journal)
+    assert after.pop('received_owners')==signed.model_dump_json()
+    state.pop('received_owners');assert after==state
+    assert all(owner_frame_snapshot(journal)[table]==before[table] for table in ('binding','incidents','clears','incident_clear'))
+    current.record_owner_view(signed,KEY,now=now)
+    assert current.owner_view()==signed and journal.pending()==[original]
+    assert not current.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc),now=now)
+    with pytest.raises(ProtocolError):current.begin_run()
+    with pytest.raises(ProtocolError):current.observe(signed,KEY,{'gpu_uuid':current.binding.gpu_uuid,'processes':[]},primary_owner=False,now=now)
+    with pytest.raises(ProtocolError):journal.owner_view()
+
+
+@pytest.mark.parametrize('delta',[0,-1])
+def test_current_owner_frame_cross_binding_requires_strictly_newer_server_time(journal,delta):
+    current,signed,original,prior,now=reenrolled_owner_frame(journal)
+    timestamp=prior.observation.server_time+timedelta(seconds=delta)
+    tied=view(current.binding,1,True,now=timestamp)
+    before=owner_frame_snapshot(journal)
+    with pytest.raises(ProtocolError):current.record_owner_view(tied,KEY,now=now)
+    assert owner_frame_snapshot(journal)==before
+    current.record_owner_view(signed,KEY,now=now)
+    assert current.owner_view()==signed
+
+
+@pytest.mark.parametrize('sequence,offset',[(2,1),(4,-1)])
+def test_current_owner_frame_same_binding_keeps_sequence_and_time_fences(journal,sequence,offset):
+    current,signed,original,prior,now=reenrolled_owner_frame(journal)
+    latest=view(current.binding,3,True,now=now)
+    current.record_owner_view(latest,KEY,now=now)
+    before=owner_frame_snapshot(journal)
+    replay=view(current.binding,sequence,True,now=now+timedelta(seconds=offset))
+    with pytest.raises(ProtocolError):current.record_owner_view(replay,KEY,now=now)
+    assert owner_frame_snapshot(journal)==before
+    later=view(current.binding,4,True,now=now+timedelta(seconds=1))
+    current.record_owner_view(later,KEY,now=now)
+    assert current.owner_view()==later
+
+
+def test_current_owner_frame_delayed_old_ack_refused_by_current_and_obsolete_objects(journal):
+    current,signed,original,prior,now=reenrolled_owner_frame(journal)
+    current.record_owner_view(signed,KEY,now=now)
+    before=owner_frame_snapshot(journal)
+    for actor in (current,journal):
+        with pytest.raises(ProtocolError):actor.record_owner_view(prior,KEY,now=now)
+        assert owner_frame_snapshot(journal)==before
+    with pytest.raises(ProtocolError):journal.owner_view()
+    assert current.owner_view()==signed
+
+
+@pytest.mark.parametrize('field',['authority_id','host_id','gpu_uuid'])
+def test_current_owner_frame_foreign_retained_scope_cannot_read_or_write(journal,field):
+    current,signed,original,prior,now=reenrolled_owner_frame(journal)
+    foreign=current.binding.model_copy(update={field:'GPU-'+str(uuid4()) if field=='gpu_uuid' else uuid4()})
+    actor=BorrowingJournal(journal.path,foreign)
+    before=owner_frame_snapshot(journal)
+    with pytest.raises(ProtocolError):actor.record_owner_view(view(foreign,1,True,now=now),KEY,now=now)
+    with pytest.raises(ProtocolError):actor.owner_view()
+    assert owner_frame_snapshot(journal)==before
+
+
+@pytest.mark.parametrize('invalid',['signature','unsigned','binding','stale'])
+def test_current_owner_frame_authentication_and_freshness_precede_mutation(journal,invalid):
+    current,signed,original,prior,now=reenrolled_owner_frame(journal)
+    bad=signed
+    if invalid=='signature':bad=sign_borrowing(signed.observation,b'wrong-fixture-key-only-32bytes-long')
+    if invalid=='unsigned':bad=signed.observation
+    if invalid=='binding':bad=view(current.binding.model_copy(update={'worker_instance_id':uuid4()}),1,True,now=now)
+    if invalid=='stale':bad=view(current.binding,1,True,now=now-timedelta(seconds=60))
+    before=owner_frame_snapshot(journal)
+    with pytest.raises((ProtocolError,AttributeError)):current.record_owner_view(bad,KEY,now=now)
+    assert owner_frame_snapshot(journal)==before
+    with pytest.raises(ProtocolError):current.owner_view()
+
+
+def test_current_owner_frame_fullset_requalification_keeps_old_incident_history(journal):
+    current,signed,original,prior,now=reenrolled_owner_frame(journal)
+    current.record_owner_view(signed,KEY,now=now)
+    physical={'gpu_uuid':current.binding.gpu_uuid,'processes':[]}
+    inspected=current.inspection(current.owner_view(),KEY,physical,primary_owner=False,now=now)
+    assert inspected.observation.previous_binding_digest==policy_digest(journal.binding.model_dump(mode='json'))
+    assert inspected.observation.incidents=={original.incident_id:incident_digest(original)}
+    assert journal.pending()==[original] and not current.eligible(KEY,after=now,now=now)
+    receipt=sign_borrowing(BorrowingClear(binding=current.binding,clear_id=uuid4(),
+        previous_binding_digest=inspected.observation.previous_binding_digest,
+        hold_generation=inspected.observation.hold_generation,incidents=inspected.observation.incidents,
+        inspection_digest=inspected.observation.inspection_digest,report_sequence=signed.observation.report_sequence,
+        recorded_at=now,response_at=now),GRANT_KEY)
+    before=owner_frame_snapshot(journal)['incidents']
+    current.apply_clear(receipt,GRANT_KEY,KEY,signed,physical,primary_owner=False,now=now)
+    assert owner_frame_snapshot(current)['incidents']==before and not current.pending()
+    assert episode_state(current)['running']==0 and episode_state(current)['proof_run_id'] is None
+    assert not current.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc),now=now)
+    with pytest.raises(ProtocolError):journal.begin_run()
+    current.begin_run();current.observe(view(current.binding,2,now=now),KEY,physical,primary_owner=False,now=now)
+    assert current.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc),now=now)
