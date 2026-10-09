@@ -8,6 +8,7 @@ Shared contract + worker SDK for the [SynPusher](https://github.com/SyngularXR/S
 
 Finite resident inference-resource ownership is a separate SDK foundation:
 [resident service grants](docs/resident-services.md). It is not deployed or enrolled.
+Prepared borrowed GPU hosts also require the [trusted ownership observer](docs/borrowing-observer.md).
 
 ## What this is
 

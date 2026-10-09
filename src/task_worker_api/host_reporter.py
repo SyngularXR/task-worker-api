@@ -9,7 +9,7 @@ or native_scope and/or vm_command (Windows: native scope identifier and argv
 for the trusted Linux scope collector). Native capacity shares the host budget.
 """
 import asyncio
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timezone
 import json
 import logging
@@ -116,25 +116,75 @@ def publish_report(config) -> SignedHostReport:
 
 
 async def run(config):
+    observer = None
+    if "borrowing" in config:
+        try:
+            from .borrowing_observer import BorrowingObserver
+            observer = BorrowingObserver(config["borrowing"])
+            if (any(str(getattr(observer.binding,name)) != str(config[name]) for name in
+                    ("authority_id","host_id","boot_id","epoch"))
+                    or observer.key != Path(config["signing_key_file"]).read_bytes()):
+                raise ValueError("borrowing observer differs from trusted hardware reporter")
+        except Exception:
+            observer = None
+            log.error("Borrowing observer preparation failed; inference remains held")
     async with httpx.AsyncClient(timeout=5) as client:
         next_post = 0.0
-        while True:
-            try:
-                report = await asyncio.to_thread(publish_report, config)
-                if monotonic() >= next_post:
-                    response = await client.post(config["backend_url"].rstrip("/") + "/workers/host-report",
-                                                 json=report.model_dump(mode="json"))
-                    response.raise_for_status()
-            except Exception as exc:
-                if isinstance(exc, httpx.HTTPStatusError):
-                    # Capped like the v1 heartbeat: the next tick posts a fresher,
-                    # higher-sequence observation, while an hours-long window would
-                    # let the backend's copy go stale and fail every admission here.
-                    delay = _retry_after_delay(exc.response, maximum_seconds=_HEARTBEAT_RETRY_AFTER_MAX_S)
-                    if delay is not None:
-                        next_post = monotonic() + delay
-                log.error("Host report failed; previous observations will expire: %s", exc)
-            await asyncio.sleep(5)
+        publication = asyncio.Lock()
+
+        async def post_report():
+            # A race refresh uses the same hardware sequence/POST ordering as the ordinary tick.
+            async with publication:
+                report = await asyncio.to_thread(publish_report,config)
+                if monotonic() < next_post:
+                    return None
+                response = await client.post(config["backend_url"].rstrip("/") + "/workers/host-report",
+                                             json=report.model_dump(mode="json"))
+                response.raise_for_status()
+                if observer is None:
+                    return None
+                try:
+                    if len(response.content) > observer.policy.max_output_bytes:
+                        raise ValueError("borrowing owner ACK exceeded qualified bound")
+                    return await asyncio.to_thread(observer.accept_report_ack,response.json(),report.report.sequence)
+                except Exception:
+                    await asyncio.to_thread(observer.delivery_lost)
+                    log.error("Borrowing owner ACK failed; inference remains held")
+                    return None
+
+        async def refresh():
+            owners = await post_report()
+            if owners is None:
+                raise ValueError("fresh borrowing owner ACK unavailable")
+            return owners
+
+        task = asyncio.create_task(observer.run(client,config["backend_url"],refresh)) if observer is not None else None
+        try:
+            while True:
+                try:
+                    await post_report()
+                except Exception as exc:
+                    if observer is not None:
+                        try:
+                            await asyncio.to_thread(observer.delivery_lost)
+                        except Exception:
+                            log.error("Borrowing observation persistence failed; inference remains held")
+                    if isinstance(exc,httpx.HTTPStatusError):
+                        delay = _retry_after_delay(exc.response,maximum_seconds=_HEARTBEAT_RETRY_AFTER_MAX_S)
+                        if delay is not None:
+                            next_post = monotonic()+delay
+                    log.error("Host report failed; previous observations will expire: %s",exc)
+                if task is not None and task.done():
+                    with suppress(asyncio.CancelledError):
+                        task.exception()
+                    log.error("Borrowing observer stopped; inference remains held")
+                    task = None
+                await asyncio.sleep(5)
+        finally:
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError,Exception):
+                    await task
 
 
 if __name__ == "__main__":
@@ -147,6 +197,13 @@ if __name__ == "__main__":
     config = json.loads(args.config.read_text(encoding="utf-8"))
     for name in ("signing_key_file", "state_file", "report_file"):
         config[name] = str((args.config.parent / config[name]).resolve())
+    if "borrowing" in config:
+        borrowing = config["borrowing"]
+        for name in ("journal","reporter_key_file"):
+            borrowing[name] = str((args.config.parent / borrowing[name]).resolve())
+        for launcher in borrowing["launchers"]:
+            for name in ("journal","work_root"):
+                launcher[name] = str((args.config.parent / launcher[name]).resolve())
     logging.basicConfig(level=logging.INFO)
     if args.once:
         print(publish_report(config).model_dump_json())

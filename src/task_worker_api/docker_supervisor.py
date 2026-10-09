@@ -25,7 +25,7 @@ from .service_protocol import ServiceGrant
 
 
 class DockerSupervisor:
-    def __init__(self, journal: Path, work_root: Path, *, authority_id, host_id, boot_id, epoch, execution_scope, cgroup_parent, network_id):
+    def __init__(self, journal: Path, work_root: Path, *, authority_id, host_id, boot_id, epoch, execution_scope, cgroup_parent, network_id, observe_only=False):
         self.authority_id, self.host_id, self.boot_id, self.epoch = authority_id, host_id, boot_id, epoch
         if not re.fullmatch(r"[a-f0-9]{64}", network_id):
             raise ValueError("supervisor requires an inspected Docker network ID")
@@ -35,6 +35,12 @@ class DockerSupervisor:
         self.root = work_root.resolve()
         if self.journal.is_relative_to(self.root):
             raise ValueError("supervisor journal must be outside attempt storage")
+        if observe_only:
+            if not self.root.is_dir():
+                raise AdmissionError("launch_unknown")
+            with closing(sqlite3.connect(self.journal.as_uri()+"?mode=ro",uri=True)) as db:
+                db.execute("SELECT attempt,plan,phase,container,evidence FROM launches LIMIT 0")
+            return
         self.root.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.journal)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS launches (attempt TEXT PRIMARY KEY, plan TEXT NOT NULL, phase TEXT NOT NULL, container TEXT, evidence TEXT)")
@@ -57,15 +63,68 @@ class DockerSupervisor:
         if row is None:
             raise AdmissionError("launch_unknown")
         plan = json.loads(row[0])
-        if (plan["ownership"] != claim.ownership.model_dump(mode="json") or plan["root"] != str(self.root)
-                or plan["host"] != str(self.host_id) or plan["boot"] != str(self.boot_id)
-                or plan["scope"] != self.execution_scope or plan["cgroup_parent"] != self.cgroup_parent
-                or plan["network_id"] != self.network_id
-                or plan["authority"] != str(self.authority_id) or plan["epoch"] != self.epoch):
+        self._plan_binding(plan)
+        if plan["ownership"] != claim.ownership.model_dump(mode="json"):
             raise AdmissionError("attempt_fenced")
         if isinstance(claim, ServiceGrant) and plan.get('service') != self._service_binding(claim):
             raise AdmissionError("attempt_fenced")
         return plan, *row[1:]
+
+    def _plan_binding(self, plan):
+        if (plan["root"] != str(self.root) or plan["host"] != str(self.host_id)
+                or plan["boot"] != str(self.boot_id) or plan["scope"] != self.execution_scope
+                or plan["cgroup_parent"] != self.cgroup_parent or plan["network_id"] != self.network_id
+                or plan["authority"] != str(self.authority_id) or plan["epoch"] != self.epoch):
+            raise AdmissionError("attempt_fenced")
+
+    def verified_gpu_launch(self, owner, *, proc_root=Path("/proc"), profile_digest=None, inspection_timeout=30):
+        """Readonly physical proof for a filtered authenticated authority owner."""
+        from .borrowing_observer import process_identity
+        from .resources import AttemptOwnership
+
+        if physical_boot_id(self.host_id, proc_root) != self.boot_id or owner.execution_scope != self.execution_scope:
+            raise AdmissionError("attempt_fenced")
+        with closing(sqlite3.connect(self.journal.as_uri() + "?mode=ro", uri=True)) as db:
+            row = db.execute("SELECT plan,phase,container FROM launches WHERE attempt=?", [str(owner.attempt_id)]).fetchone()
+        if row is None:
+            return None  # A reserved authority owner may not have launched yet.
+        plan = json.loads(row[0])
+        self._plan_binding(plan)
+        ownership = AttemptOwnership.model_validate(plan["ownership"])
+        if ((ownership.attempt_id, ownership.worker_instance_id, ownership.generation)
+                != (owner.attempt_id, owner.worker_instance_id, owner.generation)):
+            raise AdmissionError("attempt_fenced")
+        service = plan.get("service")
+        if owner.role == "inference":
+            if (not service or service["engine_epoch"] != str(owner.engine_epoch)
+                    or service["profile"]["service_id"] != owner.service_id
+                    or service["profile"]["config_digest"] != profile_digest):
+                raise AdmissionError("attempt_fenced")
+        elif service is not None:
+            raise AdmissionError("attempt_fenced")
+        if row[1] in ("registered", "removed", "cleaned"):
+            return None
+        data = self._inspect(row[2] or plan["name"], plan, timeout=inspection_timeout)
+        if not data["State"]["Running"]:
+            return None
+        if plan["gpu"] != owner.gpu_uuid:
+            raise AdmissionError("attempt_fenced")
+        pid = data["State"]["Pid"]
+        start, cgroup = process_identity(pid, proc_root)
+        if cgroup == "/":
+            raise AdmissionError("launch_configuration_changed")
+        return {"attempt_id": str(owner.attempt_id), "container_id": data["Id"],
+                "pid": pid, "start_time": start, "cgroup": cgroup, "role": owner.role}
+
+    def stop_verified_gpu_inference(self, owner, *, profile_digest, timeout, proc_root=Path("/proc")):
+        """Withdraw only an exactly attributed inference container; never release accounting."""
+        if owner.role != "inference":
+            raise AdmissionError("service_grant_required")
+        proof = self.verified_gpu_launch(owner, proc_root=proc_root, profile_digest=profile_digest,inspection_timeout=timeout)
+        if proof is None:
+            return False
+        self._docker("kill", "--signal=KILL", proof["container_id"], timeout=timeout)
+        return True
 
     @staticmethod
     def _service_binding(grant):
@@ -157,8 +216,8 @@ class DockerSupervisor:
             db.execute("UPDATE launches SET phase=?,container=?,evidence=COALESCE(?,evidence) WHERE attempt=?",
                        [phase, container, evidence, str(claim.ownership.attempt_id)])
 
-    def _inspect(self, name, plan):
-        data = json.loads(self._docker("inspect", name))[0]
+    def _inspect(self, name, plan, *, timeout=30):
+        data = json.loads(self._docker("inspect", name,timeout=timeout))[0]
         labels = data["Config"]["Labels"] or {}
         config = data["HostConfig"]
         networks = data.get("NetworkSettings", {}).get("Networks", {})

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.19.0.dev50
+
+- Add strict signed borrowed-GPU owner views, incident delivery and exact trusted
+  clear receipts without changing the primary hardware snapshot or HMAC bytes.
+- Add private immutable incident/clear history and fresh physical observation
+  gates. New bootstrap hosts stay ineligible until their first complete idle
+  proof; established observer loss and untracked ownership hold inference.
+- Reuse verified Docker launch identity for PID/start/cgroup attribution and
+  inference-only withdrawal. Unreleased primary demand and bounded resident
+  cleanup remain transient; release never clears an unexpected-use incident.
+- Consume enriched owner ACKs alongside ordinary hardware reports; separate
+  fault retries never allocate hardware sequences or refresh primary capacity.
+  This source requires coordinated backend/worker preparation and measured
+  hardware qualification; no host is activated by this release.
+
 ## 0.19.0.dev49
 
 - Add finite resident service-resource grants without fabricated task or case
