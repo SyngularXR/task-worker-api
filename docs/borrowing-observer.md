@@ -83,3 +83,19 @@ binding, generation, owner/proof/run state and the newer incident remain intact.
 The resulting full current set is then cleared by the ordinary idle inspection
 and exact generation/set protocol. Unknown, altered, foreign-GPU or full-set
 history operations are refused. Historical reconciliation is not requalification.
+
+
+Same-class faults coalesce only while the same physical failure remains unresolved.
+A verified physical observation or strict genuinely idle requalification inspection
+records the restoration boundary. A later recurrence, even with the same bounded
+condition digest and without a locally received original ACK/clear, creates a new
+immutable incident UUID and generation. This does not depend on wall-clock ordering.
+The older authority receipt cannot clear that new local hold; historical subset
+reconciliation and a fresh full-set clear remain separate required operations.
+
+Faults invalidate only current physical inspection/time. Strict nonempty idle
+inspection records those two passive fields atomically with its exact incident-set
+and generation read. It changes no binding, generation, owner/proof/run marker,
+incident/ACK/clear history, pending delivery or eligibility. Empty/bootstrap, foreign
+or nonidle inspection cannot record that boundary. The observer and worker still
+need a fresh approved run and continuing action/progress proofs after local clear.

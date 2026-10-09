@@ -763,3 +763,125 @@ def test_historical_clear_rejects_foreign_authority_even_with_shared_fixture_key
     foreign=receipt.observation.model_copy(update={'binding':receipt.observation.binding.model_copy(update={'authority_id':uuid4()})})
     with pytest.raises(ProtocolError):journal.reconcile_clear_history(sign_borrowing(foreign,GRANT_KEY),GRANT_KEY)
     assert len(journal.pending())==2
+
+
+def episode_state(journal):
+    with sqlite3.connect(journal.path) as db:
+        columns=[row[1] for row in db.execute("PRAGMA table_info(state)")]
+        return dict(zip(columns,db.execute("SELECT * FROM state WHERE id=1").fetchone()))
+
+
+def test_same_class_fault_coalesces_only_until_verified_physical_restoration(journal):
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    evidence=policy_digest({'condition':'untracked_owner'})
+    observed(journal,1,physical=physical)
+    original=journal.fault(1,'untracked_owner',evidence)
+    assert episode_state(journal)['inspection'] is None
+    for sequence in (2,3):
+        assert journal.fault(sequence,'untracked_owner',evidence).model_dump_json()==original.model_dump_json()
+    # A signed owner ACK alone is not a physical restoration boundary.
+    journal.record_owner_view(view(journal.binding,4),KEY)
+    assert journal.fault(4,'untracked_owner',evidence)==original
+    observed(journal,5,physical=physical)
+    recurrence=journal.fault(5,'untracked_owner',evidence)
+    assert recurrence.incident_id!=original.incident_id and recurrence.hold_generation==2
+    assert journal.fault(6,'untracked_owner',evidence)==recurrence  # Latest episode, not first historical row.
+    assert journal.pending()==[original,recurrence]
+    assert episode_state(journal)['inspection'] is None
+
+
+@pytest.mark.parametrize('restore',['observation','inspection'])
+@pytest.mark.parametrize('acknowledged',[True,False])
+def test_same_class_recurrence_after_lost_clear_retains_newer_hold(journal,restore,acknowledged):
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    evidence=policy_digest({'condition':'untracked_owner'})
+    observed(journal,1,physical=physical)
+    original=journal.fault(1,'untracked_owner',evidence)
+    original_bytes=original.model_dump_json()
+    if acknowledged:
+        journal.acknowledge(sign_borrowing(BorrowingAck(incident=original,recorded_at=datetime.now(timezone.utc),disabled=True),KEY),KEY)
+    old_owners=view(journal.binding,2,True)
+    old_clear=clear_for(journal,old_owners,physical)  # Authority commit; local receipt is lost.
+    # No local ordinary-clear call or original history mutation occurs.
+    if restore=='observation':
+        observed(journal,3,physical=physical)
+    else:
+        journal.record_owner_view(view(journal.binding,3),KEY)
+        journal.inspection(view(journal.binding,3),KEY,physical,primary_owner=False)
+    recurrence=journal.fault(3,'untracked_owner',evidence)
+    assert recurrence.incident_id!=original.incident_id and recurrence.hold_generation>old_clear.observation.hold_generation
+    assert journal.pending()[0].model_dump_json()==original_bytes
+    assert recurrence in journal.awaiting_delivery()
+    current=observed(journal,4,physical=physical)
+    with pytest.raises(ProtocolError,match='newer local incident'):
+        journal.apply_clear(old_clear,GRANT_KEY,KEY,current,physical,primary_owner=False)
+    before=episode_state(journal)
+    journal.reconcile_clear_history(old_clear,GRANT_KEY)
+    assert episode_state(journal)==before and journal.pending()==[recurrence]
+    assert not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
+    fresh_clear=clear_for(journal,current,physical)
+    journal.apply_clear(fresh_clear,GRANT_KEY,KEY,current,physical,primary_owner=False)
+    assert not journal.pending() and not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
+    journal.begin_run();observed(journal,5,physical=physical)
+    assert journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
+
+
+def test_strict_idle_inspection_records_only_passive_episode_boundary(journal):
+    original=journal.fault(1,'untracked_owner',policy_digest({'condition':'untracked_owner'}))
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    before=episode_state(journal)
+    inspected=journal.inspection(view(journal.binding,2,True),KEY,physical,primary_owner=False)
+    after=episode_state(journal)
+    assert json.loads(after.pop('inspection'))==physical
+    assert after.pop('inspected_at')==inspected.observation.inspected_at.isoformat()
+    before.pop('inspection');before.pop('inspected_at')
+    assert after==before and journal.pending()==[original] and journal.awaiting_delivery()==[original]
+    assert not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
+
+
+def test_invalid_or_empty_idle_inspection_cannot_write_episode_boundary(journal):
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    before=episode_state(journal)
+    with pytest.raises(ValidationError):journal.inspection(view(journal.binding),KEY,physical,primary_owner=False)
+    assert episode_state(journal)==before  # Missing bootstrap incident is not requalification.
+    journal.fault(1,'untracked_owner','a'*64);before=episode_state(journal)
+    for invalid in ({},{'gpu_uuid':'GPU-'+str(uuid4()),'processes':[]},{'gpu_uuid':journal.binding.gpu_uuid,'processes':[{'pid':1}]}):
+        with pytest.raises(ProtocolError):journal.inspection(view(journal.binding),KEY,invalid,primary_owner=False)
+        assert episode_state(journal)==before
+    with pytest.raises(ProtocolError):journal.inspection(view(binding()),KEY,physical,primary_owner=False)
+    assert episode_state(journal)==before
+
+
+def test_episode_restoration_is_not_erased_by_backward_clock(journal):
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    evidence=policy_digest({'condition':'untracked_owner'})
+    now=datetime.now(timezone.utc)
+    original=journal.fault(1,'untracked_owner',evidence,observed_at=now)
+    earlier=now-timedelta(seconds=1)
+    owners=view(journal.binding,2,True,now=earlier)
+    journal.observe(owners,KEY,physical,primary_owner=False,now=earlier)
+    recurrence=journal.fault(2,'untracked_owner',evidence,observed_at=earlier)
+    assert recurrence.incident_id!=original.incident_id and recurrence.hold_generation==2
+
+
+def test_restart_preserves_ongoing_episode_and_restoration_opens_new_one(journal):
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    evidence=policy_digest({'condition':'untracked_owner'})
+    observed(journal,1,physical=physical)
+    original=journal.fault(1,'untracked_owner',evidence)
+    restored=BorrowingJournal(journal.path,journal.binding);restored.begin_run()
+    assert restored.fault(2,'untracked_owner',evidence)==original
+    observed(restored,3,physical=physical)
+    assert restored.fault(3,'untracked_owner',evidence).incident_id!=original.incident_id
+    assert restored.pending()[0]==original
+
+
+def test_failed_idle_inspection_write_cannot_fabricate_episode_boundary(journal):
+    journal.fault(1,'untracked_owner','a'*64)
+    before=episode_state(journal)
+    with sqlite3.connect(journal.path,timeout=0) as blocker:
+        blocker.execute('BEGIN IMMEDIATE')
+        with pytest.raises(sqlite3.OperationalError):
+            journal.inspection(view(journal.binding),KEY,{'gpu_uuid':journal.binding.gpu_uuid,'processes':[]},primary_owner=False)
+        blocker.rollback()
+    assert episode_state(journal)==before and not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
