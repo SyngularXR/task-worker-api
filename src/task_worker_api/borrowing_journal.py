@@ -281,7 +281,7 @@ class BorrowingJournal:
     def reconcile_clear_history(self,signed: SignedBorrowingClear,key):
         """Confirm an older strict subset only; never rebind or clear the newer hold."""
         clear = verify_borrowing(signed,key,signed.observation.binding)
-        if (clear.binding.host_id,clear.binding.gpu_uuid) != (self.binding.host_id,self.binding.gpu_uuid):
+        if (clear.binding.authority_id,clear.binding.host_id,clear.binding.gpu_uuid) != (self.binding.authority_id,self.binding.host_id,self.binding.gpu_uuid):
             raise ProtocolError("historical clear differs from retained host GPU")
         named = {str(k):v for k,v in clear.incidents.items()}
         with self._write(check_binding=False) as db:
@@ -291,7 +291,8 @@ class BorrowingJournal:
                     raise ProtocolError("historical clear does not match retained incident")
                 incident = BorrowingIncident.model_validate_json(row[0])
                 if (incident.hold_generation > clear.hold_generation
-                        or (incident.binding.host_id,incident.binding.gpu_uuid) != (clear.binding.host_id,clear.binding.gpu_uuid)):
+                        or (incident.binding.authority_id,incident.binding.host_id,incident.binding.gpu_uuid)
+                        != (clear.binding.authority_id,clear.binding.host_id,clear.binding.gpu_uuid)):
                     raise ProtocolError("historical clear incident binding differs")
             prior = db.execute("SELECT payload,history_only FROM clears WHERE id=?",[str(clear.clear_id)]).fetchone()
             if prior:

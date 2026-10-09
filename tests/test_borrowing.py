@@ -752,3 +752,14 @@ def test_history_reconciliation_rejects_fullset_unknown_foreign_and_altered_rece
     current=clear_for(journal,owners,physical)
     journal.apply_clear(current,GRANT_KEY,KEY,owners,physical,primary_owner=False)
     with pytest.raises(ProtocolError):journal.reconcile_clear_history(current,GRANT_KEY)
+
+
+def test_historical_clear_rejects_foreign_authority_even_with_shared_fixture_key(journal):
+    journal.fault(1,'untracked_owner','b'*64)
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    owners=observed(journal,2,disabled=True,physical=physical)
+    receipt=clear_for(journal,owners,physical)
+    journal.fault(2,'outside_fence','c'*64)
+    foreign=receipt.observation.model_copy(update={'binding':receipt.observation.binding.model_copy(update={'authority_id':uuid4()})})
+    with pytest.raises(ProtocolError):journal.reconcile_clear_history(sign_borrowing(foreign,GRANT_KEY),GRANT_KEY)
+    assert len(journal.pending())==2
