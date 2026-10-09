@@ -586,8 +586,8 @@ async def test_v2_state_for_this_attempt_is_returned_unchanged(name):
 
 @pytest.mark.asyncio
 async def test_v2_foreign_progress_state_expires_the_lease():
-    """ProtocolError is the signal ``AttemptLease`` acts on; anything else is
-    swallowed by its generic handler and the worker keeps executing."""
+    """ProtocolError is the signal ``AttemptLease`` acts on (with a 409); anything
+    else is swallowed by its generic handler and the worker keeps executing."""
     import time
     from task_worker_api.errors import ProtocolError
     from task_worker_api.resource_execution import AttemptLease

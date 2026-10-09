@@ -1152,8 +1152,8 @@ class BackendClient:
         410/426 becomes :class:`ProtocolError` rather than a raw
         ``HTTPStatusError``, because that is the distinction the attempt lease
         acts on: ``AttemptLease`` expires the lease on ``ProtocolError`` (and on
-        a heartbeat 409, the backend's dead-lease answer) and merely logs
-        anything else. :meth:`_resource_request` layers the retry
+        a heartbeat or progress 409, the backend's dead-lease answer) and
+        merely logs anything else. :meth:`_resource_request` layers the retry
         loop on top; callers on a handler's critical path use this directly to
         stay one-shot (see :meth:`resource_progress`).
         """
@@ -1303,7 +1303,8 @@ class BackendClient:
         to map a retired protocol (410/426) to :class:`ProtocolError`, which is
         what makes ``AttemptLease.update`` expire the lease instead of
         swallowing the error in its generic handler and letting the worker keep
-        executing an attempt the backend no longer honours.
+        executing an attempt the backend no longer honours. A 409 stays a raw
+        ``HTTPStatusError``; ``update`` expires the lease on that too.
         """
         response = await self._resource_request_once("PUT", f"/tasks/{claim.task_id}/progress",
             json={"protocol_version": 2, "ownership": claim.ownership.model_dump(mode="json"), "progress": progress})
