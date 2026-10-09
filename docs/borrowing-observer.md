@@ -72,3 +72,14 @@ set, including on replay. It confirms named pending delivery and appends clear
 links without deleting history. A newer local or remote incident defeats an older
 receipt. New ordinary reports or plain service enrollment cannot clear a hold.
 Fresh observer/worker action proofs remain necessary after an accepted clear.
+
+If a committed authority clear receipt is lost and a newer incident occurs before
+local application, normal `apply_clear()` still refuses the old generation.
+Trusted provisioning may retrieve the exact prior clear UUID/request receipt
+without reopening the newer authority hold. `reconcile_clear_history()` verifies
+that signed receipt and a strict proper subset of retained incident digests while
+a newer local hold remains. It appends only history and those older clear links;
+binding, generation, owner/proof/run state and the newer incident remain intact.
+The resulting full current set is then cleared by the ordinary idle inspection
+and exact generation/set protocol. Unknown, altered, foreign-GPU or full-set
+history operations are refused. Historical reconciliation is not requalification.

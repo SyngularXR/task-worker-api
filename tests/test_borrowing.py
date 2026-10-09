@@ -705,3 +705,50 @@ async def test_established_observer_task_exit_records_hold_while_primary_reports
     assert sent==[1,2,3,4]
     assert len(journal.pending())==1
     assert not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
+
+
+def test_lost_clear_history_reconciles_only_older_subset_and_preserves_new_hold(journal):
+    first=journal.fault(1,'untracked_owner','b'*64)
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    owners=observed(journal,2,disabled=True,physical=physical)
+    old=clear_for(journal,owners,physical)
+    second=journal.fault(2,'outside_fence','c'*64)
+    with sqlite3.connect(journal.path) as db:
+        binding_before=db.execute('SELECT * FROM binding').fetchall()
+        state_before=db.execute('SELECT * FROM state').fetchall()
+        incidents_before=db.execute('SELECT * FROM incidents').fetchall()
+    with pytest.raises(ProtocolError):journal.apply_clear(old,GRANT_KEY,KEY,owners,physical,primary_owner=False)
+    journal.reconcile_clear_history(old,GRANT_KEY)
+    assert journal.pending()==[second] and not journal.eligible(KEY,after=datetime.min.replace(tzinfo=timezone.utc))
+    with sqlite3.connect(journal.path) as db:
+        assert db.execute('SELECT * FROM binding').fetchall()==binding_before
+        assert db.execute('SELECT * FROM state').fetchall()==state_before
+        assert db.execute('SELECT * FROM incidents').fetchall()==incidents_before
+        assert db.execute('SELECT history_only FROM clears').fetchone()==(1,)
+    journal.reconcile_clear_history(old,GRANT_KEY)
+    fresh=clear_for(journal,owners,physical)
+    journal.apply_clear(fresh,GRANT_KEY,KEY,owners,physical,primary_owner=False)
+    assert not journal.pending()
+    # Replaying history after the later full clear never changes eligibility/proofs.
+    journal.reconcile_clear_history(old,GRANT_KEY)
+    with sqlite3.connect(journal.path) as db:
+        assert db.execute('SELECT count(*) FROM clears').fetchone()[0]==2
+
+
+def test_history_reconciliation_rejects_fullset_unknown_foreign_and_altered_receipts(journal):
+    journal.fault(1,'untracked_owner','b'*64)
+    physical={'gpu_uuid':journal.binding.gpu_uuid,'processes':[]}
+    owners=observed(journal,2,disabled=True,physical=physical)
+    receipt=clear_for(journal,owners,physical)
+    with pytest.raises(ProtocolError):journal.reconcile_clear_history(receipt,GRANT_KEY)
+    journal.fault(2,'outside_fence','c'*64)
+    original=receipt.observation
+    for changed in ({'binding':original.binding.model_copy(update={'gpu_uuid':'GPU-'+str(uuid4())})},
+                    {'incidents':{uuid4():'1'*64}}, {'incidents':{next(iter(original.incidents)):'1'*64}},
+                    {'hold_generation':2}, {'incidents':{incident.incident_id:incident_digest(incident) for incident in journal.pending()}}):
+        altered=sign_borrowing(original.model_copy(update=changed),GRANT_KEY)
+        with pytest.raises(ProtocolError):journal.reconcile_clear_history(altered,GRANT_KEY)
+    assert len(journal.pending())==2
+    current=clear_for(journal,owners,physical)
+    journal.apply_clear(current,GRANT_KEY,KEY,owners,physical,primary_owner=False)
+    with pytest.raises(ProtocolError):journal.reconcile_clear_history(current,GRANT_KEY)

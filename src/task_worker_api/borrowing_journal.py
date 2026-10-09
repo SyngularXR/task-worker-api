@@ -86,7 +86,7 @@ class BorrowingJournal:
             db.execute("CREATE TABLE binding(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL)")
             db.execute("CREATE TABLE state(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL,owners TEXT,inspection TEXT,inspected_at TEXT,primary_owner INTEGER NOT NULL,established INTEGER NOT NULL,received_owners TEXT,run_id TEXT,run_pid INTEGER,run_start INTEGER,running INTEGER NOT NULL,proof_run_id TEXT)")
             db.execute("CREATE TABLE incidents(id TEXT PRIMARY KEY,payload TEXT NOT NULL,digest TEXT NOT NULL,ack TEXT)")
-            db.execute("CREATE TABLE clears(id TEXT PRIMARY KEY,payload TEXT NOT NULL)")
+            db.execute("CREATE TABLE clears(id TEXT PRIMARY KEY,payload TEXT NOT NULL,history_only INTEGER NOT NULL CHECK(history_only IN (0,1)))")
             db.execute("CREATE TABLE incident_clear(incident TEXT PRIMARY KEY REFERENCES incidents(id),clear_id TEXT NOT NULL REFERENCES clears(id))")
             db.execute("INSERT INTO binding VALUES(1,?)", [self.binding.model_dump_json()])
             db.execute("INSERT INTO state VALUES(1,0,NULL,NULL,NULL,1,0,NULL,NULL,NULL,NULL,0,NULL)")
@@ -270,10 +270,39 @@ class BorrowingJournal:
             pending = {row[0]: row[2] for row in self._pending(db)}
             if pending != {str(k): v for k, v in clear.incidents.items()}:
                 raise ProtocolError("borrowing clear does not match exact retained incidents")
-            db.execute("INSERT INTO clears VALUES(?,?)", [str(clear.clear_id), signed.model_dump_json()])
+            db.execute("INSERT INTO clears VALUES(?,?,0)", [str(clear.clear_id), signed.model_dump_json()])
             for incident in pending:
                 db.execute("INSERT INTO incident_clear VALUES(?,?)", [incident, str(clear.clear_id)])
             # The signed clear confirms authority delivery even when the original ACK was lost.
             db.execute("UPDATE binding SET payload=? WHERE id=1", [self.binding.model_dump_json()])
             db.execute("UPDATE state SET owners=?,inspection=?,inspected_at=?,primary_owner=0,established=1,running=0,proof_run_id=NULL WHERE id=1",
                 [owners.model_dump_json(), json.dumps(physical,sort_keys=True,separators=(",", ":")), now.isoformat()])
+
+    def reconcile_clear_history(self,signed: SignedBorrowingClear,key):
+        """Confirm an older strict subset only; never rebind or clear the newer hold."""
+        clear = verify_borrowing(signed,key,signed.observation.binding)
+        if (clear.binding.host_id,clear.binding.gpu_uuid) != (self.binding.host_id,self.binding.gpu_uuid):
+            raise ProtocolError("historical clear differs from retained host GPU")
+        named = {str(k):v for k,v in clear.incidents.items()}
+        with self._write(check_binding=False) as db:
+            for identity,digest in named.items():
+                row = db.execute("SELECT payload,digest FROM incidents WHERE id=?",[identity]).fetchone()
+                if row is None or row[1] != digest:
+                    raise ProtocolError("historical clear does not match retained incident")
+                incident = BorrowingIncident.model_validate_json(row[0])
+                if (incident.hold_generation > clear.hold_generation
+                        or (incident.binding.host_id,incident.binding.gpu_uuid) != (clear.binding.host_id,clear.binding.gpu_uuid)):
+                    raise ProtocolError("historical clear incident binding differs")
+            prior = db.execute("SELECT payload,history_only FROM clears WHERE id=?",[str(clear.clear_id)]).fetchone()
+            if prior:
+                original = SignedBorrowingClear.model_validate_json(prior[0]).observation
+                if (prior[1] != 1 or original.model_dump(exclude={"response_at"}) != clear.model_dump(exclude={"response_at"})):
+                    raise ProtocolError("historical clear identity conflicts")
+                return
+            generation = db.execute("SELECT generation FROM state WHERE id=1").fetchone()[0]
+            pending = {row[0]:row[2] for row in self._pending(db)}
+            if generation <= clear.hold_generation or not set(named) < set(pending) or any(pending[k] != v for k,v in named.items()):
+                raise ProtocolError("historical clear must leave a newer retained hold")
+            db.execute("INSERT INTO clears VALUES(?,?,1)",[str(clear.clear_id),signed.model_dump_json()])
+            for identity in named:
+                db.execute("INSERT INTO incident_clear VALUES(?,?)",[identity,str(clear.clear_id)])
