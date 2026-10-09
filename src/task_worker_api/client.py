@@ -81,6 +81,22 @@ _TRANSIENT_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 _TERMINAL_EXTRA_TRANSIENT = frozenset({500})
 _TERMINAL_MIN_ATTEMPTS = 6
 
+# Named 409 precondition failures on which the backend rolls back the
+# transaction, so the journaled operation may rotate to fresh evidence.
+_REJECTED_OBSERVATION_CODES = ("hardware_report_stale", "hardware_report_replayed", "cleanup_evidence_stale")
+# The subset caused only by the request's host report: a fresh report can fix it.
+_REJECTED_REPORT_CODES = ("hardware_report_stale", "hardware_report_replayed")
+
+
+def _rejection_code(exc: httpx.HTTPStatusError) -> Optional[str]:
+    """The ``code`` of a 409 JSON body, or None."""
+    if exc.response.status_code != 409:
+        return None
+    try:
+        return exc.response.json().get("code")
+    except (ValueError, AttributeError):
+        return None
+
 # Default ceiling for a single retry delay. Without a cap, backoff grows as
 # ``retry_backoff_s * 2**n`` — unbounded. A worker configured with the
 # (supported) ``max_retries=8`` and the default ``retry_backoff_s=2.0`` would
@@ -1299,13 +1315,9 @@ class BackendClient:
         except httpx.HTTPStatusError as exc:
             # These named precondition failures roll back the backend transaction.
             # Timeouts, 5xx, fencing and idempotency conflicts remain unresolved.
-            if exc.response.status_code == 409:
-                try:
-                    code = exc.response.json().get("code")
-                except (ValueError, AttributeError):
-                    code = None
-                if code in ("hardware_report_stale", "hardware_report_replayed", "cleanup_evidence_stale"):
-                    journal.record_operation(kind, operation_id, {"rejected": code})
+            code = _rejection_code(exc)
+            if code in _REJECTED_OBSERVATION_CODES:
+                journal.record_operation(kind, operation_id, {"rejected": code})
             raise
         state = self._resource_state(claim, response, "operation response")
         journal.record_operation(kind, operation_id, state.model_dump(mode="json"))

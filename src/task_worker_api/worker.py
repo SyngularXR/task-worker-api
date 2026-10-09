@@ -38,7 +38,7 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from .cancel import CancelGuard
-from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD
+from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD, _REJECTED_REPORT_CODES, _rejection_code
 from .context import ClaimedTask, TaskContext
 from .enums import TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -520,6 +520,13 @@ def _result_encode_error(result: object) -> Optional[str]:
 # one becomes a terminal fail the supervisor can release. 512 KiB is far above
 # any real result dict and still half of nginx's 1 MB default body limit.
 _MAX_RESULT_BODY_BYTES = 512 * 1024
+
+# A v2 start the backend rejects for a stale/replayed host report rolled back,
+# so it is re-sent with a fresh report instead of losing the staged inputs. One
+# transport retry of the journaled body easily outlives the report's 15 s
+# freshness window; the host reporter publishes a newer one every 5 s.
+_START_REPORT_ATTEMPTS = 3
+_START_REPORT_RETRY_DELAY_S = 5.0
 
 
 def _result_body_bytes(result: object) -> int:
@@ -1121,7 +1128,18 @@ class Worker:
                     params = TASK_PARAMS_SCHEMAS[task.task_type](**task.params)
                     handler = self.handlers[task.task_type]
                     files = await prepare_admitted_inputs(claim, client, self.work_dir, cancelled=lease.lost)
-                    await lease.start(await read_report(), claim.input_digest)
+                    for retries_left in reversed(range(_START_REPORT_ATTEMPTS)):
+                        try:
+                            await lease.start(await read_report(), claim.input_digest)
+                            break
+                        except httpx.HTTPStatusError as exc:
+                            code = _rejection_code(exc)
+                            if not retries_left or code not in _REJECTED_REPORT_CODES:
+                                raise
+                            log.warning("start for task %s rejected (%s); retrying with a fresh host report",
+                                        claim.task_id, code)
+                            await asyncio.sleep(_START_REPORT_RETRY_DELAY_S)
+                            lease.raise_if_cancelled()
                     started = True
                     result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease,
                                                                  profile=claim.profile), params)
