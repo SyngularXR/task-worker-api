@@ -228,6 +228,29 @@ async def test_non_409_renewal_error_is_not_lease_loss():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [409, 503])
+async def test_progress_409_is_lease_loss_and_other_statuses_are_not(status):
+    """A progress 409 is the backend's attempt_fenced: update raises and the
+    lease is lost, as on a heartbeat 409. Any other status only logs."""
+    client = Client()
+
+    async def progress(claim, payload):
+        raise _status_error(status)
+
+    client.resource_progress = progress
+    lease = AttemptLease(client, None, client.claim, grace_s=0.1, on_hard_exit=lambda: None)
+    async with lease:
+        if status == 409:
+            with pytest.raises(httpx.HTTPStatusError):
+                await lease.update("compute")
+        else:
+            await lease.update("compute")
+        await asyncio.sleep(0)
+        assert lease.lost.is_set() is (status == 409)
+        assert lease.is_cancelled is (status == 409)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("degraded", ["parks", "fails"])
 async def test_renewal_cannot_spend_the_whole_lease_on_one_retried_heartbeat(degraded):
     """A renewal keeps the client's retry policy, but never for longer than the

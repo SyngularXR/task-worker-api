@@ -227,6 +227,14 @@ class AttemptLease:
         except ProtocolError:
             self._mark_lost()
             raise
+        except httpx.HTTPStatusError as exc:
+            # A progress 409 is the backend's attempt_fenced, the same
+            # dead-lease answer _renew acts on; working on would spend the
+            # handler's time on a retired token. Other statuses stay a blip.
+            if exc.response.status_code == 409:
+                self._mark_lost()
+                raise
+            log.warning("Attempt progress update failed", exc_info=True)
         except Exception:
             log.warning("Attempt progress update failed", exc_info=True)
 
