@@ -9,6 +9,9 @@ This repo is **two things**:
 
 **For SDK-consumer questions** (how do I write a worker that consumes this), see [`docs/adding-a-worker.md`](docs/adding-a-worker.md).
 
+For resident inference-resource ownership, read [docs/resident-services.md](docs/resident-services.md).
+This foundation is separate from task admission and is not deployed/enrolled.
+
 ## Layout at a glance
 
 ```

@@ -20,12 +20,8 @@ class ResourceModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class ResourceProfile(ResourceModel):
-    profile_id: Identifier
-    revision: Positive
-    task_type: Identifier
-    required_capabilities: frozenset[str]
-    workload_bounds: dict[str, NonNegative]
+class ResourceBudget(ResourceModel):
+    """Shared admission quantities; never imply task or service ownership."""
     gpu_count: Annotated[StrictInt, Field(ge=0, le=1)]
     gpu_backend: Literal["cuda", "vulkan", "dx12", "none"]
     gpu_vram_mib: NonNegative
@@ -34,15 +30,6 @@ class ResourceProfile(ResourceModel):
     cpu_millicores: Positive
     scratch_mib: NonNegative
     scratch_pool: Identifier
-    execution_timeout_seconds: Positive
-    staging_timeout_seconds: Annotated[StrictInt, Field(ge=60, le=900)]
-    evidence: Annotated[str, Field(min_length=1)]
-    validation_state: Literal["unvalidated", "validated"]
-
-    @field_serializer("required_capabilities")
-    def sorted_capabilities(self, value):
-        return sorted(value)
-
     @model_validator(mode="after")
     def coherent_resources(self):
         if self.gpu_count == 0:
@@ -53,6 +40,22 @@ class ResourceProfile(ResourceModel):
         if self.execution_ram_mib > self.host_ram_mib:
             raise ValueError("execution RAM cannot exceed total host RAM request")
         return self
+
+
+class ResourceProfile(ResourceBudget):
+    profile_id: Identifier
+    revision: Positive
+    task_type: Identifier
+    required_capabilities: frozenset[str]
+    workload_bounds: dict[str, NonNegative]
+    execution_timeout_seconds: Positive
+    staging_timeout_seconds: Annotated[StrictInt, Field(ge=60, le=900)]
+    evidence: Annotated[str, Field(min_length=1)]
+    validation_state: Literal["unvalidated", "validated"]
+
+    @field_serializer("required_capabilities")
+    def sorted_capabilities(self, value):
+        return sorted(value)
 
 
 class Capacity(ResourceModel):

@@ -6,6 +6,9 @@ Shared contract + worker SDK for the [SynPusher](https://github.com/SyngularXR/S
 
 **Understand or improve worker pipelines →** [workflow documentation standard](docs/fleet/workflow-standard.md)
 
+Finite resident inference-resource ownership is a separate SDK foundation:
+[resident service grants](docs/resident-services.md). It is not deployed or enrolled.
+
 ## What this is
 
 One Python package consumed by three kinds of callers:

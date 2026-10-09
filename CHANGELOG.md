@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.19.0.dev49
+
+- Add finite resident service-resource grants without fabricated task or case
+  fields. Profiles share existing resource-budget validation; signed grants bind
+  authority, host/boot/engine epochs, model/configuration and destination scope.
+- Add service claim/ready/renew/status/release client messages with owned epoch
+  checks. Caller-persisted operation IDs survive transport retries; signed cleanup
+  and fresh host capacity remain separate from local engine termination.
+- Fence resident dispatch on expiry/revocation using a monotonic watchdog outside
+  the event loop. Trusted owned-stop and force-stop callbacks retain actual cleanup
+  outcomes; unknown or partial proof never establishes release.
+- Reuse the owned Docker launch journal for explicit service loading, exact engine
+  address and cleanup, including recorded prelaunch ownership. Recovery cannot
+  resume an old resident engine. This opt-in foundation is not enrolled/deployed;
+  platform reclaim and resource fit still require qualification.
+
 ## 0.19.0.dev48
 
 - Log a WARNING for each `WORKER_TASK_TIMEOUTS` key that is neither a task

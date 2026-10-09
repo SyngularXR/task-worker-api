@@ -9,3 +9,7 @@ for matched visual comparisons, Android rendering, generation timing,
 regression checks and upstream dependency reviews. See [CLAUDE.md](CLAUDE.md)
 for SDK development commands and
 [Fleet HQ](docs/fleet/README.md) for fleet configuration and runbooks.
+
+For resident inference-resource ownership, read
+[resident service grants](docs/resident-services.md); this SDK foundation is not
+enrolled or deployed and does not replace task admission.
