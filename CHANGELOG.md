@@ -2,6 +2,8 @@
 
 ## 0.19.0.dev51
 
+- Withdraw resident service dispatch and stop the owned engine on an
+  `attempt_fenced` renewal; hardware-report rejections retain the acknowledged lease.
 - Retain a new incident generation when the same ownership fault recurs after
   verified physical restoration or trusted idle inspection. Repeated failures
   within one unresolved episode still coalesce to the latest immutable incident.
