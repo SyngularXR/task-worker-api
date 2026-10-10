@@ -428,6 +428,49 @@ async def _ok_handler(ctx, params):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("body, kept_status", [
+    ({"status": 4}, "FAILED"),
+    ({"status": 5}, "CANCELLED"),
+    ({"status": 3}, None),
+    ({"status": 2}, None),
+    ({}, None),
+    (None, None),
+    ({"status": "4"}, None),
+    ({"status": []}, None),
+])
+async def test_worker_logs_backend_complete_status(
+    make_worker, tmp_path, caplog, body, kept_status,
+):
+    class CompleteResponseClient(FakeBackendClient):
+        async def complete(self, task_id, result):
+            await super().complete(task_id, result)
+            return body
+
+    client = CompleteResponseClient()
+    _queue_detect(client, tmp_path)
+    task_id = client._queue[0].id
+    worker = make_worker(client=client, handlers={TaskType.DETECT_CUT_PLANES: _ok_handler})
+    with caplog.at_level("INFO"):
+        assert await worker.run_one()
+
+    assert len(client.completed_tasks) == 1
+    assert client.failed_tasks == []
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    completed = [
+        r.getMessage() for r in caplog.records
+        if r.levelname == "INFO" and f"task {task_id} completed" in r.getMessage()
+    ]
+    if kept_status:
+        assert warnings == [
+            f"task {task_id}: backend kept status {kept_status}; did not record the result"
+        ]
+        assert completed == []
+    else:
+        assert warnings == []
+        assert completed == [f"task {task_id} completed (detect_cut_planes)"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("code", [400, 413, 422])
 async def test_worker_fails_task_when_complete_report_is_rejected(
     make_worker, tmp_path, code,
