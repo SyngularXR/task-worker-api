@@ -174,6 +174,47 @@ async def test_partition_expiry_stops_owned_engine_when_event_loop_blocked():
 
 
 @pytest.mark.asyncio
+async def test_renew_fenced_stops_owned_engine_before_expiry():
+    value=grant();client=LeaseClient(value,seconds=10)
+    renewed=asyncio.Event();withdrawn=threading.Event();stopped=threading.Event()
+    async def renew(*_):
+        renewed.set()
+        request=httpx.Request('POST','http://synthetic/services/renew')
+        raise httpx.HTTPStatusError('fenced',request=request,
+            response=httpx.Response(409,json={'code':'attempt_fenced'},request=request))
+    def stop():stopped.set();return proof(value)
+    client.service_renew=renew
+    owned=lease(value,client,withdrawn.set,stop)
+    async with owned:
+        await owned.ready(uuid4(),report(value))
+        assert owned.can_dispatch
+        # The unchanged cadence first renews a ten-second lease after about 2.5s.
+        await asyncio.wait_for(renewed.wait(),5)
+        assert await asyncio.to_thread(stopped.wait,2)
+        assert withdrawn.is_set() and not owned.can_dispatch
+    assert owned.wait_stopped()==proof(value)
+
+
+@pytest.mark.asyncio
+async def test_renew_stale_report_keeps_dispatch_until_acknowledged_expiry():
+    value=grant();client=LeaseClient(value,seconds=10)
+    renewed=asyncio.Event();withdrawn=threading.Event();stopped=threading.Event()
+    async def renew(*_):
+        renewed.set()
+        request=httpx.Request('POST','http://synthetic/services/renew')
+        raise httpx.HTTPStatusError('stale report',request=request,
+            response=httpx.Response(409,json={'code':'hardware_report_stale'},request=request))
+    client.service_renew=renew
+    owned=lease(value,client,withdrawn.set,stopped.set)
+    async with owned:
+        await owned.ready(uuid4(),report(value))
+        await asyncio.wait_for(renewed.wait(),5)
+        await asyncio.sleep(1)
+        assert owned.can_dispatch
+        assert not withdrawn.is_set() and not stopped.is_set()
+
+
+@pytest.mark.asyncio
 async def test_revocation_is_sticky_and_stalled_cleanup_forces_only_owned_callback():
     value=grant();blocked=threading.Event();forced=threading.Event()
     owned=lease(value,stop=lambda:blocked.wait(2),force=lambda:forced.set())

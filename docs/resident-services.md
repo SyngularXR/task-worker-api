@@ -26,7 +26,7 @@ flowchart TD
     ready --> serve["Worker / router: separately authorize bounded rounds"]
     serve --> renew["SDK: renew finite owned lease"]
     renew --> serve
-    revoke["Revocation, expiry, shutdown or unknown control state"] -.-> stop["Supervisor: fence dispatch and stop exact owned engine"]
+    revoke["Fenced renewal, revocation, expiry, shutdown or unknown control state"] -.-> stop["Supervisor: fence dispatch and stop exact owned engine"]
     lease -.-> stop
     serve -.-> stop
     stop --> proof["Supervisor: retain actual owned cleanup outcome"]
@@ -63,6 +63,7 @@ event loop. Independent threads call stop and, if reclaim stalls/fails, the exac
 owned force-stop callback. `wait_stopped()` waits no longer than the reclaim
 budget and returns a trusted `CleanupEvidence` or None (unknown). Callback
 completion, grant expiry and a closed socket never release the ledger.
+A renewal rejected with `attempt_fenced` immediately withdraws dispatch and stops the owned engine.
 
 ## Cleanup and recovery
 

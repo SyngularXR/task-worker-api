@@ -9,6 +9,9 @@ import contextlib
 import threading
 import time
 
+import httpx
+
+from .client import _rejection_code
 from .errors import ProtocolError
 from .resource_execution import _MAX_LEASE_RUNWAY_S
 from .resources import CleanupEvidence
@@ -167,6 +170,10 @@ class ResidentServiceLease:
             except ProtocolError:
                 self._lose()
                 return
+            except httpx.HTTPStatusError as exc:
+                if _rejection_code(exc) == 'attempt_fenced':
+                    self._lose()
+                    return
             except Exception:
                 pass  # A transient failure cannot extend acknowledged local ownership.
 
