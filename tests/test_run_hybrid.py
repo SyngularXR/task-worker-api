@@ -8,6 +8,7 @@ to the caller.  This module gives that public function its first coverage.
 from __future__ import annotations
 
 import asyncio
+import signal
 
 import pytest
 
@@ -51,6 +52,21 @@ async def test_app_exit_cancels_worker(tmp_path):
     # We can't assert on internal client state (it's a FakeBackendClient
     # whose close() is a no-op), but reaching this line without a timeout
     # proves cancellation worked.
+
+
+@pytest.mark.asyncio
+async def test_run_hybrid_leaves_sigterm_to_the_app(tmp_path):
+    """uvicorn owns SIGTERM under run_hybrid; the worker must not install
+    its own run_forever handler there."""
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    seen = []
+
+    async def app():
+        await asyncio.sleep(0.05)  # worker is inside run_forever by now
+        seen.append(signal.getsignal(signal.SIGTERM))
+
+    await asyncio.wait_for(run_hybrid_safe(app(), _make_worker(tmp_path)), timeout=3.0)
+    assert seen == [signal.SIG_DFL]
 
 
 @pytest.mark.asyncio

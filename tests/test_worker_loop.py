@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
+import sys
 import threading
 import time
 
@@ -1696,6 +1699,56 @@ async def test_cancelled_worker_reports_shutdown_reason(
     ]
     assert len(cancelled_logs) == 1, [r.message for r in caplog.records]
     assert cancelled_logs[0].message == error
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals only")
+@pytest.mark.asyncio
+async def test_sigterm_reports_running_task_interrupted_and_returns(
+    make_worker, tmp_path, caplog,
+):
+    """docker stop on a standalone asyncio.run(worker.run_forever()) worker:
+    SIGTERM must land the running task as interrupted and let run_forever
+    return normally (exit 0), not leave it IN_PROGRESS for the sweeper."""
+    class _ResignalingFailClient(FakeBackendClient):
+        async def fail(self, task_id: int, error: str) -> None:
+            # A second SIGTERM mid-report must not cancel the report.
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(0.05)
+            await super().fail(task_id, error)
+
+    fake_client = _ResignalingFailClient()
+    # Guards: a real SIGTERM with no handler installed would kill pytest.
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    (tmp_path / "fake.stl").write_bytes(b"solid\nendsolid\n")
+    fake_client.queue_task(
+        task_type=TaskType.DETECT_CUT_PLANES,
+        params={"input_path": str(tmp_path / "fake.stl")},
+    )
+
+    async def handler(ctx, params):
+        assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(60)
+        return {}  # pragma: no cover — cancelled first
+
+    worker = make_worker(
+        client=fake_client,
+        handlers={TaskType.DETECT_CUT_PLANES: handler},
+    )
+    with caplog.at_level("WARNING"):
+        await asyncio.wait_for(worker.run_forever(), timeout=5)
+
+    assert fake_client.completed_tasks == []
+    assert len(fake_client.failed_tasks) == 1
+    task_id = str(fake_client.failed_tasks[0]["task_id"])
+    assert fake_client.failed_tasks[0]["error"] == (
+        f"worker shut down before task {task_id} finished; the task was "
+        "interrupted, not attempted-and-failed"
+    )
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    sigterm_logs = [r for r in caplog.records if "SIGTERM received" in r.message]
+    assert len(sigterm_logs) == 2, [r.message for r in sigterm_logs]
+    assert "already stopping" in sigterm_logs[1].message
 
 
 class _HangingFailClient(FakeBackendClient):
