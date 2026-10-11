@@ -109,6 +109,8 @@ flowchart TD
     handler --> outputs["SDK: validate declared output filenames and sources; upload attempt artifacts"]
     outputs --> commit["SDK / backend: commit attempt result"]
     commit --> reconcile["Supervisor: reconcile outcome, prove cleanup and acknowledge release"]
+    commit -->|manifest or artifact refusal; lease live| failure["SDK: report failure naming refusal code"]
+    failure --> reconcile
     commit --> finalizer["Backend: trusted finalizer consumes committed artifacts for publication"]
     cancel["Lease loss or cancellation"] -.-> handler
     cancel -.-> reconcile
@@ -119,6 +121,12 @@ distinct responsibilities. Do not substitute this route for polling, or imply
 an adapter is deployed because `run_admitted` exists. Staging failures before
 start acknowledgement are reconciled by the supervisor, not failed as started
 compute. The SDK entrypoint imports the handler only after start acknowledgement.
+
+A completion rejected with `invalid_output_manifest` or `artifact_not_committed`
+is recorded as rejected in the private claim journal. While the lease is live,
+the worker reports a failure naming that code, then propagates the refusal.
+Recovery skips the refused completion and reconciles the failure before release.
+Ambiguous transport errors retain the original completion for replay.
 
 After handler configuration changes, the same worker instance replays its pending
 claim with the original request ID and task types before claiming under the new

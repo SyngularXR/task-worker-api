@@ -84,6 +84,8 @@ _TERMINAL_MIN_ATTEMPTS = 6
 # Named 409 precondition failures on which the backend rolls back the
 # transaction, so the journaled operation may rotate to fresh evidence.
 _REJECTED_OBSERVATION_CODES = ("hardware_report_stale", "hardware_report_replayed", "cleanup_evidence_stale")
+# Completion refusals roll back too, but cannot rotate to a new result.
+_REJECTED_COMPLETE_CODES = ("invalid_output_manifest", "artifact_not_committed")
 # The subset caused only by the request's host report: a fresh report can fix it.
 _REJECTED_REPORT_CODES = ("hardware_report_stale", "hardware_report_replayed")
 
@@ -1320,7 +1322,7 @@ class BackendClient:
             # These named precondition failures roll back the backend transaction.
             # Timeouts, 5xx, fencing and idempotency conflicts remain unresolved.
             code = _rejection_code(exc)
-            if code in _REJECTED_OBSERVATION_CODES:
+            if code in _REJECTED_OBSERVATION_CODES or (kind == "complete" and code in _REJECTED_COMPLETE_CODES):
                 journal.record_operation(kind, operation_id, {"rejected": code})
             raise
         state = self._resource_state(claim, response, "operation response")
