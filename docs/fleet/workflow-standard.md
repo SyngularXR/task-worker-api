@@ -100,7 +100,7 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    backend["Backend: reserve admitted task and frozen input/profile"] --> supervisor["Supervisor: journal claim and launch assigned process/device scope"]
+    backend["Backend: reserve admitted task and frozen input/profile"] --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
     refused --> reconcile
@@ -119,6 +119,11 @@ distinct responsibilities. Do not substitute this route for polling, or imply
 an adapter is deployed because `run_admitted` exists. Staging failures before
 start acknowledgement are reconciled by the supervisor, not failed as started
 compute. The SDK entrypoint imports the handler only after start acknowledgement.
+
+After handler configuration changes, the same worker instance replays its pending
+claim with the original request ID and task types before claiming under the new
+types. A missing handler exits before start; the supervisor declines and releases
+the reservation. A different worker instance still cannot reuse the journal.
 
 Docker refusals for an expired staging deadline, a non-reserved attempt or an
 unsupported GPU backend record a `removed` launch in the private host journal,
