@@ -100,6 +100,51 @@ def test_claim_journal_survives_lost_response_and_process_restart(tmp_path):
     assert journal.prepare(instance, types).claim_request_id != req.claim_request_id
 
 
+@pytest.mark.parametrize("types", [{"a", "b"}, {"b"}])
+def test_claim_journal_replays_original_request_after_task_types_change(tmp_path, types):
+    path = tmp_path / "journal.sqlite"
+    instance = uuid4()
+    request = ClaimJournal(path).prepare(instance, frozenset({"a"}))
+    journal = ClaimJournal(path)
+    assert journal.prepare(instance, frozenset(types)) == request
+    assert journal.pending() == (request, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("types", [["a", "b"], ["b"], ["a"]])
+async def test_resource_claim_replays_original_request_on_wire(tmp_path, caplog, types):
+    path = tmp_path / "journal.sqlite"
+    instance = uuid4()
+    request = ClaimJournal(path).prepare(instance, frozenset({"a"}))
+    journal = ClaimJournal(path)
+    snapshot = HostSnapshot(host_id=uuid4(), boot_id=uuid4(), sequence=1,
+                            captured_at=datetime.now(timezone.utc), host_ram={"allocatable": 1, "available": 1},
+                            cpu_millicores=1, execution_scopes={}, scratch_pools={}, gpus={})
+    report = SignedHostReport(authority_id=uuid4(), epoch=1, report=snapshot, signature="0" * 64)
+    sent = []
+
+    def handle(wire_request):
+        sent.append(json.loads(wire_request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://test") as client:
+        backend = BackendClient("http://test", "test", client=client)
+        with caplog.at_level("WARNING", logger="task_worker_api.client"):
+            result, delay = await backend.resource_claim(journal, instance, iter(types), report)
+    assert result is None and delay == 5.0
+    assert sent == [{**request.model_dump(mode="json"), "host_report": report.model_dump(mode="json")}]
+    assert journal.pending() == (request, {"claim": None})
+    warnings = [record for record in caplog.records if record.name == "task_worker_api.client"]
+    assert len(warnings) == (types != ["a"])
+    if warnings:
+        assert warnings[0].levelname == "WARNING"
+        assert "under its original task types ['a'] first" in warnings[0].getMessage()
+    journal.acknowledge_no_work(request.claim_request_id)
+    next_request = journal.prepare(instance, frozenset(types))
+    assert next_request.claim_request_id != request.claim_request_id
+    assert next_request.task_types == frozenset(types)
+
+
 @pytest.mark.asyncio
 async def test_v2_claim_poll_hint_and_its_retry_sleep_have_separate_caps(tmp_path, monkeypatch):
     """The 204's Retry-After is a poll interval, held to the poll-hint ceiling;

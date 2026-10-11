@@ -1197,7 +1197,11 @@ class BackendClient:
         """
         from .resources import ClaimResult
 
-        request = journal.prepare(worker_instance_id, frozenset(task_types))
+        task_types = frozenset(task_types)
+        request = journal.prepare(worker_instance_id, task_types)
+        if request.task_types != task_types:
+            log.warning("Replaying pending claim %s under its original task types %s first; current task types are %s",
+                        request.claim_request_id, sorted(request.task_types), sorted(task_types))
         body = {**request.model_dump(mode="json"), "host_report": host_report.model_dump(mode="json")}
         response = await self._resource_request("POST", "/tasks/claim", json=body)
         if response.status_code == 204:
