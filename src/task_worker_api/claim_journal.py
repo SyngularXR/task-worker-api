@@ -37,7 +37,7 @@ The worker must reconcile an existing entry on restart before requesting work.
             row = db.execute("SELECT request FROM claim WHERE id=1").fetchone()
             if row:
                 request = ClaimRequest.model_validate_json(row[0])
-                if request.worker_instance_id != worker_instance_id or request.task_types != task_types:
+                if request.worker_instance_id != worker_instance_id:
                     raise AdmissionError("previous_claim_unresolved")
             else:
                 request = ClaimRequest(protocol_version=2, worker_instance_id=worker_instance_id,
