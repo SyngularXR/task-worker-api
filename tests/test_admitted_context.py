@@ -306,7 +306,7 @@ class _Lease:
     is_cancelled = False
 
 
-def _oversized_attempt(tmp_path, result):
+def _oversized_attempt(tmp_path, result, *, respond=None):
     """Worker + real journal/client wired for one admitted attempt returning ``result``."""
     from datetime import datetime, timedelta, timezone
 
@@ -329,6 +329,10 @@ def _oversized_attempt(tmp_path, result):
     def handle(request):
         seen.append(request.url.path)
         bodies.append(request.content)
+        if respond is not None:
+            response = respond(request)
+            if response is not None:
+                return response
         if request.url.path == "/workers/ready":
             return httpx.Response(200, json={
                 "worker_instance_id": str(claim.ownership.worker_instance_id), "ready": True})
@@ -348,6 +352,52 @@ def _oversized_attempt(tmp_path, result):
         return result
 
     return claim, journal, backend, transport, seen, bodies, handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,code,cancelled", [
+    (409, "invalid_output_manifest", False),
+    (409, "artifact_not_committed", False),
+    (409, "artifact_not_committed", True),
+    (409, "attempt_fenced", False),
+    (409, "lease_expired", False),
+    (409, "idempotency_conflict", False),
+    (422, "invalid_output_manifest", False),
+])
+async def test_refused_complete_reports_the_code_as_fail(monkeypatch, tmp_path, status, code, cancelled):
+    def respond(request):
+        if request.url.path == "/tasks/1/complete":
+            assert request.method == "PUT"
+            return httpx.Response(status, json={"code": code})
+
+    claim, journal, backend, transport, seen, bodies, handler = _oversized_attempt(
+        tmp_path, {}, respond=respond)
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", _Lease)
+    monkeypatch.setattr(_Lease, "is_cancelled", cancelled)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", AsyncMock(return_value=files))
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=backend,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+
+    async with transport:
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
+
+        assert caught.value.request.url.path == "/tasks/1/complete"
+        assert caught.value.response.status_code == status
+        refused = status == 409 and code in ("invalid_output_manifest", "artifact_not_committed")
+        if not refused or cancelled:
+            assert seen == ["/tasks/1/complete"]
+            assert [kind for kind, _ in journal.unresolved_operations()] == ([] if refused else ["complete"])
+            return
+        assert seen == ["/tasks/1/complete", "/tasks/1/fail"]
+        assert journal.unresolved_operations() == []
+        assert json.loads(bodies[1])["error"] == f"backend rejected the complete report: {code}"
+        assert json.loads(bodies[1])["failure_kind"] == "error"
+        assert await backend.resource_recover_operations(journal) == []
+        assert seen == ["/tasks/1/complete", "/tasks/1/fail"]
 
 
 @pytest.mark.asyncio

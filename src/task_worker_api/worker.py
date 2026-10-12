@@ -39,7 +39,7 @@ from typing import Awaitable, Callable, Optional
 import httpx
 
 from .cancel import CancelGuard
-from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD, _REJECTED_REPORT_CODES, _rejection_code
+from .client import BackendClient, _DEFAULT_BACKOFF_MAX_S, _JITTER_SPREAD, _REJECTED_COMPLETE_CODES, _REJECTED_REPORT_CODES, _rejection_code
 from .context import ClaimedTask, TaskContext
 from .enums import TaskStatus, TaskType
 from .errors import ProtocolError, TaskCancelled, TaskParamsError
@@ -1239,7 +1239,7 @@ class Worker:
                         uploaded.add(filename)
                 except Exception as exc:
                     # Only pre-publication failure selects fail. Once a terminal
-                    # request is transmitted, its durable operation alone is replayed.
+                    # request is transmitted, replay it unless explicitly refused below.
                     # And only a *started* attempt whose lease is still live may be
                     # failed at all — the same rule the interrupt arm below states,
                     # which holds for every exception and not just a cancel. Lease
@@ -1334,7 +1334,14 @@ class Worker:
                             await client.resource_operation(journal, "fail",
                                 {"error": reason, "failure_kind": "error"})
                     raise
-                await client.resource_operation(journal, "complete", {"result": result})
+                try:
+                    await client.resource_operation(journal, "complete", {"result": result})
+                except httpx.HTTPStatusError as exc:
+                    code = _rejection_code(exc)
+                    if code in _REJECTED_COMPLETE_CODES and not lease.is_cancelled:
+                        await client.resource_operation(journal, "fail", {
+                            "error": f"backend rejected the complete report: {code}", "failure_kind": "error"})
+                    raise
             finally:
                 try:
                     clean = await _cuda_cleanup_with_timeout(self.timeout_grace_s)

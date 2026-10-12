@@ -111,6 +111,8 @@ flowchart TD
     outputs -->|invalid result| failure["SDK: report failure while started attempt lease is live"]
     failure --> reconcile
     commit --> reconcile["Supervisor: reconcile outcome, prove cleanup and acknowledge release"]
+    commit -->|manifest or artifact refusal; lease live| failure["SDK: report failure naming refusal code"]
+    failure --> reconcile
     commit --> finalizer["Backend: trusted finalizer consumes committed artifacts for publication"]
     cancel["Lease loss or cancellation"] -.-> handler
     cancel -.-> reconcile
@@ -121,6 +123,12 @@ distinct responsibilities. Do not substitute this route for polling, or imply
 an adapter is deployed because `run_admitted` exists. Staging failures before
 start acknowledgement are reconciled by the supervisor, not failed as started
 compute. The SDK entrypoint imports the handler only after start acknowledgement.
+
+A completion rejected with `invalid_output_manifest` or `artifact_not_committed`
+is recorded as rejected in the private claim journal. While the lease is live,
+the worker reports a failure naming that code, then propagates the refusal.
+Recovery skips the refused completion and reconciles the failure before release.
+Ambiguous transport errors retain the original completion for replay.
 
 Admitted results must also encode with `json.dumps(..., allow_nan=False)` before
 the complete operation reaches the private worker journal. A NaN or Infinity
