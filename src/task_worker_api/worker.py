@@ -1208,6 +1208,10 @@ class Worker:
                     result = result or {}
                     if _result_encode_error(result) is not None:
                         raise ProtocolError("handler result cannot be encoded")
+                    try:
+                        json.dumps(result, allow_nan=False)
+                    except ValueError as exc:
+                        raise ProtocolError(f"handler result cannot be journaled: {exc}") from exc
                     size = _result_body_bytes(result)
                     if size > _MAX_RESULT_BODY_BYTES:
                         raise ProtocolError(
