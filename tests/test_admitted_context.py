@@ -438,6 +438,34 @@ async def test_oversized_result_fails_the_attempt_before_it_is_journaled(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "negative_inf"])
+async def test_nan_result_fails_the_attempt_before_it_is_journaled(monkeypatch, tmp_path, value):
+    claim, journal, backend, transport, seen, bodies, handler = _oversized_attempt(
+        tmp_path, {"psnr": value})
+    files = FileContext(tmp_path, tmp_path, tmp_path / "mesh.stl")
+
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    monkeypatch.setattr("task_worker_api.resource_execution.AttemptLease", _Lease)
+    monkeypatch.setattr("task_worker_api.files.prepare_admitted_inputs", AsyncMock(return_value=files))
+    monkeypatch.setattr("task_worker_api.worker._cuda_cleanup_with_timeout", AsyncMock(return_value=True))
+    # Older httpx accepts non-finite floats; exercise that path on any installed version.
+    monkeypatch.setattr("task_worker_api.worker._result_encode_error", lambda result: None)
+    monkeypatch.setattr("task_worker_api.worker._result_body_bytes", lambda result: 0)
+    worker = Worker(backend_url="http://test", api_key="test", worker_id="test", client=backend,
+                    work_dir=str(tmp_path), handlers={TaskType.MODEL_INITIALIZING: handler})
+
+    with pytest.raises(ProtocolError, match="cannot be journaled.*not JSON compliant"):
+        await worker.run_admitted_attempt(claim, journal, AsyncMock(return_value=None))
+    await transport.aclose()
+
+    assert seen == ["/tasks/1/fail"]
+    assert journal.unresolved_operations() == []
+    error = json.loads(bodies[0])["error"]
+    assert error.startswith("ProtocolError: handler result cannot be journaled:")
+    assert "not JSON compliant" in error
+
+
+@pytest.mark.asyncio
 async def test_a_normal_result_still_completes(monkeypatch, tmp_path):
     """The limit only rejects bodies the wire cannot carry."""
     claim, journal, backend, transport, seen, bodies, handler = _oversized_attempt(

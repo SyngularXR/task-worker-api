@@ -625,6 +625,13 @@ Before you cut a release:
 - [ ] Cancel test: submit a long task, hit cancel from the dashboard,
       confirm the row goes to CANCELLED and your subprocess / thread
       actually stops.
+- [ ] Container stop grace (`docker stop -t`, compose `stop_grace_period`)
+      is above `timeout_grace_s` (default 15s). On SIGTERM, `run_forever`
+      cancels the running task and reports it failed as interrupted,
+      bounded by `timeout_grace_s`; a shorter grace SIGKILLs the process
+      before that report lands and the task sits IN_PROGRESS until the
+      stale sweeper fails it. (Skipped when SIGTERM already has a handler,
+      off the main thread, and under `run_hybrid`, where uvicorn owns it.)
 
 ---
 

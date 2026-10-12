@@ -106,8 +106,10 @@ flowchart TD
     refused --> reconcile
     stage --> start["SDK / backend: acknowledge start with host report and input digest"]
     start --> handler["Handler: compute inside attempt storage under lease"]
-    handler --> outputs["SDK: validate declared output filenames and sources; upload attempt artifacts"]
+    handler --> outputs["SDK: validate result for wire and journal; validate declared outputs; upload attempt artifacts"]
     outputs --> commit["SDK / backend: commit attempt result"]
+    outputs -->|invalid result| failure["SDK: report failure while started attempt lease is live"]
+    failure --> reconcile
     commit --> reconcile["Supervisor: reconcile outcome, prove cleanup and acknowledge release"]
     commit -->|manifest or artifact refusal; lease live| failure["SDK: report failure naming refusal code"]
     failure --> reconcile
@@ -127,6 +129,11 @@ is recorded as rejected in the private claim journal. While the lease is live,
 the worker reports a failure naming that code, then propagates the refusal.
 Recovery skips the refused completion and reconciles the failure before release.
 Ambiguous transport errors retain the original completion for replay.
+
+Admitted results must also encode with `json.dumps(..., allow_nan=False)` before
+the complete operation reaches the private worker journal. A NaN or Infinity
+accepted by older httpx becomes a fail report naming the serialization error;
+the supervisor still owns cleanup and release.
 
 After handler configuration changes, the same worker instance replays its pending
 claim with the original request ID and task types before claiming under the new

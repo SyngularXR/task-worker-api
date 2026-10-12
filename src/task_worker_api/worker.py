@@ -23,6 +23,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import threading
@@ -786,6 +787,11 @@ class Worker:
             # used as-is; we don't reach in and rewrite its state.
             self._client = client
         self._stop = asyncio.Event()
+        # run_forever's SIGTERM handling (see _install_sigterm_handler).
+        # run_hybrid clears _sigterm_enabled so uvicorn keeps its own handler.
+        self._sigterm_enabled = True
+        self._sigterm_received = False
+        self._sigterm_target: Optional[asyncio.Task] = None
         # Consecutive failed claim round-trips; drives the escalating idle
         # wait in run_forever. Reset by any claim that reaches the backend.
         self._claim_failures = 0
@@ -905,6 +911,7 @@ class Worker:
         # buried in "Task was destroyed but it is pending" and
         # unclosed-socket noise.
         cleanup_task: Optional[asyncio.Task] = None
+        sigterm_loop = self._install_sigterm_handler()
         try:
             self.work_dir.mkdir(parents=True, exist_ok=True)
             log.info(
@@ -978,7 +985,18 @@ class Worker:
                     continue
                 task, target = claimed
                 await self._run_one(task, target)
+        except asyncio.CancelledError:
+            if not self._sigterm_received:
+                raise
+            # Our own SIGTERM cancel: the interrupted task has been reported,
+            # so swallow it and return so asyncio.run(...) exits 0.
+            uncancel = getattr(asyncio.current_task(), "uncancel", None)
+            if uncancel is not None:  # 3.11+
+                uncancel()
         finally:
+            # Synchronously, before any await: a SIGTERM from here on must not
+            # cancel teardown (it would abort client.close()).
+            self._sigterm_target = None
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 try:
@@ -995,7 +1013,51 @@ class Worker:
                     await tgt.client.close()
                 except Exception:  # noqa: BLE001 — shutdown is best-effort
                     log.warning("failed to close client for %s", tgt.label)
+            if sigterm_loop is not None:
+                # Back to SIG_DFL, which is what install required it to be.
+                sigterm_loop.remove_signal_handler(signal.SIGTERM)
             log.info("task-worker-api Worker stopped: id=%s", self.worker_id)
+
+    def _install_sigterm_handler(self) -> Optional[asyncio.AbstractEventLoop]:
+        """Turn SIGTERM into a one-shot cancel of the run_forever task.
+
+        Standalone workers run asyncio.run(worker.run_forever()) with no
+        handler of their own, so docker stop killed the process outright (or,
+        as PID 1, ignored SIGTERM until SIGKILL) and the running task never
+        reached _execute_one's interrupted-report path: it sat IN_PROGRESS
+        until the stale sweeper failed it. Only installs where it cannot
+        clobber anyone: main thread, POSIX, SIGTERM still SIG_DFL.
+        """
+        self._sigterm_received = False
+        self._sigterm_target = asyncio.current_task()
+        if (
+            not self._sigterm_enabled
+            or sys.platform == "win32"
+            or threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+        ):
+            return None
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGTERM, self._on_sigterm)
+        except NotImplementedError:
+            return None
+        return loop
+
+    def _on_sigterm(self) -> None:
+        self._stop.set()
+        target = self._sigterm_target
+        if self._sigterm_received or target is None:
+            # Cancel at most once, and never during teardown: a second cancel
+            # would abort the in-flight interrupted fail() report.
+            log.warning("SIGTERM received; worker is already stopping")
+            return
+        self._sigterm_received = True
+        log.warning(
+            "SIGTERM received; worker %s is cancelling its running task and "
+            "reporting it interrupted", self.worker_id,
+        )
+        target.cancel()
 
     async def _verify_home_affinity(self) -> None:
         """Volume-affinity check: is SYNPUSHER_URL really the box whose volume
@@ -1146,6 +1208,10 @@ class Worker:
                     result = result or {}
                     if _result_encode_error(result) is not None:
                         raise ProtocolError("handler result cannot be encoded")
+                    try:
+                        json.dumps(result, allow_nan=False)
+                    except ValueError as exc:
+                        raise ProtocolError(f"handler result cannot be journaled: {exc}") from exc
                     size = _result_body_bytes(result)
                     if size > _MAX_RESULT_BODY_BYTES:
                         raise ProtocolError(
@@ -1929,6 +1995,8 @@ async def run_hybrid(
     3.10 and can't easily jump to 3.11; raising the SDK's floor would
     strand that consumer.
     """
+    # uvicorn owns SIGTERM here; its exit cancels the worker below.
+    worker._sigterm_enabled = False
     app_task = asyncio.ensure_future(app_coro)
     worker_task = asyncio.ensure_future(worker.run_forever())
     try:

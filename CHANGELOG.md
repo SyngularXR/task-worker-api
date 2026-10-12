@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.0.dev52
+
+- `Worker.run_forever` now handles SIGTERM (main thread, POSIX, only when
+  SIGTERM is still `SIG_DFL`; not under `run_hybrid`): it cancels itself once,
+  reports the running task failed as interrupted, and returns normally so
+  `asyncio.run(worker.run_forever())` exits 0. Set the container stop grace
+  above `timeout_grace_s` (default 15s) so that report can land.
+
 ## 0.19.0.dev51
 
 - Withdraw resident service dispatch and stop the owned engine on an
