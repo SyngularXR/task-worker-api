@@ -11,6 +11,7 @@ This is the central reference for every `task-worker-api` consumer in the Syngul
 | [`conventions.md`](conventions.md) | Fleet-wide conventions: dep pinning style, env var contract, `shared_volume_path` wiring, payload logging | Worker repo authors |
 | [`workflow-standard.md`](workflow-standard.md) | Common workflow diagram format, SDK lifecycle reference and improvement evidence rules | Agents, worker authors and reviewers |
 | [`improvement-scopes.md`](improvement-scopes.md) | Per-worker improvement scopes, visual/Android performance gates, defect checks and upstream review contract | Agents, worker authors and reviewers |
+| [`review-ledger.md`](review-ledger.md) | Dated review coverage and links to worker defect/dependency ledgers; measured evidence and unresolved comparisons | Agents and reviewers |
 | [`runbooks/sdk-upgrade.md`](runbooks/sdk-upgrade.md) | Step-by-step playbook for bumping `task-worker-api` across the fleet | Anyone shipping an SDK release |
 | [`runbooks/local-testing.md`](runbooks/local-testing.md) | Pull latest worker images and restart the local compose stack | Dev box / staging operators |
 | [`runbooks/debugging-with-payload-logs.md`](runbooks/debugging-with-payload-logs.md) | Replay captured task envelopes for reproducing bugs | Worker debuggers |
@@ -23,6 +24,8 @@ All worker diagrams follow the [workflow documentation standard](workflow-standa
 Agents should read it first, then the current guide and its linked implementation.
 Apply the [improvement scopes](improvement-scopes.md) when proposing quality,
 generation-speed, real-time performance, dependency or bug-fix changes.
+Check the [review ledger](review-ledger.md) and owning worker ledger to avoid
+repeating evaluated candidates or active Fleet work.
 The guides distinguish source behavior from deployed images, and identify SDK,
 handler/child and backend publication ownership consistently.
 
