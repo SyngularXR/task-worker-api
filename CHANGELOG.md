@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0.dev53
+
+- Payload logs now write only standard JSON lines: `NaN`, `Infinity` and
+  `-Infinity` in task params or raw envelopes are written as the string markers
+  `"NaN"`, `"Infinity"`, `"-Infinity"` instead of bare tokens that `jq` rejects.
+  Finite records are unchanged byte-for-byte; size caps measure the final line.
+
 ## 0.19.0.dev52
 
 - `Worker.run_forever` now handles SIGTERM (main thread, POSIX, only when

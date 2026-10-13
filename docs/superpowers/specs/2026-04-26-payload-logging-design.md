@@ -156,7 +156,7 @@ The file handle is held open across calls to avoid open/close overhead per task 
 
 I/O is synchronous — one append per task, microseconds, on a polling loop that already does HTTP round-trips. Async wrapping would add complexity for no measurable gain.
 
-JSON serialization uses `json.dumps(record, default=str)` so non-JSON-native values inside `params` (e.g., `Path`, `datetime`) don't crash `record()`. If even `default=str` raises, the failure is caught in the outer try/except per the failure-mode contract above.
+JSON serialization uses `json.dumps(record, default=str)` so non-JSON-native values inside `params` (e.g., `Path`, `datetime`) don't crash `record()`. If even `default=str` raises, the failure is caught in the outer try/except per the failure-mode contract above. Encoding also uses `allow_nan=False` so every line is standard JSON (strict readers such as `jq` reject bare `NaN`/`Infinity`); if that rejects a record, non-finite floats (values and dict keys) are rewritten as the string markers `"NaN"`, `"Infinity"`, `"-Infinity"` and the record is encoded again. Finite records encode byte-for-byte as before, and both size-cap stages measure this final encoded form.
 
 ### `Worker` integration (`src/task_worker_api/worker.py`)
 
@@ -210,7 +210,7 @@ Pure-unit tests against `PayloadLogger` (using `tmp_path` for the root):
 - **Cleanup on rollover.** Drive `_now` across midnight; assert `cleanup_old_files` ran after the new file opened.
 - **Cleanup race tolerance.** Two `PayloadLogger` instances on the same root; both call `cleanup_old_files()` against a pre-existing expired file; both return without raising. Use a stub `os.remove` that raises `FileNotFoundError` on the second call.
 - **Filename uniqueness across processes.** Two `PayloadLogger`s with the same `worker_id`, different injected PIDs / boot_ids; each writes 100 records; assert directory contains two `payloads-*.jsonl` files, each with 100 valid JSON lines.
-- **JSON serialization fallback.** `params` containing a `Path` and a `datetime` round-trips via `default=str` without raising.
+- **JSON serialization fallback.** `params` containing a `Path` and a `datetime` round-trips via `default=str` without raising. `NaN`/`Infinity`/`-Infinity` in `params` or a raw body produce a line a strict parser accepts, with string markers in their place.
 - **Per-record size cap.** A `params` field of 1MB triggers truncation; record contains `{"_truncated": true, "_original_size_bytes": N}`; first occurrence emits a WARNING, second is silent.
 - **Degraded mode.** Monkeypatch the file-open path to raise `OSError`. First `record()` call logs WARNING, subsequent silent; all calls return normally.
 - **Close idempotent.** `close()` called twice does not raise.
@@ -315,7 +315,7 @@ No changes. The override file currently only patches `nexus-core`; worker servic
 | `PayloadLogger.__init__` (bad worker_id) | `..`, slash, Windows reserved name in worker_id | yes (sanitization test) | yes (sanitized at construction) | none |
 | `Worker.__init__` (bad retention env) | `WORKER_PAYLOAD_LOG_RETENTION_DAYS=abc` or `0` | yes (env-fallback test) | yes (fallback to 14, WARNING) | clear startup log |
 | `PayloadLogger.record` (write) | Disk full, fs flap | yes (degraded test) | yes (one WARNING, then silent) | one log line |
-| `PayloadLogger.record` (json.dumps) | Non-serializable param | yes (default=str test) | yes (default=str fallback; outer try/except for residue) | none on happy path |
+| `PayloadLogger.record` (json.dumps) | Non-serializable param | yes (default=str test; non-finite tests) | yes (default=str fallback; non-finite floats become string markers; outer try/except for residue) | none on happy path |
 | `PayloadLogger.record` (oversized) | 1MB+ params blob | yes (size cap test) | yes (truncation marker) | one WARNING |
 | `PayloadLogger.cleanup_old_files` (race) | Two replicas unlink same file | yes (race tolerance test) | yes (per-file try/except) | none |
 | `BackendClient.claim_next` (from_dict) | Backend ships new task_type before workers update | yes (raw-envelope test) | yes (raw record + re-raise) | raw envelope captured |

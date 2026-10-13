@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -32,6 +33,31 @@ _WINDOWS_RESERVED = (
 # (huge worker_id, huge error string in raw stream) can't sneak past either.
 PAYLOAD_FIELD_CAP_BYTES = 224 * 1024
 RECORD_CAP_BYTES = 256 * 1024
+
+
+def _sanitize_non_finite(value: Any) -> Any:
+    """Replace non-finite floats (values and dict keys) with string markers."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return json.dumps(value)  # "NaN" / "Infinity" / "-Infinity"
+    if isinstance(value, dict):
+        return {
+            _sanitize_non_finite(k): _sanitize_non_finite(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_non_finite(v) for v in value]
+    return value
+
+
+def _encode_jsonl(value: Any) -> str:
+    """Encode ``value`` as one standard JSON line (no bare NaN/Infinity).
+
+    Finite data encodes byte-for-byte as ``json.dumps(value, default=str)``.
+    """
+    try:
+        return json.dumps(value, default=str, allow_nan=False)
+    except ValueError:
+        return json.dumps(_sanitize_non_finite(value), default=str, allow_nan=False)
 
 
 def sanitize_worker_id(worker_id: str) -> str:
@@ -240,7 +266,7 @@ class PayloadLogger:
         PAYLOAD_FIELD_CAP_BYTES, returns a small marker dict and the
         original byte count; otherwise returns the value unchanged.
         """
-        serialized = json.dumps(value, default=str)
+        serialized = _encode_jsonl(value)
         size = len(serialized.encode("utf-8"))
         if size > PAYLOAD_FIELD_CAP_BYTES:
             return {"_truncated": True, "_original_size_bytes": size}, size
@@ -250,7 +276,7 @@ class PayloadLogger:
         """Stage 2 of the size cap. The variable-size field has already been
         truncated by _maybe_truncate_field; this catches pathological wrappers
         (huge item_key, huge error string in raw stream)."""
-        line = json.dumps(record, default=str)
+        line = _encode_jsonl(record)
         if len(line.encode("utf-8")) <= RECORD_CAP_BYTES:
             return line
         original_size = len(line.encode("utf-8"))
@@ -264,7 +290,7 @@ class PayloadLogger:
             "stream": record.get("stream"),
             "captured_at": record.get("captured_at"),
         }
-        return json.dumps(replacement, default=str)
+        return _encode_jsonl(replacement)
 
     def _warn_truncated_once(
         self, task_id: Any, stage: str, size: int,

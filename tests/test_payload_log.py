@@ -456,3 +456,160 @@ def test_init_self_disables_on_mkdir_permission_error(tmp_path: Path, caplog, mo
     assert logger.enabled is False  # self-disabled
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert any("payload_log" in r.message and "mkdir" in r.message for r in warnings)
+
+
+# ----- strict JSON (non-finite floats) ---------------------------------------
+
+
+def _reject_constant(token: str):
+    raise AssertionError(f"bare {token} token is not standard JSON")
+
+
+def _strict_loads(line: str):
+    return json.loads(line, parse_constant=_reject_constant)
+
+
+def _strict_logger(tmp_path: Path) -> tuple[PayloadLogger, Path]:
+    root = tmp_path / "_worker_payloads" / "test-worker"
+    logger = PayloadLogger(
+        root=root, worker_id="test-worker", enabled=True,
+        _boot_id="deadbeef", _pid=lambda: 1, _now=_fixed_now,
+    )
+    return logger, root
+
+
+def _lines(root: Path, stream: str) -> list[str]:
+    return (
+        root / f"{stream}-2026-04-26-pid1-deadbeef.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+
+
+def test_record_writes_non_finite_params_as_string_markers(tmp_path: Path, caplog):
+    logger, root = _strict_logger(tmp_path)
+    nan, inf = float("nan"), float("inf")
+    params = {
+        "a": nan, "b": inf, "c": -inf, "n": [nan, 1.5], "t": (inf,),
+        "d": {"x": inf, "ok": "v"}, "keep": 3, "s": "NaN-free",
+    }
+    with caplog.at_level("WARNING"):
+        logger.record(_make_task(params=params))
+
+    [line] = _lines(root, "payloads")
+    entry = _strict_loads(line)
+    assert entry["params"] == {
+        "a": "NaN", "b": "Infinity", "c": "-Infinity", "n": ["NaN", 1.5],
+        "t": ["Infinity"], "d": {"x": "Infinity", "ok": "v"}, "keep": 3,
+        "s": "NaN-free",
+    }
+    assert entry["task_id"] == 1
+    assert entry["item_key"] == "case_42_scene_1"
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_finite_records_stay_byte_identical(tmp_path: Path):
+    logger, root = _strict_logger(tmp_path)
+    task = _make_task()
+    logger.record(task)
+    raw = {"id": 7, "task_type": 999, "params": {"k": "v", "f": 0.1}}
+    logger.record_raw(raw, error_type="ValueError", error="bad")
+
+    expected_typed = {
+        "captured_at": _fixed_now().isoformat(),
+        "stream": "typed",
+        "task_id": 1,
+        "task_type": "detect_cut_planes",
+        "case_id": 42,
+        "item_key": "case_42_scene_1",
+        "status": int(TaskStatus.IN_PROGRESS),
+        "params": task.params,
+        "worker_id": "test-worker",
+        "process_id": 1,
+        "boot_id": "deadbeef",
+    }
+    expected_raw = {
+        "captured_at": _fixed_now().isoformat(),
+        "stream": "raw",
+        "raw": raw,
+        "error_type": "ValueError",
+        "error": "bad",
+        "worker_id": "test-worker",
+        "process_id": 1,
+        "boot_id": "deadbeef",
+    }
+    typed_text = (root / "payloads-2026-04-26-pid1-deadbeef.jsonl").read_text(encoding="utf-8")
+    raw_text = (root / "raw_envelopes-2026-04-26-pid1-deadbeef.jsonl").read_text(encoding="utf-8")
+    assert typed_text == json.dumps(expected_typed, default=str) + "\n"
+    assert raw_text == json.dumps(expected_raw, default=str) + "\n"
+
+
+def test_field_cap_measures_sanitized_form(tmp_path: Path):
+    logger, root = _strict_logger(tmp_path)
+    params = {"v": [float("nan")] * 40000}
+    bare = len(json.dumps(params).encode("utf-8"))
+    sanitized = len(json.dumps({"v": ["NaN"] * 40000}).encode("utf-8"))
+    assert bare <= 224 * 1024 < sanitized  # only the sanitized form trips the cap
+
+    logger.record(_make_task(params=params))
+
+    [line] = _lines(root, "payloads")
+    entry = _strict_loads(line)
+    assert entry["params"] == {"_truncated": True, "_original_size_bytes": sanitized}
+
+
+def test_record_cap_applies_to_sanitized_record(tmp_path: Path):
+    logger, root = _strict_logger(tmp_path)
+    task = ClaimedTask(
+        id=99,
+        task_type=TaskType.DETECT_CUT_PLANES,
+        case_id=1,
+        item_key="X" * (300 * 1024),
+        status=TaskStatus.IN_PROGRESS,
+        params={"k": float("nan")},
+        worker_id="test-worker",
+    )
+    logger.record(task)
+
+    [line] = _lines(root, "payloads")
+    entry = _strict_loads(line)
+    assert entry["_record_truncated"] is True
+    assert entry["task_id"] == 99
+
+
+def test_record_raw_and_non_finite_keys_write_strict_lines(tmp_path: Path, caplog):
+    logger, root = _strict_logger(tmp_path)
+    with caplog.at_level("WARNING"):
+        logger.record_raw(
+            {"id": 7, "params": {"x": float("-inf")}},
+            error_type="ValueError", error="bad",
+        )
+        logger.record(_make_task(params={float("nan"): 1, float("inf"): 2, 1.5: 3}))
+
+    [raw_line] = _lines(root, "raw_envelopes")
+    assert _strict_loads(raw_line)["raw"] == {"id": 7, "params": {"x": "-Infinity"}}
+    [typed_line] = _lines(root, "payloads")
+    assert _strict_loads(typed_line)["params"] == {"NaN": 1, "Infinity": 2, "1.5": 3}
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_sanitizing_does_not_consume_io_warning(tmp_path: Path, caplog, monkeypatch):
+    import builtins
+    real_open = builtins.open
+    fail = {"on": False}
+
+    def fake_open(path, *args, **kwargs):
+        if fail["on"] and "_worker_payloads" in str(path):
+            raise OSError("disk full")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    logger, root = _strict_logger(tmp_path)
+    with caplog.at_level("WARNING"):
+        logger.record(_make_task(task_id=1, params={"x": float("nan")}))
+        logger.close()  # force the next record to reopen the file
+        fail["on"] = True
+        logger.record(_make_task(task_id=2))
+        logger.record(_make_task(task_id=3))
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "I/O failure" in warnings[0].message
