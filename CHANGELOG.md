@@ -6,6 +6,10 @@
   fields. Tasks carrying those values fail schema validation on claim before
   the segmentation handler runs. Defaults and optional `None` values are unchanged.
 
+- `DetectCutPlanesParams` rejects NaN and infinite values for `angle_tol_deg`,
+  `planar_tol_mm` and `min_area_mm2`. Tasks with these values now fail schema
+  validation at enqueue and on claim before the handler runs.
+
 ## 0.19.0.dev53
 
 - Payload logs now write only standard JSON lines: `NaN`, `Infinity` and

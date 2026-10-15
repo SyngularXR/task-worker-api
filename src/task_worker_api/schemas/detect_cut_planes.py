@@ -18,8 +18,8 @@ class DetectCutPlanesParams(TaskParamsBase):
         description="Absolute path to the input STL on the shared volume.",
     )
     max_results: int = Field(default=10, ge=1, le=100)
-    angle_tol_deg: float = Field(default=5.0, gt=0, le=90)
-    planar_tol_mm: float = Field(default=0.3, gt=0)
-    min_area_mm2: float = Field(default=20.0, ge=0)
+    angle_tol_deg: float = Field(default=5.0, gt=0, le=90, allow_inf_nan=False)
+    planar_tol_mm: float = Field(default=0.3, gt=0, allow_inf_nan=False)
+    min_area_mm2: float = Field(default=20.0, ge=0, allow_inf_nan=False)
     connected: bool = True
     connected_count: int = Field(default=3, ge=1)
