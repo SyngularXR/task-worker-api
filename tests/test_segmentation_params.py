@@ -1,12 +1,73 @@
 """SegmentationParams (widened in 0.9.0) — full one-shot field coverage."""
 import pytest
+from pydantic import ValidationError
 
 from task_worker_api.enums import TaskType
 from task_worker_api.schemas import TASK_PARAMS_SCHEMAS
 
 
+_FINITE_FLOAT_FIELDS = (
+    "min_volume_cm3",
+    "threshold",
+    "nms_iou",
+    "window_center",
+    "window_width",
+    "volume_threshold",
+    "grow_gradient_threshold",
+    "grow_intensity_sigma",
+)
+
+
 def _schema():
     return TASK_PARAMS_SCHEMAS[TaskType.SEGMENTATION]
+
+
+@pytest.mark.parametrize("field", _FINITE_FLOAT_FIELDS)
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"],
+)
+def test_rejects_non_finite_float(field, value):
+    with pytest.raises(ValidationError) as exc:
+        _schema()(input_path="/p", model="vista3d", output_dir="/o", **{field: value})
+    assert exc.value.errors()[0]["loc"] == (field,)
+    assert exc.value.errors()[0]["type"] == "finite_number"
+
+
+def test_accepts_negative_window_center_and_keeps_none():
+    params = dict(input_path="/p", model="vista3d", output_dir="/o")
+    p = _schema()(**params, window_center=-6.0)
+    assert p.window_center == -6.0
+    assert p.window_width is None
+    assert p.threshold == 0.5
+    p = _schema()(**params, window_center=None, window_width=None)
+    assert p.window_center is None
+    assert p.window_width is None
+
+
+async def test_worker_rejects_nan_threshold_before_handler(make_worker, fake_client):
+    task = fake_client.queue_task(
+        task_type=TaskType.SEGMENTATION,
+        params={
+            "input_path": "/p", "model": "vista3d", "output_dir": "/o",
+            "threshold": float("nan"),
+        },
+    )
+    called = []
+
+    async def handler(ctx, params):
+        called.append(params)
+        return {}
+
+    worker = make_worker(client=fake_client, handlers={TaskType.SEGMENTATION: handler})
+    await worker.run_one()
+
+    assert called == []
+    assert fake_client.completed_tasks == []
+    assert len(fake_client.failed_tasks) == 1
+    failure = fake_client.failed_tasks[0]
+    assert failure["task_id"] == task.id
+    assert "schema validation" in failure["error"]
+    assert "threshold" in failure["error"]
 
 
 def test_medsam3_params_roundtrip():

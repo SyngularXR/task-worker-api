@@ -49,7 +49,7 @@ class SegmentationParams(TaskParamsBase):
     result_frame: Optional[str] = Field(default=None, description="'primary' | 'native'.")
 
     # Shared knobs.
-    min_volume_cm3: float = 0.0
+    min_volume_cm3: float = Field(default=0.0, allow_inf_nan=False)
     boundary_smoothing: bool = True
     boundary_smoothing_strength: str = "balanced"
     bbox: Optional[list[int]] = None
@@ -57,11 +57,11 @@ class SegmentationParams(TaskParamsBase):
     # MedSAM3.
     prompt: Optional[str] = None
     axis: int = 0
-    threshold: float = 0.5
-    nms_iou: float = 0.5
-    window_center: Optional[float] = None
-    window_width: Optional[float] = None
-    volume_threshold: float = 0.1
+    threshold: float = Field(default=0.5, allow_inf_nan=False)
+    nms_iou: float = Field(default=0.5, allow_inf_nan=False)
+    window_center: Optional[float] = Field(default=None, allow_inf_nan=False)
+    window_width: Optional[float] = Field(default=None, allow_inf_nan=False)
+    volume_threshold: float = Field(default=0.1, allow_inf_nan=False)
     merge_regions: bool = False
     fill_empty_slices: bool = False
     max_fill_gap: int = 0
@@ -73,8 +73,8 @@ class SegmentationParams(TaskParamsBase):
     intensity_refine: bool = False
     grow_max_distance: int = 0
     grow_shrink_voxels: int = 0
-    grow_gradient_threshold: float = 0.0
-    grow_intensity_sigma: float = 0.0
+    grow_gradient_threshold: float = Field(default=0.0, allow_inf_nan=False)
+    grow_intensity_sigma: float = Field(default=0.0, allow_inf_nan=False)
     grow_debug: bool = False
     smooth_edge: bool = False
     smooth_seeds: bool = False
