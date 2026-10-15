@@ -1,10 +1,12 @@
 # Changelog
 
-## 0.19.0.dev54
+## 0.19.0.dev55
 
 - `SegmentationParams` now rejects NaN and infinite values for all eight float
   fields. Tasks carrying those values fail schema validation on claim before
   the segmentation handler runs. Defaults and optional `None` values are unchanged.
+
+## 0.19.0.dev54
 
 - `DetectCutPlanesParams` rejects NaN and infinite values for `angle_tol_deg`,
   `planar_tol_mm` and `min_area_mm2`. Tasks with these values now fail schema
