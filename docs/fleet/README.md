@@ -109,6 +109,8 @@ A SynPusher-Vue backend that wants to render a "fleet status" page or drive depl
 | A workflow stage, gate, budget, output or lifecycle boundary | The worker's maintained guide using [`workflow-standard.md`](workflow-standard.md); keep its README/AGENTS links current |
 | The SDK upgrade procedure | [`runbooks/sdk-upgrade.md`](runbooks/sdk-upgrade.md) |
 
+In each `sdk_pin.line_pattern`, `{version}` stands for `sdk_pin.version` without its leading `v`, so `v0.14.0` renders `.../releases/download/v0.14.0/task_worker_api-0.14.0-py3-none-any.whl`.
+
 ## Stale-detection
 
 If `workers.json`'s `sdk.current_release` doesn't match a worker's `sdk_pin.version`, that worker is behind. The SDK upgrade runbook automates the catch-up.
