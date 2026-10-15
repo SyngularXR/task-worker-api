@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev54
+
+- `SegmentationParams` now rejects NaN and infinite values for all eight float
+  fields. Tasks carrying those values fail schema validation on claim before
+  the segmentation handler runs. Defaults and optional `None` values are unchanged.
+
 ## 0.19.0.dev53
 
 - Payload logs now write only standard JSON lines: `NaN`, `Infinity` and
