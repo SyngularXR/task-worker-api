@@ -13,6 +13,8 @@ from enum import Enum, IntEnum
 class TaskType(str, Enum):
     """Recognised task types in the unified queue."""
 
+    VOLUME_RESAMPLE = "volume_resample"
+    FINALIZE_VOLUME = "finalize_volume"
     RENDER = "render"
     GS_BUILD = "gs_build"
     # 4D Gaussian Splatting build — one orchestrator over N cardiac phases with a

@@ -2,13 +2,13 @@
   "$schema_version": "1.0.0",
   "fleet_version": "1.0.0",
   "generated_at": "2026-08-25",
-  "description": "Machine-readable manifest of every task-worker-api consumer in the SyngularXR fleet. Source of truth for backend handler routing, deployment health checks, and SDK-upgrade automation. Fetch via the GitHub raw URL — see docs/fleet/README.md for the canonical link.",
+  "description": "Machine-readable manifest of every task-worker-api consumer in the SyngularXR fleet. Source of truth for backend handler routing, deployment health checks, and SDK-upgrade automation. Fetch via the GitHub raw URL \u00e2\u20ac\u201d see docs/fleet/README.md for the canonical link.",
   "sdk": {
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
     "current_release": "v0.19.0.dev41",
     "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.19.0.dev41",
-    "release_workflow": ".github/workflows/release.yml — publishes wheel + tag on every merge to main"
+    "release_workflow": ".github/workflows/release.yml \u00e2\u20ac\u201d publishes wheel + tag on every merge to main"
   },
   "workers": [
     {
@@ -18,18 +18,27 @@
       "image_tag_env": "NEURAL_CANVAS_TAG",
       "compose_service": "neural-canvas",
       "mode": "hybrid",
-      "mode_description": "Runs FastAPI app + task worker on one event loop via run_hybrid(). Falls back to FastAPI-only if SYNPUSHER_URL or WORKER_API_KEY are missing — safe for API-only deployments.",
-      "task_types": ["segmentation", "spatial_recon"],
+      "mode_description": "Hybrid FastAPI and polling worker; API-only when backend credentials are absent. volume_resample is admitted-only via src.sdk_handlers.volume_resample:run_admitted, is not registered by the hybrid poller, and is not enrolled/deployed by source availability.",
+      "task_types": [
+        "segmentation",
+        "spatial_recon",
+        "volume_resample"
+      ],
       "sdk_pin": {
         "style": "wheel_url",
-        "version": "v0.14.0",
+        "version": "v0.19.0.dev56",
         "file": "requirements.txt",
-        "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
+        "line_pattern": "https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },
       "env": {
-        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID"],
+        "required": [
+          "SYNPUSHER_URL",
+          "WORKER_API_KEY",
+          "WORKER_ID"
+        ],
         "optional": [
           "SHARED_VOLUME_PATH",
+          "NEURAL_CANVAS_MODELS_DIR",
           "WORKER_WORKDIR_CLEANUP_MIN_AGE_S",
           "WORKER_PAYLOAD_LOG_ENABLED",
           "WORKER_PAYLOAD_LOG_RETENTION_DAYS",
@@ -70,7 +79,11 @@
         "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },
       "env": {
-        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID"],
+        "required": [
+          "SYNPUSHER_URL",
+          "WORKER_API_KEY",
+          "WORKER_ID"
+        ],
         "optional": [
           "SHARED_VOLUME_PATH",
           "WORKER_WORKDIR",
@@ -96,7 +109,9 @@
       "compose_service": "assetbundle-builder-worker",
       "mode": "polling",
       "mode_description": "Standalone Worker.run_forever() polling loop. Gated on ENABLE_TASK_WORKER=true. Worker lives under worker/ in the Unity project repo.",
-      "task_types": ["deploy_case"],
+      "task_types": [
+        "deploy_case"
+      ],
       "sdk_pin": {
         "style": "wheel_url",
         "version": "v0.6.0",
@@ -104,7 +119,12 @@
         "line_pattern": "task-worker-api @ https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },
       "env": {
-        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID", "ENABLE_TASK_WORKER"],
+        "required": [
+          "SYNPUSHER_URL",
+          "WORKER_API_KEY",
+          "WORKER_ID",
+          "ENABLE_TASK_WORKER"
+        ],
         "optional": [
           "SHARED_VOLUME_PATH",
           "WORKER_WORKDIR",
@@ -128,7 +148,10 @@
       "compose_service": "colmap-splat-worker",
       "mode": "polling",
       "mode_description": "Standalone Worker.run_forever() polling loop. Image's baked-in CMD is ['--help'] (back-compat with legacy 'docker run colmap-splat --help' callers); worker mode is gated on ENABLE_TASK_WORKER=true env var.",
-      "task_types": ["gs_build", "spatial_gs_build"],
+      "task_types": [
+        "gs_build",
+        "spatial_gs_build"
+      ],
       "sdk_pin": {
         "style": "git_ref",
         "version": "v0.16.0",
@@ -137,7 +160,12 @@
         "build_dependency": "Dockerfile must pre-install hatchling (task-worker-api's PEP 517 backend) because requirements.txt installs run with --no-build-isolation for torch/CUDA pinning."
       },
       "env": {
-        "required": ["SYNPUSHER_URL", "WORKER_API_KEY", "WORKER_ID", "ENABLE_TASK_WORKER"],
+        "required": [
+          "SYNPUSHER_URL",
+          "WORKER_API_KEY",
+          "WORKER_ID",
+          "ENABLE_TASK_WORKER"
+        ],
         "optional": [
           "SHARED_VOLUME_PATH",
           "WORKER_WORKDIR",
@@ -161,7 +189,10 @@
     "compose_dir": "surgiclaw/",
     "shared_volume_env": "SHARED_DATA_PATH",
     "shared_volume_mount": "/app/shared",
-    "platforms": ["linux/amd64 (native)", "windows/amd64 (Docker Desktop / WSL2)"]
+    "platforms": [
+      "linux/amd64 (native)",
+      "windows/amd64 (Docker Desktop / WSL2)"
+    ]
   },
   "common_env_vars": {
     "WORKER_PAYLOAD_LOG_ENABLED": {
