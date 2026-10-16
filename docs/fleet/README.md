@@ -32,11 +32,11 @@ handler/child and backend publication ownership consistently.
 | Worker | Maintained workflow guide | Implemented scope |
 |---|---|---|
 | Blender | [Model build pipeline](https://github.com/SyngularXR/Blender-CLI/blob/main/docs/model-build-pipeline.md) | Initialization, cinematic baking and cut-plane detection; geometry/UV/bake budgets |
-| Neural-Canvas | [Worker task pipelines](https://github.com/SyngularXR/Neural-Canvas/blob/main/docs/guide/worker-pipelines.md) | Segmentation, spatial reconstruction and conditional synthetic dispatch |
+| Neural-Canvas | [Worker task pipelines](https://github.com/SyngularXR/Neural-Canvas/blob/main/docs/guide/worker-pipelines.md) | Segmentation, spatial reconstruction, conditional synthetic dispatch and admitted-only RAM2 volume resampling |
 | colmap-splat | [Gaussian build pipelines](https://github.com/SyngularXR/colmap-splat/blob/main/docs/worker-pipelines.md) | Scene/spatial builds, COLMAP/cache paths, training, export and cropping |
 | AssetBundle builder | [Bundle pipeline](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/blob/main/docs/worker-pipeline.md) | Snapshot/Unity build, licensing, validation, publication and measured timings |
-| Backend compute | [Admitted compute workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-compute-worker.md) | Render, GS4D phase preparation/sequence assembly and deploy snapshot preparation |
-| Backend finalizer | [Trusted publication workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-finalizer-worker.md) | Ten CPU finalizer routes, publication ownership, validation and recovery boundaries |
+| Backend compute | [Admitted compute workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-compute-worker.md) | Render, GS4D phase preparation/sequence assembly, deploy snapshots and fine-only volume preparation |
+| Backend finalizer | [Trusted publication workflows](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-finalizer-worker.md) | Eleven CPU finalizer routes, publication ownership, validation and recovery boundaries |
 | Synthetic reconstruction | [Synthetic pipeline](https://github.com/SyngularXR/synthetic-generator/blob/main/docs/worker-pipeline.md) | Input/ROI preparation, NiftyMIC reconstruction, volume output, admitted cleanup and DICOM publication handoff |
 | Visual tracking foundation | [Benchmark workflow](https://github.com/SyngularXR/visual-tracking-worker/blob/main/docs/worker-pipeline.md) | CPU protocol-control replay, independent evaluation and admitted adapter; not enrolled/deployed, no real tracker |
 

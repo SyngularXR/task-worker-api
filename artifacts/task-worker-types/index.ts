@@ -5,6 +5,8 @@
 // Enums ------------------------------------------------------
 
 export type TaskType =
+  | 'volume_resample'
+  | 'finalize_volume'
   | 'render'
   | 'gs_build'
   | 'gs4d_build'
@@ -32,6 +34,8 @@ export type TaskType =
 ;
 
 export const TaskType = {
+  VOLUME_RESAMPLE: 'volume_resample' as const,
+  FINALIZE_VOLUME: 'finalize_volume' as const,
   RENDER: 'render' as const,
   GS_BUILD: 'gs_build' as const,
   GS4D_BUILD: 'gs4d_build' as const,
@@ -101,6 +105,15 @@ export interface TaskEnvelope {
 }
 
 // Task param schemas ---------------------------------------
+
+export interface VolumeResampleParams {
+  input_path: string;
+  modality: 'CT' | 'CTA' | 'PET' | 'MRI';
+  method: 'ram2' | 'linear';
+  dicom_id: number;
+  job_id: string;
+  phase_files?: Record<string, string>;
+}
 
 export interface RenderParams {
   config_path: string;
@@ -353,6 +366,7 @@ export interface VisualTrackingParams {
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
+  'volume_resample': VolumeResampleParams;
   'render': RenderParams;
   'detect_cut_planes': DetectCutPlanesParams;
   'model_initializing': ModelInitializingParams;
