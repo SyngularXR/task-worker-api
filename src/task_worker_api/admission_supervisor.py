@@ -210,7 +210,7 @@ async def run(config_path):
         if "handlers" in config:
             raise ValueError("backend finalizer cannot register compute handlers")
         module = "src.services.resource_finalizer_worker"
-        task_types = ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep"]
+        task_types = ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume"]
         publication_directory = (config_path.parent / finalizer["publication_directory"]).resolve(strict=True)
         for name, target in (("artifact_root", "/run/committed-artifacts"),
                              ("response_key_file", "/run/backend-response-key"),
