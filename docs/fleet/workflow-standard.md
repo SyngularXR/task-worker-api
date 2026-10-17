@@ -160,6 +160,13 @@ not deployed host status; the Windows adapter has its own phase machine.
 
 ## Review and improvement procedure
 
+Windows host reporters use the operator-configured App Invoker `system_info_url`
+for host and Docker VM capacities. Observations must be fresh and successful;
+headroom is subtracted before signing. The native kernel boot GUID is stable
+across wall-clock correction, preserving the enrolled boot binding. Do not carry
+an older supervisor solely to retain a private reporter patch: the released
+adapter supports the current supervisor/finalizer task list.
+
 For each guide PR, verify relative source links, stage strings and counters,
 handler registration/gates, output producers/consumers and cleanup ownership.
 Review Mermaid branching and ownership; render it when graph complexity makes

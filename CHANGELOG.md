@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.0.dev57
+
+- Windows reporters read fresh host and Docker VM capacity from the installed
+  App Invoker system-info endpoint, with explicit headroom and no proxy/redirect
+  fallback. The kernel boot GUID preserves enrolled identity across clock changes.
+  This brings the maintained Windows adapter into the released SDK so supervisors
+  can upgrade for new task types without losing their resource reporter.
+
 ## 0.19.0.dev55
 
 - `SegmentationParams` now rejects NaN and infinite values for all eight float
