@@ -1,11 +1,14 @@
 # Changelog
 
+<<<<<<< HEAD
 ## 0.19.0.dev58
 
 - The admitted backend finalizer supervisor claims `finalize_volume`, matching
   the released task contract and trusted backend publication handler. Add a
   registration check against every finalizer task type to prevent future omissions.
 
+=======
+>>>>>>> origin/main
 ## 0.19.0.dev57
 
 - Windows reporters read fresh host and Docker VM capacity from the installed
