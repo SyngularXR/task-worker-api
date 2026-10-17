@@ -293,7 +293,7 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
 
     async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
         assert ready_calls == startup_failures + 1
-        assert types == ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep"]
+        assert types == ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume"]
         assert launch["command"][2] == "src.services.resource_finalizer_worker"
         assert launch["publication_directory"] == tmp_path / "publication"
         assert launch["environment"]["SHARED_DATA_PATH"] == "/app/shared"
@@ -413,7 +413,7 @@ def test_operator_model_settings_cannot_override_gpu_or_authority(tmp_path, monk
                             read_only_mounts={}, environment={name: "all"})
 
 
-@pytest.mark.parametrize("finalizer_type", ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep"])
+@pytest.mark.parametrize("finalizer_type", ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume"])
 def test_publication_mount_is_backend_cpu_only_and_inspected(tmp_path, monkeypatch, finalizer_type):
     instance, claim = supervisor(tmp_path, monkeypatch)
     publication = tmp_path / "publication"

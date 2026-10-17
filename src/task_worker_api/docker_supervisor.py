@@ -307,7 +307,7 @@ class DockerSupervisor:
         if publication_directory is not None:
             publication_directory = publication_directory.resolve(strict=True)
             if (service or claim.gpu_uuid is not None or claim.profile.gpu_count != 0
-                    or claim.task.task_type not in ("finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep")
+                    or claim.task.task_type not in ("finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume")
                     or command != ["python", "-m", "src.services.resource_finalizer_worker", "/run/worker-config.json"]):
                 raise ValueError("publication mount requires the backend CPU finalizer")
             if (not publication_directory.is_dir() or publication_directory == Path(publication_directory.anchor)
