@@ -53,47 +53,61 @@ def test_physical_boot_identity_is_stable(tmp_path):
     assert host_reporter.physical_boot_id(host, tmp_path) == host_reporter.physical_boot_id(host, tmp_path)
 
 
-@pytest.mark.parametrize("native,vm", [(True, False), (False, True), (True, True)])
-def test_windows_execution_scopes_share_measured_host_budget(monkeypatch, native, vm):
+@pytest.mark.parametrize("native", [False, True])
+def test_windows_execution_scopes_use_fresh_app_invoker_measurements(monkeypatch, native):
     boot = uuid4()
-    ram = Capacity(allocatable=24000, available=12000)
-    config = dict(host_id=str(uuid4()), boot_id=str(boot), ram_headroom_mib=8192,
-                  cpu_headroom_millicores=2000, gpu_headroom_mib={}, scratch_paths=[], scratch_headroom_mib={})
+    config = dict(host_id=str(uuid4()), boot_id=str(boot), ram_headroom_mib=1024,
+                  cpu_headroom_millicores=2000, gpu_headroom_mib={}, scratch_paths=[], scratch_headroom_mib={},
+                  system_info_url="http://localhost:50070/api/system/info")
     monkeypatch.setattr(host_reporter, "os", SimpleNamespace(name="nt"))
     monkeypatch.setattr(host_reporter, "physical_boot_id", lambda *args: boot)
-    monkeypatch.setattr(host_reporter, "windows_host_capacity", lambda **kwargs: (ram, 18000))
     monkeypatch.setattr(host_reporter, "nvidia_gpu_capacity", lambda *args: {})
     monkeypatch.setattr(host_reporter, "scratch_capacities", lambda *args, **kwargs: {})
-    monkeypatch.setattr(host_reporter.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    payload = {"success": True, "data": {"capturedAt": datetime.now(timezone.utc).isoformat(),
+        "host": {"ram": {"allocatable": 24000, "available": 12000}, "cpu_millicores": 20000},
+        "dockerVm": {"ram": {"allocatable": 8000, "available": 4000}, "cpu_millicores": 8000}}}
     calls = []
-    def collect_vm(argv, **kwargs):
-        assert kwargs["creationflags"] == 0x08000000  # no console flash every report tick
-        calls.append(argv)
-        return SimpleNamespace(stdout='{"execution_scopes":{"vm":{"ram":{"allocatable":8000,"available":4000},"cpu_millicores":4000}}}')
-    monkeypatch.setattr(host_reporter.subprocess, "run", collect_vm)
-    if vm:
-        config["vm_command"] = ["trusted-collector"]
+    def collect(url, **kwargs):
+        calls.append((url, kwargs))
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+    monkeypatch.setattr(host_reporter.httpx, "get", collect)
     if native:
         config["native_scope"] = "native"
     report = host_reporter._snapshot(config, 1)
-    assert report.host_ram == ram and report.cpu_millicores == 18000
-    assert set(report.execution_scopes) == ({"native"} if native else set()) | ({"vm"} if vm else set())
-    assert calls == ([["trusted-collector"]] if vm else [])
+    assert report.host_ram == Capacity(allocatable=22976, available=10976)
+    assert report.cpu_millicores == 18000
+    assert report.execution_scopes["/"].ram == Capacity(allocatable=6976, available=2976)
+    assert report.execution_scopes["/"].cpu_millicores == 6000
     if native:
-        scope = report.execution_scopes["native"]
-        assert scope.ram == ram and scope.cpu_millicores == 18000 and scope.parent is None
-    if vm:
-        assert report.execution_scopes["vm"].ram.available == 4000
-    for invalid in (None, "", " ", "x" * 256, []):
+        assert report.execution_scopes["native"].ram == report.host_ram
+    assert calls == [(config["system_info_url"], {"timeout": 7, "trust_env": False, "follow_redirects": False})]
+    for invalid in (None, "", " ", "x" * 256, [], "/"):
         with pytest.raises(ValueError, match="native scope"):
             host_reporter._snapshot({**config, "native_scope": invalid}, 2)
-    if vm:
-        with pytest.raises(ValueError, match="native scope"):
-            host_reporter._snapshot({**config, "native_scope": "vm"}, 2)
-    config.pop("native_scope", None)
-    config.pop("vm_command", None)
-    with pytest.raises(ValueError, match="requires an execution scope"):
+    payload["success"] = False
+    with pytest.raises(ValueError, match="unavailable"):
         host_reporter._snapshot(config, 2)
+    payload["success"] = True
+    payload["data"]["capturedAt"] = "2020-01-01T00:00:00+00:00"
+    with pytest.raises(ValueError, match="stale"):
+        host_reporter._snapshot(config, 2)
+    with pytest.raises(ValueError, match="headroom"):
+        host_reporter._snapshot({**config, "ram_headroom_mib": -1}, 2)
+
+
+def test_windows_boot_identity_uses_kernel_guid_not_clock(monkeypatch):
+    import ctypes
+    from uuid import uuid5
+    host, boot = uuid4(), uuid4()
+    def query(kind, buffer, length, returned):
+        assert kind == 90 and length == 32
+        ctypes.memmove(buffer, boot.bytes_le + bytes(16), 32)
+        returned._obj.value = 32
+        return 0
+    monkeypatch.setattr(host_reporter, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(host_reporter.ctypes, "WinDLL", lambda name: SimpleNamespace(NtQuerySystemInformation=query), raising=False)
+    assert host_reporter.physical_boot_id(host, None) == uuid5(host, str(boot))
+    assert host_reporter.physical_boot_id(host, None) == uuid5(host, str(boot))
 
 
 @pytest.mark.parametrize("headers, posts", [({"Retry-After": "21600"}, 2), ({}, 15)])

@@ -5,10 +5,11 @@ Only report_file is shared read-only with workers. Required fields: authority_id
 host_id, boot_id, epoch, backend_url (including /api/v1), signing_key_file,
 state_file, report_file, ram_headroom_mib, cpu_headroom_millicores,
 gpu_headroom_mib, scratch_headroom_mib, scratch_paths, and scope_paths (Linux)
-or native_scope and/or vm_command (Windows: native scope identifier and argv
-for the trusted Linux scope collector). Native capacity shares the host budget.
+or system_info_url and native_scope (Windows: local App Invoker system-info
+endpoint and native scope identifier). Native capacity shares the host budget.
 """
 import asyncio
+import ctypes
 from contextlib import closing, suppress
 from datetime import datetime, timezone
 import json
@@ -16,7 +17,6 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
-import subprocess
 import tempfile
 from time import monotonic
 from uuid import UUID, uuid5
@@ -26,10 +26,10 @@ import httpx
 from .client import _HEARTBEAT_RETRY_AFTER_MAX_S, _retry_after_delay
 from .host_resources import (
     linux_execution_scopes, linux_host_capacity, nvidia_gpu_capacity,
-    scratch_capacities, windows_host_capacity,
+    scratch_capacities,
 )
 from .resource_protocol import SignedHostReport, observation_signature
-from .resources import HostSnapshot
+from .resources import Capacity, ExecutionCapacity, HostSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -37,11 +37,20 @@ log = logging.getLogger(__name__)
 def physical_boot_id(host_id: UUID, proc_root: Path) -> UUID:
     if os.name != "nt":
         return UUID((proc_root / "sys/kernel/random/boot_id").read_text().strip())
-    boot = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-        "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')"],
-        check=True, capture_output=True, text=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW).stdout.strip()
-    datetime.fromisoformat(boot.replace("Z", "+00:00"))  # Reject empty/error output.
-    return uuid5(host_id, boot)
+    # SystemBootEnvironmentInformation: GUID, firmware type, padding, boot flags.
+    # LastBootUpTime moves when Windows corrects its clock; it is not an identity.
+    buffer = ctypes.create_string_buffer(32)
+    returned = ctypes.c_ulong()
+    query = ctypes.WinDLL("ntdll").NtQuerySystemInformation
+    query.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    query.restype = ctypes.c_long
+    status = query(90, buffer, len(buffer), ctypes.byref(returned))
+    if status != 0 or returned.value != len(buffer):
+        raise OSError(f"Cannot read Windows boot identity: NTSTATUS {status:#x}, size {returned.value}")
+    boot = UUID(bytes_le=buffer.raw[:16])
+    if not boot.int:
+        raise OSError("Windows returned an empty boot identity")
+    return uuid5(host_id, str(boot))
 
 
 def _snapshot(config, sequence):
@@ -53,20 +62,32 @@ def _snapshot(config, sequence):
     headroom = {"ram_headroom_mib": config["ram_headroom_mib"],
                 "cpu_headroom_millicores": config["cpu_headroom_millicores"]}
     if os.name == "nt":
-        ram, cpu = windows_host_capacity(**headroom)
-        scopes = {}
-        if "vm_command" in config:
-            # Operator-provisioned argv, never shell text or a worker request.
-            raw = subprocess.run(config["vm_command"], check=True, capture_output=True, text=True, timeout=10,
-                                 creationflags=subprocess.CREATE_NO_WINDOW).stdout
-            scopes = json.loads(raw)["execution_scopes"]
+        if any(type(value) is not int or value < 0 for value in headroom.values()):
+            raise ValueError("headroom must be a nonnegative integer")
+        response = httpx.get(config["system_info_url"], timeout=7, trust_env=False, follow_redirects=False)
+        response.raise_for_status()
+        envelope = response.json()
+        if envelope["success"] is not True:
+            raise ValueError("App Invoker system information is unavailable")
+        info = envelope["data"]
+        observed = datetime.fromisoformat(info["capturedAt"].replace("Z", "+00:00"))
+        if observed.tzinfo is None or not 0 <= (datetime.now(timezone.utc) - observed).total_seconds() <= 15:
+            raise ValueError("App Invoker system information is stale")
+        captured = min(captured, observed)
+        measured = {}
+        for name in ("host", "dockerVm"):
+            capacity = ExecutionCapacity.model_validate(info[name])
+            measured[name] = ExecutionCapacity(
+                ram=Capacity(allocatable=max(0, capacity.ram.allocatable - headroom["ram_headroom_mib"]),
+                             available=max(0, capacity.ram.available - headroom["ram_headroom_mib"])),
+                cpu_millicores=max(0, capacity.cpu_millicores - headroom["cpu_headroom_millicores"]))
+        ram, cpu = measured["host"].ram, measured["host"].cpu_millicores
+        scopes = {"/": measured["dockerVm"]}
         if "native_scope" in config:
             native = config["native_scope"]
             if not isinstance(native, str) or not native.strip() or len(native) > 255 or native in scopes:
                 raise ValueError("native scope must be a unique nonempty identifier of at most 255 characters")
             scopes[native] = {"ram": ram, "cpu_millicores": cpu}
-        if not scopes:
-            raise ValueError("Windows reporter requires an execution scope")
     else:
         ram, cpu = linux_host_capacity(**headroom, proc_root=proc_root)
         scopes = linux_execution_scopes(config["scope_paths"], host_ram=ram, host_cpu_millicores=cpu,
