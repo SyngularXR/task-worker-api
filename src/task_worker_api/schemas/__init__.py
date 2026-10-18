@@ -20,10 +20,14 @@ from .render import RenderParams
 from .spatial_reconstruction import SpatialReconstructionParams
 from .visual_tracking import VisualTrackingParams
 from .volume_resample import VolumeResampleParams
+from .bone_generation import BoneGenerationParams
+from .synthesize_ct import SynthesizeCtParams
 
 # apple_ml_gs lands in a future release once the handler shape
 # are audited (see design spec Appendix A).
 TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
+    TaskType.SYNTHESIZE_CT: SynthesizeCtParams,
+    TaskType.GENERATE_BONE: BoneGenerationParams,
     TaskType.VOLUME_RESAMPLE: VolumeResampleParams,
     TaskType.RENDER: RenderParams,
     TaskType.DETECT_CUT_PLANES: DetectCutPlanesParams,
@@ -44,6 +48,8 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
 
 
 __all__ = [
+    "SynthesizeCtParams",
+    "BoneGenerationParams",
     "VolumeResampleParams",
     "TaskParamsBase",
     "RenderParams",
