@@ -18,6 +18,7 @@ from typing import Optional, TYPE_CHECKING
 import httpx
 
 from .client import _ENCODE_PROBE_URL, _progress_body
+from .timeouts import _positive_finite_s
 
 if TYPE_CHECKING:  # pragma: no cover
     from .client import BackendClient
@@ -90,7 +91,7 @@ class ProgressReporter:
     ):
         self._client = client
         self._task_id = task_id
-        self._interval = heartbeat_interval_s
+        self._interval = _positive_finite_s("heartbeat_interval_s", heartbeat_interval_s)
         self._warn_threshold = max(1, heartbeat_warn_threshold)
         self._state = _SharedState()
         self._task: Optional[asyncio.Task] = None

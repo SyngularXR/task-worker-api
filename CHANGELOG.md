@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `ProgressReporter(heartbeat_interval_s=...)` and
+  `CancelGuard(poll_interval_s=...)` now reject NaN, infinite, zero and negative
+  intervals with `ValueError`. Validation runs at reporter construction or
+  cancel-guard context entry, before any background task is created.
+
 - `BackendClient`, and therefore `Worker` when constructing its own client,
   now rejects NaN and infinite `retry_backoff_max_s` values with `ValueError`
   at construction. Previously, NaN and positive infinity passed the `<= 0`

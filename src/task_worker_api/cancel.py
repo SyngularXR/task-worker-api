@@ -25,6 +25,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from .enums import TaskStatus
 from .errors import TaskCancelled
+from .timeouts import _positive_finite_s
 
 if TYPE_CHECKING:  # pragma: no cover
     from .client import BackendClient
@@ -142,6 +143,7 @@ async def CancelGuard(
     extension calls that don't yield to the event loop will see the cancel
     only after they return.
     """
+    poll_interval_s = _positive_finite_s("poll_interval_s", poll_interval_s)
     cancelled = asyncio.Event()
     poll_status = _cancel_status_poller(client)
 
