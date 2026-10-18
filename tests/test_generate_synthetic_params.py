@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from task_worker_api.enums import TaskType
 from task_worker_api.schemas import TASK_PARAMS_SCHEMAS
@@ -44,6 +45,27 @@ def test_generate_synthetic_params_roundtrip():
     assert len(p.sources) == 2
     assert p.sources[0].nifti_path == "/app/shared/a.nii.gz"
     assert p.source_dicom_ids == [53, 54]
+
+
+@pytest.mark.parametrize(
+    "reference_size, valid",
+    [
+        ([8, 16, 24], True),
+        ([8, 16], False),
+        ([8, 16, 24, 2], False),
+        ([0, 16, 24], False),
+        ([8, -1, 24], False),
+    ],
+)
+def test_generate_synthetic_reference_size(reference_size, valid):
+    schema = TASK_PARAMS_SCHEMAS[TaskType.GENERATE_SYNTHETIC]
+    payload = _valid_payload()
+    payload["reference_size"] = reference_size
+    if valid:
+        assert schema.model_validate(payload).reference_size == reference_size
+    else:
+        with pytest.raises(ValidationError):
+            schema.model_validate(payload)
 
 
 def test_generate_synthetic_params_forbid_extra():
