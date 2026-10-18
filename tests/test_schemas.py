@@ -167,6 +167,43 @@ def test_gs_build_accepts_cross_box_scene_bundle():
     assert params.input_files == {"scene": "scene.zip"}
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("iterations", 0),
+        ("max_image_size", 0),
+        ("max_splats", 0),
+        ("sift_max_image_size", 0),
+        ("num_threads", 0),
+        ("sh_degree", -1),
+        ("sh_degree", 4),
+        ("seed", -1),
+        ("seed", 4294967296),
+    ],
+)
+def test_gs_build_rejects_out_of_range_knobs(field, value):
+    with pytest.raises(ValidationError):
+        GsBuildParams.model_validate({field: value})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("iterations", 1),
+        ("max_image_size", 1),
+        ("max_splats", 1),
+        ("sift_max_image_size", 1),
+        ("num_threads", 1),
+        ("sh_degree", 0),
+        ("sh_degree", 3),
+        ("seed", 0),
+        ("seed", 4294967295),
+    ],
+)
+def test_gs_build_accepts_boundary_knobs(field, value):
+    assert getattr(GsBuildParams.model_validate({field: value}), field) == value
+
+
 def test_gs4d_build_registered():
     assert TASK_PARAMS_SCHEMAS[TaskType.GS4D_BUILD] is Gs4dBuildParams
 
