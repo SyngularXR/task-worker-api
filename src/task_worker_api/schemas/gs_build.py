@@ -40,14 +40,15 @@ class GsBuildParams(TaskParamsBase):
     )
 
     # Tuning knobs — all optional, run.sh defaults apply when omitted.
+    # Numeric bounds mirror colmap-splat run.sh's init checks.
     method: Optional[str] = Field(default=None)
-    iterations: Optional[int] = Field(default=None, ge=0)
-    max_image_size: Optional[int] = Field(default=None, ge=0)
-    max_splats: Optional[int] = Field(default=None, ge=0)
-    sh_degree: Optional[int] = Field(default=None, ge=0)
-    seed: Optional[int] = Field(default=None, ge=0)
-    sift_max_image_size: Optional[int] = Field(default=None, ge=0)
-    num_threads: Optional[int] = Field(default=None, ge=0)
+    iterations: Optional[int] = Field(default=None, gt=0)
+    max_image_size: Optional[int] = Field(default=None, gt=0)
+    max_splats: Optional[int] = Field(default=None, gt=0)
+    sh_degree: Optional[int] = Field(default=None, ge=0, le=3)
+    seed: Optional[int] = Field(default=None, ge=0, le=4294967295)
+    sift_max_image_size: Optional[int] = Field(default=None, gt=0)
+    num_threads: Optional[int] = Field(default=None, gt=0)
     background: Optional[str] = Field(default=None)
     strategy: Optional[str] = Field(default=None)
     dense_init: Optional[bool] = Field(

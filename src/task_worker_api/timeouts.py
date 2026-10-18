@@ -23,6 +23,43 @@ DEFAULT_TASK_TIMEOUT_S = 1800.0  # 30 minutes
 _KNOWN_KEYS = frozenset(t.value for t in TaskType) | {"default"}
 
 
+def _positive_finite_s(name: str, value: float) -> float:
+    """Validate an SDK pacing interval, or raise ``ValueError``.
+
+    These intervals pace SDK background work, and every degenerate value
+    breaks that pacing in a way that is silent at construction and expensive in
+    production — against the one backend the whole fleet shares:
+
+    * ``poll_interval_s`` / ``claim_backoff_max_s``: ``0``/negative spins the
+      claim loop at full speed, ``inf`` makes the first idle wait never end
+      (the worker stops polling for good), and ``NaN`` fails every comparison
+      in ``_claim_wait_s`` — so the cap never matches, the doubling loop runs
+      once per accumulated failure, and ``asyncio.wait_for(timeout=nan)``
+      waits forever.
+    * ``heartbeat_interval_s``: ``<= 0`` makes every report's ``wait_for``
+      time out immediately, so no heartbeat lands. Non-finite values break
+      heartbeat timing: ``NaN`` is invalid and ``inf`` removes the report
+      deadline and prevents subsequent ticks.
+    * ``cancel_poll_interval_s`` (``CancelGuard.poll_interval_s``): ``<= 0``
+      polls ``GET /tasks/{id}/cancel-status`` in a busy loop; non-finite
+      values break the sleep or prevent subsequent polls.
+    * ``timeout_grace_s``: ``NaN`` makes ``TaskWatchdog._wait`` return
+      instantly at both grace phases (``end = now + nan``, so the loop never
+      runs), collapsing SIGTERM → grace → SIGKILL → grace → hard-exit into an
+      immediate container kill on the first deadline; ``<= 0`` does the same,
+      and ``inf`` means the escalation never reaches the hard exit.
+
+    Rejecting them here is what makes the capped-and-still-polling guarantee
+    real.
+    """
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{name} must be a finite positive number of seconds "
+            f"(got {value!r})"
+        )
+    return float(value)
+
+
 def parse_timeouts_env(raw: Optional[str]) -> dict[str, float]:
     """Parse ``WORKER_TASK_TIMEOUTS='default=1800,gs_build=7200'`` into a dict.
 

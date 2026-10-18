@@ -56,7 +56,7 @@ class SegmentationParams(TaskParamsBase):
 
     # MedSAM3.
     prompt: Optional[str] = None
-    axis: int = 0
+    axis: int = Field(default=0, ge=0, le=2)
     threshold: float = Field(default=0.5, allow_inf_nan=False)
     nms_iou: float = Field(default=0.5, allow_inf_nan=False)
     window_center: Optional[float] = Field(default=None, allow_inf_nan=False)
@@ -71,10 +71,10 @@ class SegmentationParams(TaskParamsBase):
     modality: Optional[str] = None
     label_prompt: Optional[list[int]] = None
     intensity_refine: bool = False
-    grow_max_distance: int = 0
-    grow_shrink_voxels: int = 0
-    grow_gradient_threshold: float = Field(default=0.0, allow_inf_nan=False)
-    grow_intensity_sigma: float = Field(default=0.0, allow_inf_nan=False)
+    grow_max_distance: int = Field(default=0, ge=0, le=20)
+    grow_shrink_voxels: int = Field(default=0, ge=0, le=20)
+    grow_gradient_threshold: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    grow_intensity_sigma: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     grow_debug: bool = False
     smooth_edge: bool = False
     smooth_seeds: bool = False
@@ -86,7 +86,7 @@ class SegmentationParams(TaskParamsBase):
     fast: bool = False
 
     # One-shot MedSAM2 (box-seed; NOT the interactive warm session).
-    seed_slice: Optional[int] = None
+    seed_slice: Optional[int] = Field(default=None, ge=0)
     seed_box: Optional[list[int]] = None
     medsam2_modality: Optional[str] = None
 

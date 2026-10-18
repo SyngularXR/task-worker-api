@@ -21,6 +21,16 @@ from task_worker_api.progress import ProgressReporter, _SharedState
 from task_worker_api.testing import FakeBackendClient
 
 
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), -float("inf")])
+def test_heartbeat_interval_rejects_degenerate_values(bad):
+    with pytest.raises(ValueError, match="heartbeat_interval_s"):
+        ProgressReporter(FakeBackendClient(), 1, heartbeat_interval_s=bad)
+
+
+def test_default_heartbeat_interval_constructs():
+    ProgressReporter(FakeBackendClient(), 1)
+
+
 # ----- update() --------------------------------------------------------------
 
 

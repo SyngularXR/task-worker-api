@@ -5,6 +5,27 @@
 - Add source-owned `synthesize_ct` parameters and trusted `finalize_ct` dispatch.
 - Include CT publication in the supervisor CPU publication-mount allowlist and generated types.
 
+- `ProgressReporter(heartbeat_interval_s=...)` and
+  `CancelGuard(poll_interval_s=...)` now reject NaN, infinite, zero and negative
+  intervals with `ValueError`. Validation runs at reporter construction or
+  cancel-guard context entry, before any background task is created.
+
+- `BackendClient`, and therefore `Worker` when constructing its own client,
+  now rejects NaN and infinite `retry_backoff_max_s` values with `ValueError`
+  at construction. Previously, NaN and positive infinity passed the `<= 0`
+  check and silently removed the cap, as if `None` had been passed. Negative
+  infinity was already rejected; only its error message changes, as does the
+  message for zero and negative values, to "must be a finite number > 0".
+  Pass `None` to disable the cap.
+
+- `GsBuildParams` now requires positive `iterations`, `max_image_size`,
+  `max_splats`, `sift_max_image_size` and `num_threads`, `sh_degree` in 0–3,
+  and `seed` in 0–4294967295, matching colmap-splat's `run.sh` init checks.
+  Invalid values fail generic enqueue validation or worker claim validation,
+  before staging. The GS_BUILD feature route still enqueues seeds above
+  4294967295; these now fail at claim instead of later in the worker handler
+  (and `run.sh` also rejects them).
+
 ## 0.19.0.dev59
 
 - Add prepared-T1 bone generation params and trusted CPU finalizer dispatch.

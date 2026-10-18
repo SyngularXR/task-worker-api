@@ -785,10 +785,15 @@ class BackendClient:
         # (high max_retries) would otherwise block the worker's event loop for
         # minutes on one call. None disables the cap for consumers that want
         # the legacy unbounded behaviour, but the default bounds it.
-        if retry_backoff_max_s is not None and retry_backoff_max_s <= 0:
+        # NaN fails every cap comparison, silently removing the cap. ``inf``
+        # is an unbounded cap spelled as a number; None is the documented way
+        # to request that.
+        if retry_backoff_max_s is not None and not (
+            math.isfinite(retry_backoff_max_s) and retry_backoff_max_s > 0
+        ):
             raise ValueError(
-                f"retry_backoff_max_s must be > 0 (got {retry_backoff_max_s}); "
-                "pass None to disable the cap."
+                f"retry_backoff_max_s must be a finite number > 0 "
+                f"(got {retry_backoff_max_s!r}); pass None to disable the cap."
             )
         self.retry_backoff_max_s = retry_backoff_max_s
         # Optional budget on the inter-attempt sleeps one call may *start*.

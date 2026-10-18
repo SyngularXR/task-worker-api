@@ -6,8 +6,8 @@
   "sdk": {
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
-    "current_release": "v0.19.0.dev41",
-    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.19.0.dev41",
+    "current_release": "v0.19.0.dev60",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.19.0.dev60",
     "release_workflow": ".github/workflows/release.yml \u00e2\u20ac\u201d publishes wheel + tag on every merge to main"
   },
   "workers": [
@@ -27,7 +27,7 @@
       ],
       "sdk_pin": {
         "style": "wheel_url",
-        "version": "v0.19.0.dev59",
+        "version": "v0.19.0.dev60",
         "file": "requirements.txt",
         "line_pattern": "https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },

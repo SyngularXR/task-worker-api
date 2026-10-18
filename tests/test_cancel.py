@@ -11,6 +11,7 @@ indirectly through the full Worker.run_one cycle:
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -19,6 +20,30 @@ from task_worker_api.cancel import CancelGuard
 from task_worker_api.enums import TaskStatus
 from task_worker_api.errors import TaskCancelled
 from task_worker_api.testing import FakeBackendClient
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.asyncio
+async def test_poll_interval_rejects_before_creating_task(bad, monkeypatch):
+    client = FakeBackendClient()
+    poll = AsyncMock(wraps=client.poll_cancel_status)
+    create_task = Mock(wraps=asyncio.create_task)
+    monkeypatch.setattr(client, "poll_cancel_status", poll)
+    monkeypatch.setattr(cancel_mod.asyncio, "create_task", create_task)
+
+    with pytest.raises(ValueError, match="poll_interval_s"):
+        async with CancelGuard(client, 1, poll_interval_s=bad):
+            pass
+
+    poll.assert_not_awaited()
+    create_task.assert_not_called()
+    assert not any(t.get_name() == "cancel-guard-1" for t in asyncio.all_tasks())
+
+
+@pytest.mark.asyncio
+async def test_default_poll_interval_enters_and_exits():
+    async with CancelGuard(FakeBackendClient(), 1) as cancelled:
+        assert not cancelled.is_set()
 
 
 @pytest.mark.asyncio
