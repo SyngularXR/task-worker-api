@@ -4,6 +4,18 @@ from pydantic import ValidationError
 from task_worker_api.schemas import ModelInitializingParams
 
 
+@pytest.mark.parametrize("base_name", ["a/b", r"..\x", "C:x", "a?b", "a%2fb", "CON.x"])
+def test_model_initializing_rejects_unsafe_published_filename(base_name):
+    with pytest.raises(ValidationError, match="base_name must produce a safe published filename"):
+        ModelInitializingParams(job_id="j", input_path="/p", base_name=base_name)
+
+
+@pytest.mark.parametrize("base_name", ["", "Liver", "Liver.", "CON"])
+def test_model_initializing_preserves_safe_base_name(base_name):
+    params = ModelInitializingParams(job_id="j", input_path="/p", base_name=base_name)
+    assert params.base_name == base_name
+
+
 def test_mesh_preprocessing_options_validate_without_importing_blender():
     base = dict(job_id="job", input_path="mesh.stl", base_name="mesh")
     params = ModelInitializingParams(**base, remove_interior=True, yup=False)
