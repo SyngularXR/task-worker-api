@@ -42,8 +42,11 @@ class ClaimedTask:
     @classmethod
     def from_dict(cls, data: dict) -> "ClaimedTask":
         """Construct from the backend's ``_task_to_dict`` envelope."""
+        task_id = data["id"]
+        if type(task_id) is not int:
+            raise TypeError(f"task id must be int, got {type(task_id).__name__}")
         return cls(
-            id=data["id"],
+            id=task_id,
             task_type=TaskType(data["task_type"]),
             case_id=data.get("case_id"),
             item_key=data.get("item_key", ""),
