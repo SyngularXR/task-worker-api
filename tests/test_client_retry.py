@@ -2124,10 +2124,57 @@ async def test_request_caps_backoff_at_max(monkeypatch):
 
 def test_init_rejects_non_positive_backoff_max():
     """A non-positive retry_backoff_max_s is degenerate — fail fast."""
-    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be a finite number > 0"):
         BackendClient("http://fake", "x", retry_backoff_max_s=0)
-    with pytest.raises(ValueError, match="retry_backoff_max_s must be > 0"):
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be a finite number > 0"):
         BackendClient("http://fake", "x", retry_backoff_max_s=-5)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_init_rejects_non_finite_backoff_max(value):
+    """NaN and +inf make cap comparisons False, silently removing the cap.
+
+    -inf was already rejected; it also gets the finite-number message.
+    """
+    with pytest.raises(ValueError, match="retry_backoff_max_s must be a finite number > 0"):
+        BackendClient("http://fake", "x", retry_backoff_max_s=value)
+
+
+@pytest.mark.parametrize("value", [None, 30.0])
+def test_init_accepts_none_and_finite_backoff_max(value):
+    client = BackendClient("http://fake", "x", retry_backoff_max_s=value)
+    if value is None:
+        assert client.retry_backoff_max_s is None
+    else:
+        assert client.retry_backoff_max_s == value
+
+
+def test_worker_rejects_nan_backoff_max_before_owning_a_client(monkeypatch):
+    """Worker must reject the cap before any HTTP connection pool exists."""
+    from task_worker_api.worker import Worker
+
+    monkeypatch.delenv("SYNPUSHER_TARGETS", raising=False)
+    built = []
+    real_init = httpx.AsyncClient.__init__
+
+    def _spy(self, *args, **kwargs):
+        built.append(self)
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _spy)
+
+    async def _noop(*a, **kw):
+        return None
+
+    with pytest.raises(ValueError, match="retry_backoff_max_s"):
+        Worker(
+            backend_url="http://fake/api/v1",
+            api_key="k",
+            worker_id="w",
+            handlers={TaskType.DETECT_CUT_PLANES: _noop},
+            retry_backoff_max_s=float("nan"),
+        )
+    assert built == []
 
 
 def test_init_accepts_none_backoff_max():

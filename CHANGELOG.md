@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `BackendClient`, and therefore `Worker` when constructing its own client,
+  now rejects NaN and infinite `retry_backoff_max_s` values with `ValueError`
+  at construction. Previously, NaN and positive infinity passed the `<= 0`
+  check and silently removed the cap, as if `None` had been passed. Negative
+  infinity was already rejected; only its error message changes, as does the
+  message for zero and negative values, to "must be a finite number > 0".
+  Pass `None` to disable the cap.
+
 - `GsBuildParams` now requires positive `iterations`, `max_image_size`,
   `max_splats`, `sift_max_image_size` and `num_threads`, `sh_degree` in 0–3,
   and `seed` in 0–4294967295, matching colmap-splat's `run.sh` init checks.
