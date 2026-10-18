@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev61
+
+- Carry the original acquisition plane in `volume_resample` tasks. Axial and
+  unknown acquisitions keep the existing pipeline; coronal and sagittal MRI
+  select sampling-only interpolation followed by native-plane enhancement.
+
 ## 0.19.0.dev60
 
 - Add source-owned `synthesize_ct` parameters and trusted `finalize_ct` dispatch.
