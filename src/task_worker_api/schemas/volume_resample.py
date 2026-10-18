@@ -1,7 +1,7 @@
 """Backend-owned scalar-volume resampling; enhancement is a separate operation."""
 from typing import Literal
 from uuid import UUID
-from pydantic import Field, PositiveInt
+from pydantic import Field, PositiveInt, field_validator
 
 from ._base import TaskParamsBase
 
@@ -14,3 +14,10 @@ class VolumeResampleParams(TaskParamsBase):
     dicom_id: PositiveInt
     job_id: UUID
     phase_files: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("phase_files")
+    @classmethod
+    def primary_key_reserved(cls, value):
+        if "volume" in value:
+            raise ValueError('phase_files key "volume" is reserved for input_path')
+        return value
