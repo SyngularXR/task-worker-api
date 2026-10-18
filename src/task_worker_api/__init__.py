@@ -6,7 +6,7 @@ file transfer, hybrid-mode runner, and testing fixtures.
 from importlib.metadata import version as _installed_version
 
 from .cancel import CancelGuard
-from .client import BackendClient
+from .client import BackendClient, _to_thread_complete as to_thread_complete
 from .context import ClaimedTask, FileContext, TaskContext
 from .enums import TaskStatus, TaskType
 from .errors import (
@@ -15,7 +15,7 @@ from .errors import (
     TaskCancelled,
     TaskParamsError,
 )
-from .files import prepare_inputs, upload_outputs
+from .files import _require_safe_filename as require_safe_filename, prepare_inputs, upload_outputs
 from .progress import ProgressReporter
 from .schemas import TASK_PARAMS_SCHEMAS, TaskParamsBase
 from .worker import ForeignTarget, Worker, parse_synpusher_targets, run_hybrid
@@ -49,4 +49,6 @@ __all__ = [
     "run_hybrid",
     "prepare_inputs",
     "upload_outputs",
+    "require_safe_filename",
+    "to_thread_complete",
 ]
