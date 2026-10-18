@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.0.dev62
+
+- Reject the reserved `"volume"` key in `VolumeResampleParams.phase_files` so
+  phase inputs cannot replace the primary input.
+
 ## 0.19.0.dev61
 
 - Carry the original acquisition plane in `volume_resample` tasks. Axial and
