@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `GsBuildParams` now requires positive `iterations`, `max_image_size`,
+  `max_splats`, `sift_max_image_size` and `num_threads`, `sh_degree` in 0–3,
+  and `seed` in 0–4294967295, matching colmap-splat's `run.sh` init checks.
+  Invalid values fail generic enqueue validation or worker claim validation,
+  before staging. The GS_BUILD feature route still enqueues seeds above
+  4294967295; these now fail at claim instead of later in the worker handler
+  (and `run.sh` also rejects them).
+
 ## 0.19.0.dev58
 
 - The admitted backend finalizer supervisor claims `finalize_volume`, matching
