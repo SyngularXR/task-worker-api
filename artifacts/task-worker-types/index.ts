@@ -5,6 +5,8 @@
 // Enums ------------------------------------------------------
 
 export type TaskType =
+  | 'generate_bone'
+  | 'finalize_bone'
   | 'volume_resample'
   | 'finalize_volume'
   | 'render'
@@ -34,6 +36,8 @@ export type TaskType =
 ;
 
 export const TaskType = {
+  GENERATE_BONE: 'generate_bone' as const,
+  FINALIZE_BONE: 'finalize_bone' as const,
   VOLUME_RESAMPLE: 'volume_resample' as const,
   FINALIZE_VOLUME: 'finalize_volume' as const,
   RENDER: 'render' as const,
@@ -105,6 +109,13 @@ export interface TaskEnvelope {
 }
 
 // Task param schemas ---------------------------------------
+
+export interface BoneGenerationParams {
+  input_path: string;
+  dicom_id: number;
+  job_id: string;
+  orientation: string;
+}
 
 export interface VolumeResampleParams {
   input_path: string;
@@ -366,6 +377,7 @@ export interface VisualTrackingParams {
 
 /** Map of TaskType → params schema for typed dispatch. */
 export interface TaskParamsByType {
+  'generate_bone': BoneGenerationParams;
   'volume_resample': VolumeResampleParams;
   'render': RenderParams;
   'detect_cut_planes': DetectCutPlanesParams;

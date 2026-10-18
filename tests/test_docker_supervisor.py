@@ -359,6 +359,8 @@ def test_launch_is_durable_gpu_pinned_and_never_restarted(tmp_path, monkeypatch,
             assert instance._row(claim)[1] == "creating"
             assert args[args.index("--gpus") + 1] == "device=GPU-test"
             assert args[args.index("--network") + 1] == instance.network_id
+            assert args[args.index("--shm-size") + 1] == args[args.index("--memory") + 1]
+            assert "--ipc=host" not in args and "--privileged" not in args
             assert args[args.index("--user") + 1] == ("1000:1000" if windows_host else "1000:1001")
             assert "USER=worker" in args and "HOME=/work" in args
             assert "XDG_CACHE_HOME=/work/.cache" in args

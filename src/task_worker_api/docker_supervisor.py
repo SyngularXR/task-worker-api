@@ -307,7 +307,7 @@ class DockerSupervisor:
         if publication_directory is not None:
             publication_directory = publication_directory.resolve(strict=True)
             if (service or claim.gpu_uuid is not None or claim.profile.gpu_count != 0
-                    or claim.task.task_type not in ("finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume")
+                    or claim.task.task_type not in ("finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume", "finalize_bone")
                     or command != ["python", "-m", "src.services.resource_finalizer_worker", "/run/worker-config.json"]):
                 raise ValueError("publication mount requires the backend CPU finalizer")
             if (not publication_directory.is_dir() or publication_directory == Path(publication_directory.anchor)
@@ -359,6 +359,7 @@ class DockerSupervisor:
                 "--user", plan["user"],
                 "--restart=no", "--init", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                 "--read-only", "--memory", f"{plan['memory']}m", "--memory-swap", f"{plan['memory']}m",
+                "--shm-size", f"{plan['memory']}m",  # Shared tensors remain charged to the admitted cgroup memory.
                 "--cpus", str(plan["cpu"] / 1000), "--pids-limit", "512", "--tmpfs", "/tmp:rw,size=256m",
                 "--mount", f"type=bind,source={directory},target=/work"]
         if plan["gpu"]:

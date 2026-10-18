@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0.dev59
+
+- Add prepared-T1 bone generation params and trusted CPU finalizer dispatch.
+- Size private Docker shared memory within the admitted execution RAM limit so
+  nnU-Net can export full-volume prediction tensors without the 64 MiB default ceiling.
+
+
 ## 0.19.0.dev58
 
 - The admitted backend finalizer supervisor claims `finalize_volume`, matching
