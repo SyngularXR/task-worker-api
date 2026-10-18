@@ -293,7 +293,7 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
 
     async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
         assert ready_calls == startup_failures + 1
-        assert types == ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume"]
+        assert types == ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume", "finalize_bone", "finalize_ct"]
         assert launch["command"][2] == "src.services.resource_finalizer_worker"
         assert launch["publication_directory"] == tmp_path / "publication"
         assert launch["environment"]["SHARED_DATA_PATH"] == "/app/shared"
@@ -359,6 +359,8 @@ def test_launch_is_durable_gpu_pinned_and_never_restarted(tmp_path, monkeypatch,
             assert instance._row(claim)[1] == "creating"
             assert args[args.index("--gpus") + 1] == "device=GPU-test"
             assert args[args.index("--network") + 1] == instance.network_id
+            assert args[args.index("--shm-size") + 1] == args[args.index("--memory") + 1]
+            assert "--ipc=host" not in args and "--privileged" not in args
             assert args[args.index("--user") + 1] == ("1000:1000" if windows_host else "1000:1001")
             assert "USER=worker" in args and "HOME=/work" in args
             assert "XDG_CACHE_HOME=/work/.cache" in args

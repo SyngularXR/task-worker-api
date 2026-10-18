@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.19.0.dev60
+
+- Add source-owned `synthesize_ct` parameters and trusted `finalize_ct` dispatch.
+- Include CT publication in the supervisor CPU publication-mount allowlist and generated types.
 
 - `ProgressReporter(heartbeat_interval_s=...)` and
   `CancelGuard(poll_interval_s=...)` now reject NaN, infinite, zero and negative
@@ -22,6 +25,13 @@
   before staging. The GS_BUILD feature route still enqueues seeds above
   4294967295; these now fail at claim instead of later in the worker handler
   (and `run.sh` also rejects them).
+
+## 0.19.0.dev59
+
+- Add prepared-T1 bone generation params and trusted CPU finalizer dispatch.
+- Size private Docker shared memory within the admitted execution RAM limit so
+  nnU-Net can export full-volume prediction tensors without the 64 MiB default ceiling.
+
 
 ## 0.19.0.dev58
 

@@ -6,8 +6,8 @@
   "sdk": {
     "name": "task-worker-api",
     "repo": "https://github.com/SyngularXR/task-worker-api",
-    "current_release": "v0.19.0.dev41",
-    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.19.0.dev41",
+    "current_release": "v0.19.0.dev60",
+    "release_notes": "https://github.com/SyngularXR/task-worker-api/releases/tag/v0.19.0.dev60",
     "release_workflow": ".github/workflows/release.yml \u00e2\u20ac\u201d publishes wheel + tag on every merge to main"
   },
   "workers": [
@@ -18,15 +18,16 @@
       "image_tag_env": "NEURAL_CANVAS_TAG",
       "compose_service": "neural-canvas",
       "mode": "hybrid",
-      "mode_description": "Hybrid FastAPI and polling worker; API-only when backend credentials are absent. volume_resample is admitted-only via src.sdk_handlers.volume_resample:run_admitted, is not registered by the hybrid poller, and is not enrolled/deployed by source availability.",
+      "mode_description": "Hybrid FastAPI and polling worker; API-only when backend credentials are absent. volume_resample is admitted-only via src.sdk_handlers.volume_resample:run_admitted, is not registered by the hybrid poller, and is not enrolled/deployed by source availability. CASIMIR generate_bone is retired in the backend. synthesize_ct is an admitted CUDA handler in the dedicated Dockerfile.impactsynth image (requirements-impactsynth.txt, SDK dev60); finalize_ct belongs to the trusted backend CPU worker. The hybrid image retains its separately pinned SDK. Source support does not establish enrollment.",
       "task_types": [
         "segmentation",
         "spatial_recon",
-        "volume_resample"
+        "volume_resample",
+        "synthesize_ct"
       ],
       "sdk_pin": {
         "style": "wheel_url",
-        "version": "v0.19.0.dev56",
+        "version": "v0.19.0.dev60",
         "file": "requirements.txt",
         "line_pattern": "https://github.com/SyngularXR/task-worker-api/releases/download/v{version}/task_worker_api-{version}-py3-none-any.whl"
       },

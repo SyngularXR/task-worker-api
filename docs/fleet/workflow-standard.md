@@ -148,6 +148,10 @@ reservation through the existing backend protocol. Fencing and configuration
 errors do not create this recovery record. This describes SDK source behavior,
 not deployed host status; the Windows adapter has its own phase machine.
 
+The Docker supervisor sizes private `/dev/shm` to the admitted execution RAM
+ceiling. Used shared-memory pages count inside the unchanged cgroup memory and
+swap limits; they are not an additional reservation. No host IPC is shared.
+
 | Shared responsibility | Source |
 |---|---|
 | Wire task names and statuses | [enums.py](../../src/task_worker_api/enums.py) |
