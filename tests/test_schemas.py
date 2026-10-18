@@ -204,6 +204,41 @@ def test_gs_build_accepts_boundary_knobs(field, value):
     assert getattr(GsBuildParams.model_validate({field: value}), field) == value
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("method", "gsplat"),
+        ("method", "gsplat+ppisp"),
+        ("method", None),
+        ("background", "auto"),
+        ("background", "white"),
+        ("background", "black"),
+        ("background", None),
+        ("strategy", "default"),
+        ("strategy", "mcmc"),
+        ("strategy", None),
+    ],
+)
+def test_gs_build_accepts_string_choices(field, value):
+    assert getattr(GsBuildParams.model_validate({field: value}), field) == value
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("method", "3dgs"),
+        ("background", "grey"),
+        ("strategy", "adc"),
+        ("method", ""),
+        ("background", ""),
+        ("strategy", ""),
+    ],
+)
+def test_gs_build_rejects_unknown_string_choices(field, value):
+    with pytest.raises(ValidationError):
+        GsBuildParams.model_validate({field: value})
+
+
 def test_gs4d_build_registered():
     assert TASK_PARAMS_SCHEMAS[TaskType.GS4D_BUILD] is Gs4dBuildParams
 

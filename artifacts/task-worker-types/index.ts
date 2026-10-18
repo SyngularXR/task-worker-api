@@ -223,7 +223,7 @@ export interface GsBuildParams {
   input_files?: Record<string, string>;
   /** Prior-phase PLY to warm-start from (4D); absolute, on shared volume. */
   warm_start_ply?: string;
-  method?: string;
+  method?: 'gsplat' | 'gsplat+ppisp';
   iterations?: number;
   max_image_size?: number;
   max_splats?: number;
@@ -231,8 +231,8 @@ export interface GsBuildParams {
   seed?: number;
   sift_max_image_size?: number;
   num_threads?: number;
-  background?: string;
-  strategy?: string;
+  background?: 'auto' | 'white' | 'black';
+  strategy?: 'default' | 'mcmc';
   /** Run COLMAP dense MVS for splat init (adds 5–30 min). */
   dense_init?: boolean;
 }
