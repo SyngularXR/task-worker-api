@@ -131,6 +131,7 @@ export interface VolumeResampleParams {
   input_path: string;
   modality: 'CT' | 'CTA' | 'PET' | 'MRI';
   method: 'ram2' | 'linear';
+  acquisition_plane?: 'axial' | 'coronal' | 'sagittal';
   dicom_id: number;
   job_id: string;
   phase_files?: Record<string, string>;
