@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `prepare_admitted_inputs` drains directory-creation threads before cancellation
+  propagates, including repeated cancellation. Existing attempt directories are
+  still refused, and uncancelled filesystem errors propagate unchanged.
+
 - `ProgressReporter(heartbeat_interval_s=...)` and
   `CancelGuard(poll_interval_s=...)` now reject NaN, infinite, zero and negative
   intervals with `ValueError`. Validation runs at reporter construction or
