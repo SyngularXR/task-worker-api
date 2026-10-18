@@ -30,6 +30,7 @@ from task_worker_api.client import (
     _UPLOAD_CHUNK_BYTES,
     BackendClient,
 )
+from task_worker_api.context import ClaimedTask
 from task_worker_api.enums import TaskType
 from task_worker_api.errors import TaskCancelled
 
@@ -167,6 +168,44 @@ async def test_claim_next_unparseable_envelope_fails_the_claimed_task(fail_statu
     assert error.startswith(
         "worker could not parse the claimed task envelope: ValueError:"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", ["7", True, 7.0])
+async def test_claim_next_non_int_id_raises_without_fail(bad_id):
+    from task_worker_api.errors import ProtocolError
+
+    fails: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            fails.append(request)
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={
+            "id": bad_id,
+            "task_type": "detect_cut_planes",
+            "status": 2,
+        })
+
+    client = _client_with_handler(handler)
+    try:
+        with pytest.raises(ProtocolError, match="unexpected envelope"):
+            await client.claim_next([TaskType.DETECT_CUT_PLANES], worker_id="w")
+    finally:
+        await client.close()
+
+    assert fails == []
+
+
+def test_claimed_task_from_dict_accepts_int_id():
+    task = ClaimedTask.from_dict({
+        "id": 7,
+        "task_type": "detect_cut_planes",
+        "status": 2,
+    })
+
+    assert task.id == 7
+    assert type(task.id) is int
 
 
 # ---------------------------------------------------------------------------
