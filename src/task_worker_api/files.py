@@ -476,10 +476,13 @@ async def prepare_admitted_inputs(
         parts = artifact.path.split("/")
         for part in parts:
             _require_safe_filename(part, field="input path", key=key)
-        alias = artifact.path.lower()
+        alias = tuple(ntpath.normcase(part) for part in parts)
         if alias in destinations:
             raise ProtocolError("duplicate input paths")
         destinations.add(alias)
+    prefixes = {path[:i] for path in destinations for i in range(1, len(path))}
+    if destinations & prefixes:
+        raise ProtocolError("input path is a directory of another input path")
     directory = work_root / str(claim.ownership.attempt_id)
     # Existing attempts require supervisor reconciliation, never destructive reuse.
     await _to_thread_complete(functools.partial(directory.mkdir, parents=True, exist_ok=False))

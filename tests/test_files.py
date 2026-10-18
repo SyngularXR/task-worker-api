@@ -1574,18 +1574,57 @@ async def test_staging_mkdir_failure_propagates_without_a_cancel(
 
 
 def _admitted_claim_with_input(path):
+    return _admitted_claim_with_inputs([path])
+
+
+def _admitted_claim_with_inputs(paths):
     from uuid import uuid4
     from task_worker_api.resources import AdmittedTask, InputArtifact, input_snapshot_digest
     from .test_resources import _admitted_claim
 
     task = AdmittedTask(
         id=1, task_type="finalize_segment", case_id=None, item_key="mesh", params={},
-        inputs={"mesh": InputArtifact(filename="mesh.stl", path=path,
-                                      sha256="0" * 64, size_bytes=1)},
+        inputs={"mesh" if i == 0 else f"input{i}": InputArtifact(
+            filename="mesh.stl" if i == 0 else f"input{i}.stl", path=path,
+            sha256="0" * 64, size_bytes=1,
+        ) for i, path in enumerate(paths)},
     )
     return _admitted_claim(uuid4()).model_copy(update={
         "task": task, "input_digest": input_snapshot_digest(task),
     })
+
+
+@pytest.mark.parametrize("paths", [["scene", "Scene/a.ply"], ["Scene/a.ply", "scene"]])
+@pytest.mark.asyncio
+async def test_admitted_directory_prefix_input_paths_are_refused(tmp_path, paths):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from task_worker_api.errors import ProtocolError
+    from task_worker_api.files import prepare_admitted_inputs
+
+    claim = _admitted_claim_with_inputs(paths)
+    client = SimpleNamespace(resource_download=AsyncMock())
+
+    with pytest.raises(ProtocolError, match="input path is a directory of another input path"):
+        await prepare_admitted_inputs(claim, client, tmp_path)
+    client.resource_download.assert_not_awaited()
+    assert not (tmp_path / str(claim.ownership.attempt_id)).exists()
+
+
+@pytest.mark.asyncio
+async def test_admitted_sibling_input_paths_stage(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from task_worker_api.files import prepare_admitted_inputs
+
+    claim = _admitted_claim_with_inputs(["a/x", "a/y"])
+    client = SimpleNamespace(resource_download=AsyncMock())
+
+    files = await prepare_admitted_inputs(claim, client, tmp_path)
+
+    assert isinstance(files, FileContext)
+    assert files.all_paths == {"mesh": files.input_dir / "a/x", "input1": files.input_dir / "a/y"}
+    assert client.resource_download.await_count == 2
 
 
 @pytest.mark.parametrize("mkdir_path", [".", "in", "out", "in/sub"])
