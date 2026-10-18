@@ -25,6 +25,18 @@ def test_cinematic_baking_registered():
     assert TASK_PARAMS_SCHEMAS[TaskType.CINEMATIC_BAKING] is CinematicBakingParams
 
 
+@pytest.mark.parametrize("base_name", ["a/b", r"..\x", "C:x", "a?b", "a%2fb", "CON.x"])
+def test_cinematic_baking_rejects_unsafe_published_filename(base_name):
+    with pytest.raises(ValidationError, match="base_name must produce a safe published filename"):
+        CinematicBakingParams(job_id="j", input_path="/p", base_name=base_name)
+
+
+@pytest.mark.parametrize("base_name", ["", "Liver", "Liver.", "CON"])
+def test_cinematic_baking_preserves_safe_base_name(base_name):
+    params = CinematicBakingParams(job_id="j", input_path="/p", base_name=base_name)
+    assert params.base_name == base_name
+
+
 def test_cinematic_baking_roundtrip():
     schema = TASK_PARAMS_SCHEMAS[TaskType.CINEMATIC_BAKING]
     obj = schema(job_id="job1", input_path="/shared/preview.glb", base_name="skull")

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.0.dev63
+
+- `ModelInitializingParams` and `CinematicBakingParams` reject a `base_name`
+  whose published filename is unsafe. Producers that validate through these
+  schemas reject such values when a task is enqueued. Workers using these
+  schemas reject such tasks when they claim them. Blender-CLI's local
+  model-initializing schema does not inherit this validation.
+
 ## 0.19.0.dev62
 
 - Reject the reserved `"volume"` key in `VolumeResampleParams.phase_files` so
