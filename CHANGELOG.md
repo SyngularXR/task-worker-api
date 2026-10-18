@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev61
+
+- Expose `ResidentServiceLease.residence_remaining_seconds` for finite request/session
+  lifetimes independent of the renewable heartbeat window. Callers still require
+  `require_dispatch()` for acknowledged liveness; withdrawal returns zero runway.
+
 ## 0.19.0.dev60
 
 - Add source-owned `synthesize_ct` parameters and trusted `finalize_ct` dispatch.

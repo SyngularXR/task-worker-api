@@ -103,6 +103,12 @@ class ResidentServiceLease:
         with self._lock:
             return max(0, self._deadline-time.monotonic()) if not self._lost.is_set() else 0
 
+    @property
+    def residence_remaining_seconds(self):
+        """Finite residence runway; dispatch still requires the renewable live lease."""
+        with self._lock:
+            return max(0, self._residence-time.monotonic()) if not self._lost.is_set() else 0
+
     def withdraw(self):
         self._lose()
 
