@@ -293,7 +293,7 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
 
     async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
         assert ready_calls == startup_failures + 1
-        assert types == ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume"]
+        assert types == ["finalize_spatial", "finalize_gs", "finalize_render", "finalize_segment", "finalize_synthetic", "finalize_gs4d", "finalize_model", "finalize_cinematic", "finalize_deploy", "finalize_deploy_prep", "finalize_volume", "finalize_bone", "finalize_ct"]
         assert launch["command"][2] == "src.services.resource_finalizer_worker"
         assert launch["publication_directory"] == tmp_path / "publication"
         assert launch["environment"]["SHARED_DATA_PATH"] == "/app/shared"

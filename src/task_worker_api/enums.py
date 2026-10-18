@@ -13,6 +13,8 @@ from enum import Enum, IntEnum
 class TaskType(str, Enum):
     """Recognised task types in the unified queue."""
 
+    SYNTHESIZE_CT = "synthesize_ct"
+    FINALIZE_CT = "finalize_ct"
     GENERATE_BONE = "generate_bone"
     FINALIZE_BONE = "finalize_bone"
     VOLUME_RESAMPLE = "volume_resample"

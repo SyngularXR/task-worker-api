@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.0.dev60
+
+- Add source-owned `synthesize_ct` parameters and trusted `finalize_ct` dispatch.
+- Include CT publication in the supervisor CPU publication-mount allowlist and generated types.
+
 ## 0.19.0.dev59
 
 - Add prepared-T1 bone generation params and trusted CPU finalizer dispatch.
