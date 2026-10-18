@@ -482,14 +482,14 @@ async def prepare_admitted_inputs(
         destinations.add(alias)
     directory = work_root / str(claim.ownership.attempt_id)
     # Existing attempts require supervisor reconciliation, never destructive reuse.
-    await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=False)
+    await _to_thread_complete(functools.partial(directory.mkdir, parents=True, exist_ok=False))
     inputs, outputs = directory / "in", directory / "out"
-    await asyncio.to_thread(inputs.mkdir)
-    await asyncio.to_thread(outputs.mkdir)
+    await _to_thread_complete(inputs.mkdir)
+    await _to_thread_complete(outputs.mkdir)
     paths = {}
     for key, artifact in claim.task.inputs.items():
         destination = inputs.joinpath(*artifact.path.split("/"))
-        await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
+        await _to_thread_complete(functools.partial(destination.parent.mkdir, parents=True, exist_ok=True))
         await client.resource_download(claim, artifact, destination, cancelled=cancelled)
         paths[key] = destination
     primary = paths.get("mesh", next(iter(paths.values()), inputs))

@@ -1573,6 +1573,112 @@ async def test_staging_mkdir_failure_propagates_without_a_cancel(
         await files_mod._mkdirs_async(tmp_path / "temp")
 
 
+def _admitted_claim_with_input(path):
+    from uuid import uuid4
+    from task_worker_api.resources import AdmittedTask, InputArtifact, input_snapshot_digest
+    from .test_resources import _admitted_claim
+
+    task = AdmittedTask(
+        id=1, task_type="finalize_segment", case_id=None, item_key="mesh", params={},
+        inputs={"mesh": InputArtifact(filename="mesh.stl", path=path,
+                                      sha256="0" * 64, size_bytes=1)},
+    )
+    return _admitted_claim(uuid4()).model_copy(update={
+        "task": task, "input_digest": input_snapshot_digest(task),
+    })
+
+
+@pytest.mark.parametrize("mkdir_path", [".", "in", "out", "in/sub"])
+@pytest.mark.parametrize("cancels", [1, 3])
+@pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.asyncio
+async def test_admitted_mkdir_completes_before_cancellation_propagates(
+    tmp_path, monkeypatch, mkdir_path, cancels, fails,
+):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from task_worker_api.files import prepare_admitted_inputs
+
+    claim = _admitted_claim_with_input("sub/mesh.stl")
+    client = SimpleNamespace(resource_download=AsyncMock())
+    target = tmp_path / str(claim.ownership.attempt_id) / mkdir_path
+    entered, release = threading.Event(), threading.Event()
+    real_mkdir = Path.mkdir
+
+    def blocking_mkdir(self, *args, **kwargs):
+        if self == target:
+            entered.set()
+            assert release.wait(5), "mkdir was never released"
+            if fails:
+                raise PermissionError(13, "Permission denied")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", blocking_mkdir)
+    task = asyncio.create_task(prepare_admitted_inputs(claim, client, tmp_path))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5), "mkdir never started"
+        for _ in range(cancels):
+            task.cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        assert not task.done(), "unwound while the mkdir thread was still running"
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert target.exists() is not fails
+    client.resource_download.assert_not_awaited()
+
+
+@pytest.mark.parametrize("mkdir_path", [".", "in", "out", "in/sub"])
+@pytest.mark.asyncio
+async def test_admitted_mkdir_failure_propagates_without_a_cancel(
+    tmp_path, monkeypatch, mkdir_path,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from task_worker_api.files import prepare_admitted_inputs
+
+    claim = _admitted_claim_with_input("sub/mesh.stl")
+    client = SimpleNamespace(resource_download=AsyncMock())
+    target = tmp_path / str(claim.ownership.attempt_id) / mkdir_path
+    real_mkdir = Path.mkdir
+    failure = PermissionError(13, "Permission denied")
+
+    def failing_mkdir(self, *args, **kwargs):
+        if self == target:
+            raise failure
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+    with pytest.raises(PermissionError) as exc:
+        await prepare_admitted_inputs(claim, client, tmp_path)
+    assert exc.value is failure
+    client.resource_download.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admitted_existing_attempt_dir_is_refused(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from task_worker_api.files import prepare_admitted_inputs
+
+    claim = _admitted_claim_with_input("sub/mesh.stl")
+    directory = tmp_path / str(claim.ownership.attempt_id)
+    directory.mkdir()
+    sentinel = directory / "existing"
+    sentinel.write_bytes(b"preserve")
+    client = SimpleNamespace(resource_download=AsyncMock())
+
+    with pytest.raises(FileExistsError):
+        await prepare_admitted_inputs(claim, client, tmp_path)
+    assert sentinel.read_bytes() == b"preserve"
+    client.resource_download.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_staging_mkdir_cancel_leaves_no_orphan_staging_dir(
     tmp_path, monkeypatch,
