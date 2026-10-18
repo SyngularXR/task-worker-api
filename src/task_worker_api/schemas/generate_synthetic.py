@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt
 
 from ._base import TaskParamsBase
 
@@ -38,7 +38,9 @@ class GenerateSyntheticParams(TaskParamsBase):
     # fallback handler still read ``source_dicom_ids``.
     source_dicom_ids: List[int]
     reference_dicom_id: int
-    reference_size: List[int] = Field(..., description="Reference NIfTI GetSize() [X,Y,Z].")
+    reference_size: List[PositiveInt] = Field(
+        ..., min_length=3, max_length=3, description="Reference NIfTI GetSize() [X,Y,Z]."
+    )
     synthetic_roi: dict = Field(..., description="{'mode':'full'} or {'mode':'roi','bounds':{...}}.")
     staging_dir: str = Field(..., description="Server-minted staging dir on the shared volume.")
     output_dir: str = Field(..., description="Server-minted final dicom dir on the shared volume.")
