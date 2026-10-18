@@ -1,10 +1,16 @@
 # Changelog
 
-## 0.19.0.dev61
+## 0.19.0.dev62
 
 - Expose `ResidentServiceLease.residence_remaining_seconds` for finite request/session
   lifetimes independent of the renewable heartbeat window. Callers still require
   `require_dispatch()` for acknowledged liveness; withdrawal returns zero runway.
+
+## 0.19.0.dev61
+
+- Carry the original acquisition plane in `volume_resample` tasks. Axial and
+  unknown acquisitions keep the existing pipeline; coronal and sagittal MRI
+  select sampling-only interpolation followed by native-plane enhancement.
 
 ## 0.19.0.dev60
 

@@ -10,6 +10,7 @@ class VolumeResampleParams(TaskParamsBase):
     input_path: str
     modality: Literal["CT", "CTA", "PET", "MRI"]
     method: Literal["ram2", "linear"]
+    acquisition_plane: Literal["axial", "coronal", "sagittal"] = "axial"
     dicom_id: PositiveInt
     job_id: UUID
     phase_files: dict[str, str] = Field(default_factory=dict)
