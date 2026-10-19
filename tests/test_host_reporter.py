@@ -159,6 +159,20 @@ def test_run_rejects_invalid_headroom_at_startup(startup_config, name, value):
         asyncio.run(host_reporter.run(startup_config))
 
 
+@pytest.mark.parametrize("name, key", [
+    ("gpu_headroom_mib", "GPU-not-a-uuid"),
+    ("gpu_headroom_mib", "gpu-" + str(uuid4())),
+    ("gpu_headroom_mib", "GPU-123E4567-E89B-42D3-A456-426614174000"),
+    ("scratch_headroom_mib", "disk:" + str(uuid4())),
+    ("scratch_headroom_mib", "filesystem:not-a-uuid"),
+    ("scratch_headroom_mib", "filesystem:123E4567-E89B-42D3-A456-426614174000"),
+])
+def test_run_rejects_unusable_headroom_key_at_startup(startup_config, name, key):
+    startup_config[name] = {key: 0}
+    with pytest.raises(ValueError):
+        asyncio.run(host_reporter.run(startup_config))
+
+
 def test_publish_report_rejects_invalid_epoch_before_state_write(tmp_path):
     (tmp_path / "key").write_bytes(b"k" * 32)
     state_file = tmp_path / "state.sqlite"

@@ -25,8 +25,8 @@ import httpx
 
 from .client import _HEARTBEAT_RETRY_AFTER_MAX_S, _retry_after_delay
 from .host_resources import (
-    _nonnegative, linux_execution_scopes, linux_host_capacity, nvidia_gpu_capacity,
-    scratch_capacities,
+    _gpu_device_key, _nonnegative, _scratch_pool_key, linux_execution_scopes,
+    linux_host_capacity, nvidia_gpu_capacity, scratch_capacities,
 )
 from .resource_protocol import SignedHostReport, observation_signature
 from .resources import Capacity, ExecutionCapacity, HostSnapshot
@@ -155,8 +155,10 @@ async def run(config):
     _epoch(config)
     _nonnegative(config["ram_headroom_mib"])
     _nonnegative(config["cpu_headroom_millicores"])
-    for name in ("gpu_headroom_mib", "scratch_headroom_mib"):
-        for value in config[name].values():
+    for name, key_check in (("gpu_headroom_mib", _gpu_device_key),
+                            ("scratch_headroom_mib", _scratch_pool_key)):
+        for key, value in config[name].items():
+            key_check(key)
             _nonnegative(value)
     observer = None
     if "borrowing" in config:
