@@ -246,6 +246,9 @@ async def run(config_path):
     key = key_file.read_bytes()
     if len(key) < 32:
         raise ValueError("supervisor signing key requires at least 32 bytes")
+    credential = credential_file.read_text().strip()
+    if not credential:
+        raise ValueError("credential_file is empty")
     with _singleton(private_journal.with_suffix(".lock")):
         worker_config.write_text(json.dumps(dict(backend_url=config["worker_backend_url"], worker_id=config["worker_id"],
             credential_file=str(credential_file) if native else "/run/worker-credential",
@@ -275,7 +278,7 @@ async def run(config_path):
         async def read_report():
             return SignedHostReport.model_validate_json(report_file.read_text())
 
-        async with BackendClient(config["backend_url"], credential_file.read_text().strip(),
+        async with BackendClient(config["backend_url"], credential,
                                  retry_sleep_budget_s=config.get("retry_sleep_budget_s", 600)) as client:
             needs_ready = journal.pending() is None
             failures = 0

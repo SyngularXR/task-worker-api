@@ -441,6 +441,55 @@ async def test_supervisor_validates_key_and_binding_before_startup(tmp_path, mon
     assert not (tmp_path / "work").exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential", ["", "  \n"])
+async def test_supervisor_rejects_empty_credential_before_startup(tmp_path, monkeypatch, credential):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text(credential)
+    (tmp_path / "private/signing").write_bytes(b"s" * 32)
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        handlers={"render": "src.services.resource_render_worker:run_admitted"})
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    with pytest.raises(ValueError, match="credential_file is empty"):
+        await admission_supervisor.run(path)
+    assert clients == cycles == []
+    assert not (tmp_path / f"private/worker-{config['worker_instance_id']}.json").exists()
+    assert not (tmp_path / "private/supervisor.lock").exists()
+    assert not (tmp_path / "private/supervisor.sqlite").exists()
+    assert not list((tmp_path / "worker-journal").iterdir())
+    assert not (tmp_path / "work").exists()
+
+
 def test_supervisor_singleton_releases_lock_on_exit(tmp_path):
     from task_worker_api.admission_supervisor import _singleton
 
