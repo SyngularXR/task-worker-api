@@ -238,15 +238,18 @@ async def run(config_path):
             raise ValueError("worker mounts must exclude supervisor journal and signing key")
     if len(set(mounts.values())) != len(mounts):
         raise ValueError("duplicate worker mount targets")
+    binding = dict(authority_id=UUID(config["authority_id"]),
+        host_id=UUID(config["host_id"]), boot_id=UUID(config["boot_id"]), epoch=config["epoch"],
+        execution_scope=config["execution_scope"])
+    key = key_file.read_bytes()
+    if len(key) < 32:
+        raise ValueError("supervisor signing key requires at least 32 bytes")
     with _singleton(private_journal.with_suffix(".lock")):
         worker_config.write_text(json.dumps(dict(backend_url=config["worker_backend_url"], worker_id=config["worker_id"],
             credential_file=str(credential_file) if native else "/run/worker-credential",
             journal_file=str(worker_directory/'claim.sqlite') if native else "/run/worker-journal/claim.sqlite",
             report_file=str(report_file) if native else "/run/host-report/" + report_file.name,
             work_dir='.' if native else "/work", **worker_options)))
-        binding = dict(authority_id=UUID(config["authority_id"]),
-            host_id=UUID(config["host_id"]), boot_id=UUID(config["boot_id"]), epoch=config["epoch"],
-            execution_scope=config["execution_scope"])
         if native:
             from .windows_supervisor import WindowsSupervisor
             path('work_root').mkdir(parents=True, exist_ok=True)
@@ -255,9 +258,6 @@ async def run(config_path):
             supervisor = DockerSupervisor(private_journal, path("work_root"), **binding,
                 cgroup_parent=config["cgroup_parent"], network_id=config["network_id"])
         journal = ClaimJournal(worker_directory / "claim.sqlite")
-        key = key_file.read_bytes()
-        if len(key) < 32:
-            raise ValueError("supervisor signing key requires at least 32 bytes")
         instance = UUID(config["worker_instance_id"])
         environment = dict(config.get("environment", {}))
         if finalizer is not None:
