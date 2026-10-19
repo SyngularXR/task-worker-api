@@ -20,6 +20,7 @@ import httpx
 from .client import _is_transient_status
 from .resources import AdmissionError
 from .errors import ProtocolError
+from .schemas import TASK_PARAMS_SCHEMAS
 
 
 async def _log_resources(claim, read_report, event, started):
@@ -218,6 +219,16 @@ async def run(config_path):
             mounts[str((config_path.parent / finalizer[name]).resolve(strict=True))] = target
             worker_options[name] = target
     else:
+        handlers = config["handlers"]
+        if not isinstance(handlers, dict) or not handlers:
+            raise ValueError("handlers must map at least one task type to module:function")
+        known = {kind.value for kind in TASK_PARAMS_SCHEMAS}
+        for kind, spec in handlers.items():
+            if kind not in known:
+                raise ValueError(f"handler task type {kind!r} has no registered schema")
+            module_name, colon, name = spec.partition(":") if isinstance(spec, str) else ("", "", "")
+            if not (module_name and colon and name):
+                raise ValueError(f"handler for {kind!r} must be module:function")
         task_types = list(config["handlers"])
         worker_options["handlers"] = config["handlers"]
     for source, target in config.get("read_only_mounts", {}).items():
