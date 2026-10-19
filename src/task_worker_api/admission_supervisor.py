@@ -258,6 +258,13 @@ async def run(config_path):
         or budget <= 0
     ):
         raise ValueError(f"retry_sleep_budget_s must be a finite number > 0 (got {budget})")
+    environment = dict(config.get("environment", {}))
+    if finalizer is not None:
+        environment["SHARED_DATA_PATH"] = "/app/shared"
+    if native:
+        from .windows_supervisor import check_environment
+        environment = {**{name: os.environ[name] for name in ('SystemRoot', 'LOCALAPPDATA', 'ProgramFiles')}, **environment}
+        check_environment(environment)
     with _singleton(private_journal.with_suffix(".lock")):
         worker_config.write_text(json.dumps(dict(backend_url=config["worker_backend_url"], worker_id=config["worker_id"],
             credential_file=str(credential_file) if native else "/run/worker-credential",
@@ -273,13 +280,9 @@ async def run(config_path):
                 cgroup_parent=config["cgroup_parent"], network_id=config["network_id"])
         journal = ClaimJournal(worker_directory / "claim.sqlite")
         instance = UUID(config["worker_instance_id"])
-        environment = dict(config.get("environment", {}))
-        if finalizer is not None:
-            environment["SHARED_DATA_PATH"] = "/app/shared"
         if native:
             launch = dict(command=[str(python), '-I', '-m', module, str(worker_config)],
-                read_only_paths=list(mounts), network=True,
-                environment={**{name: os.environ[name] for name in ('SystemRoot', 'LOCALAPPDATA', 'ProgramFiles')}, **environment})
+                read_only_paths=list(mounts), network=True, environment=environment)
         else:
             launch = dict(image=config["image_id"], command=["python", "-m", module, "/run/worker-config.json"],
                 read_only_mounts=mounts, environment=environment, publication_directory=publication_directory)

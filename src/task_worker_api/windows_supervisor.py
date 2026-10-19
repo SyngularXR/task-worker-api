@@ -12,6 +12,16 @@ from .windows_job import WindowsAppContainer, WindowsJob
 from .windows_launch import WindowsLaunchJournal
 
 
+def check_environment(environment):
+    if len({name.upper() for name in environment}) != len(environment):
+        raise ValueError('Duplicate Windows environment variable')
+    for name, value in environment.items():
+        if (not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name) or not isinstance(value, str)
+                or name.upper() in ('CUDA_VISIBLE_DEVICES', 'NVIDIA_VISIBLE_DEVICES', 'SYNPUSHER_TARGETS',
+                                    'SPECTRA_GPU_BACKEND', 'SPECTRA_GPU_ID', 'TEMP', 'TMP')):
+            raise ValueError('invalid or supervisor-owned environment variable')
+
+
 class WindowsSupervisor:
     def __init__(self, journal, work_root, **binding):
         self.journal = WindowsLaunchJournal(journal, work_root=work_root, **binding)
@@ -23,13 +33,7 @@ class WindowsSupervisor:
 
     def launch(self, claim, *, command, read_only_paths, journal_directory, environment, network):
         environment = dict(environment)
-        if len({name.upper() for name in environment}) != len(environment):
-            raise ValueError('Duplicate Windows environment variable')
-        for name, value in environment.items():
-            if (not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name) or not isinstance(value, str)
-                    or name.upper() in ('CUDA_VISIBLE_DEVICES', 'NVIDIA_VISIBLE_DEVICES', 'SYNPUSHER_TARGETS',
-                                        'SPECTRA_GPU_BACKEND', 'SPECTRA_GPU_ID', 'TEMP', 'TMP')):
-                raise ValueError('invalid or supervisor-owned environment variable')
+        check_environment(environment)
         environment['CUDA_VISIBLE_DEVICES'] = claim.gpu_uuid or '-1'
         environment['NVIDIA_VISIBLE_DEVICES'] = claim.gpu_uuid or 'void'
         if claim.profile.gpu_backend in ('vulkan', 'dx12'):
