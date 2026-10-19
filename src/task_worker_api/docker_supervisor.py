@@ -29,6 +29,17 @@ IMAGE_ID_PATTERN = re.compile(r"sha256:[a-f0-9]{64}")
 NETWORK_ID_PATTERN = re.compile(r"[a-f0-9]{64}")
 
 
+def check_read_only_mount(journal, source, target, publication_directory):
+    """Reject a read-only mount that launch must refuse."""
+    resolved = Path(source).resolve(strict=True)
+    if (journal == resolved or journal.is_relative_to(resolved)
+            or resolved.name in ("docker.sock", "docker_engine") or not target.startswith("/")
+            or target == "/" or target == "/work" or target.startswith("/work/")):
+        raise ValueError("unsafe worker mount")
+    if publication_directory is not None and (target == "/app" or target == "/app/shared" or target.startswith("/app/shared/")):
+        raise ValueError("publication mount overlaps a read-only mount")
+
+
 class DockerSupervisor:
     def __init__(self, journal: Path, work_root: Path, *, authority_id, host_id, boot_id, epoch, execution_scope, cgroup_parent, network_id, observe_only=False):
         self.authority_id, self.host_id, self.boot_id, self.epoch = authority_id, host_id, boot_id, epoch
@@ -325,13 +336,7 @@ class DockerSupervisor:
         # Compute gets only attempt scratch and its claim journal writable.
         # The dedicated backend finalizer may also write its publication store.
         for source, target in read_only_mounts.items():
-            resolved = Path(source).resolve(strict=True)
-            if (self.journal == resolved or self.journal.is_relative_to(resolved)
-                    or resolved.name in ("docker.sock", "docker_engine") or not target.startswith("/")
-                    or target == "/" or target == "/work" or target.startswith("/work/")):
-                raise ValueError("unsafe worker mount")
-            if publication_directory is not None and (target == "/app" or target == "/app/shared" or target.startswith("/app/shared/")):
-                raise ValueError("publication mount overlaps a read-only mount")
+            check_read_only_mount(self.journal, source, target, publication_directory)
         deadline = min(claim.lease_expires_at, claim.residence_deadline) if service else claim.staging_deadline
         remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0:
