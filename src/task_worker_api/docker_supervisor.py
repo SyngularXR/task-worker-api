@@ -25,10 +25,14 @@ from .resource_protocol import CleanupObservation, SignedCleanup, observation_si
 from .service_protocol import ServiceGrant
 
 
+IMAGE_ID_PATTERN = re.compile(r"sha256:[a-f0-9]{64}")
+NETWORK_ID_PATTERN = re.compile(r"[a-f0-9]{64}")
+
+
 class DockerSupervisor:
     def __init__(self, journal: Path, work_root: Path, *, authority_id, host_id, boot_id, epoch, execution_scope, cgroup_parent, network_id, observe_only=False):
         self.authority_id, self.host_id, self.boot_id, self.epoch = authority_id, host_id, boot_id, epoch
-        if not re.fullmatch(r"[a-f0-9]{64}", network_id):
+        if not NETWORK_ID_PATTERN.fullmatch(network_id):
             raise ValueError("supervisor requires an inspected Docker network ID")
         self.network_id = network_id
         self.execution_scope, self.cgroup_parent = execution_scope, cgroup_parent
@@ -276,7 +280,7 @@ class DockerSupervisor:
 
     def launch(self, claim, *, image: str, command: list[str], read_only_mounts: dict[str, str], journal_directory: Path | None = None, environment: dict[str, str] | None = None, publication_directory: Path | None = None):
         self._binding(claim)
-        if not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or not command:
+        if not IMAGE_ID_PATTERN.fullmatch(image) or not command:
             raise ValueError("launch requires an inspected image ID and command")
         service = isinstance(claim, ServiceGrant)
         if claim.state != ('warming' if service else 'reserved'):
