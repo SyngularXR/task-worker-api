@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -249,6 +250,14 @@ async def run(config_path):
     credential = credential_file.read_text().strip()
     if not credential:
         raise ValueError("credential_file is empty")
+    budget = config.get("retry_sleep_budget_s", 600)
+    if budget is not None and (
+        isinstance(budget, bool)
+        or not isinstance(budget, (int, float))
+        or not math.isfinite(budget)
+        or budget <= 0
+    ):
+        raise ValueError(f"retry_sleep_budget_s must be a finite number > 0 (got {budget})")
     with _singleton(private_journal.with_suffix(".lock")):
         worker_config.write_text(json.dumps(dict(backend_url=config["worker_backend_url"], worker_id=config["worker_id"],
             credential_file=str(credential_file) if native else "/run/worker-credential",
@@ -279,7 +288,7 @@ async def run(config_path):
             return SignedHostReport.model_validate_json(report_file.read_text())
 
         async with BackendClient(config["backend_url"], credential,
-                                 retry_sleep_budget_s=config.get("retry_sleep_budget_s", 600)) as client:
+                                 retry_sleep_budget_s=budget) as client:
             needs_ready = journal.pending() is None
             failures = 0
             while True:
