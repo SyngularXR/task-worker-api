@@ -28,3 +28,26 @@ jobs:
           .venv/bin/python -m pip install -e ".[dev]"
       - name: Run pytest
         run: pytest -v
+
+  windows-supervisor:
+    name: Windows supervisor verification (py3.12)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + dev deps
+        run: python -m pip install -e ".[dev]"
+      - name: Run supervisor verification
+        shell: bash
+        run: python -m pytest tests/test_docker_supervisor.py tests/test_windows_supervisor.py -v -ra --junitxml=supervisor-results.xml 2>&1 | tee supervisor-output.txt
+      - name: Upload supervisor verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supervisor-verification-windows-py312
+          path: |
+            supervisor-output.txt
+            supervisor-results.xml
+          if-no-files-found: warn
