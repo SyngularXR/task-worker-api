@@ -68,3 +68,27 @@ def test_reboot_inspection_reads_journal_and_refuses_leftovers(tmp_path, monkeyp
     assert journal.read_bytes() == before
     if fault == "scratch":
         assert (root / "leftover").read_text() == "never delete me"
+
+
+@pytest.mark.parametrize("key,operation_id,epoch", [
+    (b"k" * 16, str(uuid4()), 1),
+    (b"k" * 32, "not-a-uuid", 1),
+    (b"k" * 32, str(uuid4()), 0),
+    (b"k" * 32, str(uuid4()), "1"),
+], ids=["short-key", "bad-operation-id", "zero-epoch", "string-epoch"])
+def test_static_signing_config_is_rejected_before_any_work(tmp_path, monkeypatch, key, operation_id, epoch):
+    host, old_boot, authority = uuid4(), uuid4(), uuid4()
+    (tmp_path / "key").write_bytes(key)
+    config = {"reporter": {"host_id": str(host), "boot_id": str(old_boot), "authority_id": str(authority),
+        "epoch": epoch, "signing_key_file": str(tmp_path / "key")}, "operation_id": operation_id,
+        "reason": "test reboot", "expected_attempts": [], "journals": []}
+
+    def fail(*args, **kwargs):
+        pytest.fail("work ran before static config validation")
+
+    monkeypatch.setattr(recovery, "physical_boot_id", fail)
+    monkeypatch.setattr(recovery, "_docker_inventory", fail)
+    with pytest.raises(ValueError):
+        recovery.inspect_reboot(config)
+    with pytest.raises(ValueError):
+        recovery.cleanup_windows_after_reboot(config)
