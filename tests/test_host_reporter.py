@@ -122,6 +122,8 @@ def startup_config(tmp_path, monkeypatch):
     monkeypatch.setattr(host_reporter, "publish_report", fail)
     monkeypatch.setattr("task_worker_api.borrowing_observer.BorrowingObserver", fail)
     return {"authority_id": str(uuid4()), "host_id": str(uuid4()), "boot_id": str(uuid4()), "epoch": 1,
+            "ram_headroom_mib": 0, "cpu_headroom_millicores": 0,
+            "gpu_headroom_mib": {}, "scratch_headroom_mib": {},
             "signing_key_file": str(tmp_path / "key"), "borrowing": {}}
 
 
@@ -142,6 +144,18 @@ def test_run_rejects_malformed_binding_id_at_startup(startup_config, name):
 def test_run_rejects_invalid_epoch_at_startup(startup_config, epoch):
     startup_config["epoch"] = epoch
     with pytest.raises(ValueError, match="epoch must be a positive integer"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("name, value", [
+    ("ram_headroom_mib", -1),
+    ("cpu_headroom_millicores", "0"),
+    ("gpu_headroom_mib", {"GPU-" + str(uuid4()): -1}),
+    ("scratch_headroom_mib", {"filesystem:" + str(uuid4()): 1.5}),
+])
+def test_run_rejects_invalid_headroom_at_startup(startup_config, name, value):
+    startup_config[name] = value
+    with pytest.raises(ValueError, match="resource headroom must be a nonnegative integer"):
         asyncio.run(host_reporter.run(startup_config))
 
 
@@ -179,6 +193,8 @@ def test_throttled_host_report_resumes_within_heartbeat_ceiling(tmp_path, monkey
                         lambda **kw: real_client(transport=httpx.MockTransport(reply), **kw))
     (tmp_path / "key").write_bytes(b"k" * 32)
     config = {"backend_url": "http://backend/api/v1", "signing_key_file": str(tmp_path / "key"),
+              "ram_headroom_mib": 0, "cpu_headroom_millicores": 0,
+              "gpu_headroom_mib": {}, "scratch_headroom_mib": {},
               "authority_id": str(uuid4()), "host_id": str(uuid4()), "boot_id": str(uuid4()), "epoch": 1}
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(host_reporter.run(config))
