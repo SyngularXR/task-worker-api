@@ -100,7 +100,7 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    config["Supervisor startup: validate compute handler map, signing key length and binding UUIDs before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
+    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length and binding UUIDs before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
     backend --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and input paths; stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
@@ -129,8 +129,10 @@ Before claiming, supervisor startup rejects an empty or non-dict compute handler
 map, task types without a registered parameter schema, and specifications without
 nonempty module and function parts separated by `:`. Startup also reads the signing key,
 rejects a key shorter than 32 bytes, and parses `authority_id`, `host_id` and `boot_id`
-as UUIDs. These configuration errors raise `ValueError` before the singleton lock,
-worker configuration write, supervisor and claim journal creation or backend
+as UUIDs. Startup reads and strips `credential_file`, rejecting an empty result
+with `ValueError('credential_file is empty')`. These configuration errors raise
+`ValueError` before the singleton lock, worker configuration write, supervisor
+and claim journal creation or backend
 client construction; startup may already have created directories. Handler modules
 remain deferred until start acknowledgement. Trusted backend finalizers keep their
 separate task allowlist.
