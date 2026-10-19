@@ -139,8 +139,8 @@ async def test_native_operator_configuration_excludes_signing_state(tmp_path, mo
     path.write_text(json.dumps(config))
 
     class Client:
-        def __init__(self, *args):
-            pass
+        def __init__(self, *args, retry_sleep_budget_s):
+            assert retry_sleep_budget_s == 600
         async def __aenter__(self):
             return self
         async def __aexit__(self, *args):
