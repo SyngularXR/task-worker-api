@@ -100,7 +100,8 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    backend["Backend: reserve admitted task and frozen input/profile"] --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
+    config["Supervisor startup: validate compute handler map before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
+    backend --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and input paths; stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
     refused --> reconcile
@@ -123,6 +124,14 @@ distinct responsibilities. Do not substitute this route for polling, or imply
 an adapter is deployed because `run_admitted` exists. Staging failures before
 start acknowledgement are reconciled by the supervisor, not failed as started
 compute. The SDK entrypoint imports the handler only after start acknowledgement.
+
+Before claiming, supervisor startup rejects an empty or non-dict compute handler
+map, task types without a registered parameter schema, and specifications without
+nonempty module and function parts separated by `:`. These configuration errors
+raise `ValueError` before the singleton lock, worker configuration write or backend
+client construction; startup may already have created directories. Handler modules
+remain deferred until start acknowledgement. Trusted backend finalizers keep their
+separate task allowlist.
 
 Input staging rejects case-insensitive duplicate paths and file/directory prefix
 conflicts before creating the attempt directory or downloading bytes. Sibling
