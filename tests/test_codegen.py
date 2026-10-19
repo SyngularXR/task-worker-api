@@ -44,6 +44,13 @@ def test_no_duplicate_interface_for_alias(generated_ts):
     assert count == 1, f"expected exactly one GsBuildParams interface, got {count}"
 
 
+def test_interactive_prompts_emit_nested_types_and_numeric_labels(generated_ts):
+    assert "export interface InteractiveSeeds" in generated_ts
+    assert "export interface InteractiveSeed" in generated_ts
+    assert "dims: [number, number, number]" in generated_ts
+    assert "point_labels?: Array<0 | 1>" in generated_ts
+
+
 def test_every_registry_interface_emitted_once(generated_ts):
     """Generalize the dedup guard: each distinct interface name appears once."""
     import re
