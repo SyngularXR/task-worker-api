@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 import os
 from types import SimpleNamespace
@@ -110,9 +111,35 @@ def test_windows_boot_identity_uses_kernel_guid_not_clock(monkeypatch):
     assert host_reporter.physical_boot_id(host, None) == uuid5(host, str(boot))
 
 
+@pytest.fixture
+def startup_config(tmp_path, monkeypatch):
+    (tmp_path / "key").write_bytes(b"k" * 32)
+
+    def fail(*args, **kwargs):
+        pytest.fail("invalid static config must fail before reporter setup or publication")
+
+    monkeypatch.setattr(host_reporter.httpx, "AsyncClient", fail)
+    monkeypatch.setattr(host_reporter, "publish_report", fail)
+    monkeypatch.setattr("task_worker_api.borrowing_observer.BorrowingObserver", fail)
+    return {"authority_id": str(uuid4()), "host_id": str(uuid4()), "boot_id": str(uuid4()),
+            "signing_key_file": str(tmp_path / "key"), "borrowing": {}}
+
+
+def test_run_rejects_short_signing_key_at_startup(startup_config, tmp_path):
+    (tmp_path / "key").write_bytes(b"k" * 16)
+    with pytest.raises(ValueError, match="signing key requires at least 32 bytes"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("name", ["authority_id", "host_id", "boot_id"])
+def test_run_rejects_malformed_binding_id_at_startup(startup_config, name):
+    startup_config[name] = "not-a-uuid"
+    with pytest.raises(ValueError, match="badly formed hexadecimal UUID string"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
 @pytest.mark.parametrize("headers, posts", [({"Retry-After": "21600"}, 2), ({}, 15)])
-def test_throttled_host_report_resumes_within_heartbeat_ceiling(monkeypatch, headers, posts):
-    import asyncio
+def test_throttled_host_report_resumes_within_heartbeat_ceiling(tmp_path, monkeypatch, headers, posts):
     import httpx
 
     clock, sent = [0.0], []
@@ -132,7 +159,10 @@ def test_throttled_host_report_resumes_within_heartbeat_ceiling(monkeypatch, hea
     monkeypatch.setattr(host_reporter.asyncio, "sleep", tick)
     monkeypatch.setattr(host_reporter.httpx, "AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(reply), **kw))
+    (tmp_path / "key").write_bytes(b"k" * 32)
+    config = {"backend_url": "http://backend/api/v1", "signing_key_file": str(tmp_path / "key"),
+              "authority_id": str(uuid4()), "host_id": str(uuid4()), "boot_id": str(uuid4())}
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(host_reporter.run({"backend_url": "http://backend/api/v1"}))
+        asyncio.run(host_reporter.run(config))
     assert len(sent) == posts
     assert max(sent) <= 70  # a 6h Retry-After parks the next post for 60s, not hours

@@ -102,13 +102,18 @@ def _snapshot(config, sequence):
     return snapshot
 
 
+def _signing_key(config) -> bytes:
+    key = Path(config["signing_key_file"]).read_bytes()
+    if len(key) < 32:
+        raise ValueError("reporter signing key requires at least 32 bytes")
+    return key
+
+
 def publish_report(config) -> SignedHostReport:
     """Commit sequence before collecting; a crash may skip numbers, never reuse one."""
     authority = UUID(config["authority_id"])
     binding = json.dumps({key: config[key] for key in ("authority_id", "host_id", "boot_id", "epoch")}, sort_keys=True)
-    key = Path(config["signing_key_file"]).read_bytes()
-    if len(key) < 32:
-        raise ValueError("reporter signing key requires at least 32 bytes")
+    key = _signing_key(config)
     with closing(sqlite3.connect(config["state_file"])) as db, db:
         db.execute("CREATE TABLE IF NOT EXISTS reporter (id INTEGER PRIMARY KEY CHECK(id=1), binding TEXT NOT NULL, sequence INTEGER NOT NULL)")
         db.execute("BEGIN IMMEDIATE")
@@ -137,6 +142,10 @@ def publish_report(config) -> SignedHostReport:
 
 
 async def run(config):
+    # Static configuration cannot repair itself; fail before the retry loop hides it.
+    _signing_key(config)
+    for name in ("authority_id", "host_id", "boot_id"):
+        UUID(config[name])
     observer = None
     if "borrowing" in config:
         try:
