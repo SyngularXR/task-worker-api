@@ -175,7 +175,7 @@ async def run(config_path):
     """
     from .client import BackendClient
     from .claim_journal import ClaimJournal
-    from .docker_supervisor import DockerSupervisor
+    from .docker_supervisor import DockerSupervisor, IMAGE_ID_PATTERN, NETWORK_ID_PATTERN
     from .resource_protocol import SignedHostReport
 
     config = json.loads(config_path.read_text())
@@ -244,6 +244,12 @@ async def run(config_path):
         execution_scope=config["execution_scope"])
     if type(config["epoch"]) is not int or config["epoch"] < 1:
         raise ValueError("supervisor epoch must be a positive integer")
+    if launcher == 'docker':
+        for name, pattern, message in (
+                ('image_id', IMAGE_ID_PATTERN, 'launch requires an inspected image ID and command'),
+                ('network_id', NETWORK_ID_PATTERN, 'supervisor requires an inspected Docker network ID')):
+            if not isinstance(config[name], str) or pattern.fullmatch(config[name]) is None:
+                raise ValueError(message)
     key = key_file.read_bytes()
     if len(key) < 32:
         raise ValueError("supervisor signing key requires at least 32 bytes")

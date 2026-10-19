@@ -100,7 +100,7 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length, binding UUIDs, retry sleep budget and native merged launch environment before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
+    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length, binding UUIDs, retry sleep budget, Docker image and network identifier formats and native merged launch environment before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
     backend --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and input paths; stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
@@ -139,6 +139,15 @@ finite positive number, excluding booleans. Its default remains 600 seconds;
 `null` passes through as `None` to restore the unbounded backend client default.
 Handler modules remain deferred until start acknowledgement. Trusted backend
 finalizers keep their separate task allowlist.
+
+For `launcher='docker'`, startup checks both identifier formats: `image_id` must
+be a string of `sha256:` followed by 64 lowercase hexadecimal digits, and
+`network_id` must be a string of 64 lowercase hexadecimal digits. Another type
+or format raises `ValueError` with the existing inspected image ID or inspected
+Docker network ID message before the singleton lock, worker configuration write,
+supervisor and claim journal creation or backend client construction. Startup
+may already have created directories. This checks formats without Docker CLI
+inspection.
 
 For `launcher='windows'`, startup merges `SystemRoot`, `LOCALAPPDATA` and
 `ProgramFiles` from `os.environ` with the configured environment. This native
