@@ -248,6 +248,22 @@ export interface Gs4dBuildParams {
   n_phases?: number;
 }
 
+export interface InteractiveSeed {
+  slice: number;
+  obj_id: number;
+  mask_png_b64?: string;
+  box?: [number, number, number, number];
+  points?: Array<[number, number]>;
+  point_labels?: Array<0 | 1>;
+}
+
+export interface InteractiveSeeds {
+  dims: [number, number, number];
+  axis: number;
+  depth_range: [number, number];
+  seeds: Array<InteractiveSeed>;
+}
+
 /**
  * Input for Neural-Canvas's one-shot segmentation handler.
  */
@@ -297,6 +313,8 @@ export interface SegmentationParams {
   seed_slice?: number;
   seed_box?: Array<number>;
   medsam2_modality?: string;
+  interactive_seeds?: InteractiveSeeds;
+  result_kind?: 'saved' | 'preview';
   labels?: Array<string>;
 }
 
@@ -319,6 +337,19 @@ export interface DeployCaseParams {
  */
 export interface PrepareDeployParams {
   recipe_path?: "recipe.json";
+}
+
+/**
+ * One source MRI plane resolved server-side from a Dicom row.
+ */
+export interface SyntheticSource {
+  dicom_id: number;
+  /** Source NIfTI on the shared volume. */
+  nifti_path: string;
+  /** axial | coronal | sagittal. */
+  orientation: string;
+  sequence_key?: string;
+  name: string;
 }
 
 /**

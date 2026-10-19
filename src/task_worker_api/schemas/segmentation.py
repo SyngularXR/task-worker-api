@@ -19,11 +19,12 @@ Field families:
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field
 
 from ._base import TaskParamsBase
+from .interactive_segmentation import InteractiveSeeds
 
 
 class SegmentationParams(TaskParamsBase):
@@ -89,6 +90,8 @@ class SegmentationParams(TaskParamsBase):
     seed_slice: Optional[int] = Field(default=None, ge=0)
     seed_box: Optional[list[int]] = None
     medsam2_modality: Optional[str] = None
+    interactive_seeds: InteractiveSeeds | None = None
+    result_kind: Literal["saved", "preview"] = "saved"
 
     # DEPRECATED: alias for label_prompt, kept one release for a half-rolled
     # fleet (design A1). Remove in 0.10.0. The handler prefers label_prompt.

@@ -38,7 +38,7 @@ def _pyty_to_ts(schema: dict, defs: dict[str, dict]) -> str:
 
     # enum → TS string-literal union
     if "enum" in schema:
-        return " | ".join(f"'{v}'" for v in schema["enum"])
+        return " | ".join(f"'{v}'" if isinstance(v, str) else json.dumps(v) for v in schema["enum"])
 
     # anyOf / oneOf → TS union; drop null for optionality (we emit `?`)
     if "anyOf" in schema or "oneOf" in schema:
@@ -58,6 +58,8 @@ def _pyty_to_ts(schema: dict, defs: dict[str, dict]) -> str:
     if t == "null":
         return "null"
     if t == "array":
+        if "prefixItems" in schema:
+            return "[" + ", ".join(_pyty_to_ts(item, defs) for item in schema["prefixItems"]) + "]"
         items = schema.get("items") or {}
         return f"Array<{_pyty_to_ts(items, defs)}>"
     if t == "object":
@@ -162,6 +164,10 @@ def _emit_schemas() -> str:
         seen_interfaces.add(interface_name)
         schema = model_cls.model_json_schema()
         defs = schema.get("$defs") or {}
+        for name, definition in defs.items():
+            if name not in seen_interfaces:
+                seen_interfaces.add(name)
+                parts.append(_render_interface(name, definition, defs))
         parts.append(_render_interface(interface_name, schema, defs))
 
     # Emit a discriminated union helper so TS callers can narrow on task_type.
