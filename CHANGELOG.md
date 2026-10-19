@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0.dev64
+
+- Add bounded `InteractiveSeeds` with per-lesion mask/box/point prompts, input
+  dimensions, axis and inclusive propagation range. `SegmentationParams` carries
+  frozen prompts and distinguishes editable previews from saved segmentation
+  outputs. Generate the nested TypeScript interfaces and numeric point labels.
+
 ## 0.19.0.dev63
 
 - `ModelInitializingParams` and `CinematicBakingParams` reject a `base_name`
