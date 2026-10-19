@@ -388,6 +388,9 @@ async def test_supervisor_validates_handlers_before_startup(tmp_path, monkeypatc
     ("authority_id", "not-a-uuid", b"s" * 32, None),
     ("host_id", "not-a-uuid", b"s" * 32, None),
     ("boot_id", "not-a-uuid", b"s" * 32, None),
+    ("epoch", 0, b"s" * 32, "epoch must be a positive integer"),
+    ("epoch", "1", b"s" * 32, "epoch must be a positive integer"),
+    ("epoch", True, b"s" * 32, "epoch must be a positive integer"),
 ])
 async def test_supervisor_validates_key_and_binding_before_startup(tmp_path, monkeypatch, field, value, key, match):
     from task_worker_api import admission_supervisor

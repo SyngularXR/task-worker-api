@@ -241,6 +241,8 @@ async def run(config_path):
     binding = dict(authority_id=UUID(config["authority_id"]),
         host_id=UUID(config["host_id"]), boot_id=UUID(config["boot_id"]), epoch=config["epoch"],
         execution_scope=config["execution_scope"])
+    if type(config["epoch"]) is not int or config["epoch"] < 1:
+        raise ValueError("supervisor epoch must be a positive integer")
     key = key_file.read_bytes()
     if len(key) < 32:
         raise ValueError("supervisor signing key requires at least 32 bytes")
