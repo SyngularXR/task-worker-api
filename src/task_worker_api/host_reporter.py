@@ -109,8 +109,14 @@ def _signing_key(config) -> bytes:
     return key
 
 
+def _epoch(config):
+    if type(config["epoch"]) is not int or config["epoch"] < 1:
+        raise ValueError("reporter epoch must be a positive integer")
+
+
 def publish_report(config) -> SignedHostReport:
     """Commit sequence before collecting; a crash may skip numbers, never reuse one."""
+    _epoch(config)
     authority = UUID(config["authority_id"])
     binding = json.dumps({key: config[key] for key in ("authority_id", "host_id", "boot_id", "epoch")}, sort_keys=True)
     key = _signing_key(config)
@@ -146,6 +152,7 @@ async def run(config):
     _signing_key(config)
     for name in ("authority_id", "host_id", "boot_id"):
         UUID(config[name])
+    _epoch(config)
     observer = None
     if "borrowing" in config:
         try:
