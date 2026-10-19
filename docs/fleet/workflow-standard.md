@@ -100,7 +100,7 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length and binding UUIDs before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
+    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length, binding UUIDs and retry sleep budget before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
     backend --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and input paths; stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
@@ -133,9 +133,12 @@ as UUIDs. Startup reads and strips `credential_file`, rejecting an empty result
 with `ValueError('credential_file is empty')`. These configuration errors raise
 `ValueError` before the singleton lock, worker configuration write, supervisor
 and claim journal creation or backend
-client construction; startup may already have created directories. Handler modules
-remain deferred until start acknowledgement. Trusted backend finalizers keep their
-separate task allowlist.
+client construction; startup may already have created directories. The optional
+`retry_sleep_budget_s` is also checked at this boundary: it must be `null` or a
+finite positive number, excluding booleans. Its default remains 600 seconds;
+`null` passes through as `None` to restore the unbounded backend client default.
+Handler modules remain deferred until start acknowledgement. Trusted backend
+finalizers keep their separate task allowlist.
 
 Input staging rejects case-insensitive duplicate paths and file/directory prefix
 conflicts before creating the attempt directory or downloading bytes. Sibling
