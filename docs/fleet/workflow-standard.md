@@ -100,7 +100,7 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length, binding UUIDs, retry sleep budget, Docker image and network identifier formats and native merged launch environment before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
+    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length, binding UUIDs, retry sleep budget, Docker image and network identifier formats, operator read-only mount sources and targets and native merged launch environment before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
     backend --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and input paths; stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
@@ -148,6 +148,22 @@ Docker network ID message before the singleton lock, worker configuration write,
 supervisor and claim journal creation or backend client construction. Startup
 may already have created directories. This checks formats without Docker CLI
 inspection.
+
+Docker startup also checks each operator `read_only_mounts` entry with the shared
+launch validator. Sources resolve strictly; a missing source raises
+`FileNotFoundError`. A source must not equal or contain the private supervisor
+journal, or be named `docker.sock` or `docker_engine`. Targets must start with
+`/` and must not be `/`, `/work` or under `/work/`. When `backend_finalizer`
+supplies `publication_directory`, targets `/app`, `/app/shared` and paths under
+`/app/shared/` are also rejected. Refusals retain the launch messages
+`ValueError('unsafe worker mount')` and
+`ValueError('publication mount overlaps a read-only mount')`. The existing
+journal/signing-key exclusion and duplicate-target checks run first and retain
+their messages. Internal supervisor mounts are checked at launch; they are
+excluded from startup validation because the worker configuration file does not
+exist until it is written. Operator validation runs before the singleton lock,
+worker configuration write, supervisor and claim journal creation or backend
+client construction; startup may already have created directories.
 
 For `launcher='windows'`, startup merges `SystemRoot`, `LOCALAPPDATA` and
 `ProgramFiles` from `os.environ` with the configured environment. This native

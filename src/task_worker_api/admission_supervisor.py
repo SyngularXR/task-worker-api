@@ -175,7 +175,7 @@ async def run(config_path):
     """
     from .client import BackendClient
     from .claim_journal import ClaimJournal
-    from .docker_supervisor import DockerSupervisor, IMAGE_ID_PATTERN, NETWORK_ID_PATTERN
+    from .docker_supervisor import DockerSupervisor, IMAGE_ID_PATTERN, NETWORK_ID_PATTERN, check_read_only_mount
     from .resource_protocol import SignedHostReport
 
     config = json.loads(config_path.read_text())
@@ -239,6 +239,8 @@ async def run(config_path):
             raise ValueError("worker mounts must exclude supervisor journal and signing key")
     if len(set(mounts.values())) != len(mounts):
         raise ValueError("duplicate worker mount targets")
+    for source, target in config.get("read_only_mounts", {}).items():
+        check_read_only_mount(private_journal, config_path.parent / source, target, publication_directory)
     binding = dict(authority_id=UUID(config["authority_id"]),
         host_id=UUID(config["host_id"]), boot_id=UUID(config["boot_id"]), epoch=config["epoch"],
         execution_scope=config["execution_scope"])
