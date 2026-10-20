@@ -550,6 +550,7 @@ async def test_fault_delivery_runs_while_primary_hardware_sequences_continue_unc
     b=journal.binding
     (tmp_path/'reporter.key').write_bytes(KEY)
     config=dict(authority_id=str(b.authority_id),host_id=str(b.host_id),boot_id=str(b.boot_id),epoch=b.epoch,
+        ram_headroom_mib=0,cpu_headroom_millicores=0,gpu_headroom_mib={},scratch_headroom_mib={},
         signing_key_file=str(tmp_path/'reporter.key'),state_file=str(tmp_path/'primary.sqlite'),
         report_file=str(tmp_path/'primary.json'),backend_url='http://fixture/api/v1',borrowing={})
     observer=BorrowingObserver.__new__(BorrowingObserver)
@@ -680,6 +681,7 @@ async def test_established_observer_task_exit_records_hold_while_primary_reports
     b=journal.binding;observed(journal)
     (tmp_path/'reporter.key').write_bytes(KEY)
     config=dict(authority_id=str(b.authority_id),host_id=str(b.host_id),boot_id=str(b.boot_id),epoch=b.epoch,
+        ram_headroom_mib=0,cpu_headroom_millicores=0,gpu_headroom_mib={},scratch_headroom_mib={},
         signing_key_file=str(tmp_path/'reporter.key'),state_file=str(tmp_path/'primary.sqlite'),
         report_file=str(tmp_path/'primary.json'),backend_url='http://fixture/api/v1',borrowing={})
     observer=BorrowingObserver.__new__(BorrowingObserver)

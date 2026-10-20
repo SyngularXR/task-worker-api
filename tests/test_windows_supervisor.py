@@ -139,8 +139,8 @@ async def test_native_operator_configuration_excludes_signing_state(tmp_path, mo
     path.write_text(json.dumps(config))
 
     class Client:
-        def __init__(self, *args):
-            pass
+        def __init__(self, *args, retry_sleep_budget_s):
+            assert retry_sleep_budget_s == 600
         async def __aenter__(self):
             return self
         async def __aexit__(self, *args):
@@ -170,6 +170,39 @@ async def test_native_operator_configuration_excludes_signing_state(tmp_path, mo
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match='signing key'):
         await admission_supervisor.run(path)
+
+
+@pytest.mark.asyncio
+async def test_native_environment_rejected_before_startup(tmp_path, monkeypatch):
+    from task_worker_api import admission_supervisor
+
+    for name in ('private', 'report', 'credentials', 'runtime'):
+        (tmp_path/name).mkdir()
+    (tmp_path/'private/key').write_bytes(b'k'*32)
+    (tmp_path/'credentials/worker').write_text('test-only')
+    (tmp_path/'runtime/python.exe').write_bytes(b'config-test-placeholder')
+    config = dict(launcher='windows', authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()),
+        epoch=1, execution_scope='native-test', supervisor_journal='private/supervisor.sqlite', work_root='work',
+        worker_journal_directory='worker-journal', worker_instance_id=str(uuid4()), worker_id='native-test',
+        backend_url='http://test/api/v1', worker_backend_url='http://appcontainer/api/v1', credential_file='credentials/worker', report_file='report/snapshot.json',
+        signing_key_file='private/key', python_executable='runtime/python.exe', read_only_paths=['runtime'],
+        handlers={'render': 'src.services.resource_render_worker:run_admitted'}, environment={'SYSTEMROOT': 'x'})
+    path = tmp_path/'config.json'
+    path.write_text(json.dumps(config))
+
+    async def cycle(*args):
+        pytest.fail('invalid environment reached a claim cycle')
+
+    monkeypatch.setattr('task_worker_api.client.BackendClient',
+                       lambda *args, **kwargs: pytest.fail('invalid environment reached the backend client'))
+    monkeypatch.setattr(admission_supervisor, 'run_cycle', cycle)
+    with pytest.raises(ValueError, match='Duplicate Windows environment variable'):
+        await admission_supervisor.run(path)
+    assert not (tmp_path/f"private/worker-{config['worker_instance_id']}.json").exists()
+    assert not (tmp_path/'private/supervisor.lock').exists()
+    assert not (tmp_path/'private/supervisor.sqlite').exists()
+    assert not list((tmp_path/'worker-journal').iterdir())
+    assert not (tmp_path/'work').exists()
 
 
 @pytest.mark.parametrize('backend', ['cuda', 'vulkan', 'dx12'])

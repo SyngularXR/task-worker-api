@@ -25,10 +25,25 @@ from .resource_protocol import CleanupObservation, SignedCleanup, observation_si
 from .service_protocol import ServiceGrant
 
 
+IMAGE_ID_PATTERN = re.compile(r"sha256:[a-f0-9]{64}")
+NETWORK_ID_PATTERN = re.compile(r"[a-f0-9]{64}")
+
+
+def check_read_only_mount(journal, source, target, publication_directory):
+    """Reject a read-only mount that launch must refuse."""
+    resolved = Path(source).resolve(strict=True)
+    if (journal == resolved or journal.is_relative_to(resolved)
+            or resolved.name in ("docker.sock", "docker_engine") or not target.startswith("/")
+            or target == "/" or target == "/work" or target.startswith("/work/")):
+        raise ValueError("unsafe worker mount")
+    if publication_directory is not None and (target == "/app" or target == "/app/shared" or target.startswith("/app/shared/")):
+        raise ValueError("publication mount overlaps a read-only mount")
+
+
 class DockerSupervisor:
     def __init__(self, journal: Path, work_root: Path, *, authority_id, host_id, boot_id, epoch, execution_scope, cgroup_parent, network_id, observe_only=False):
         self.authority_id, self.host_id, self.boot_id, self.epoch = authority_id, host_id, boot_id, epoch
-        if not re.fullmatch(r"[a-f0-9]{64}", network_id):
+        if not NETWORK_ID_PATTERN.fullmatch(network_id):
             raise ValueError("supervisor requires an inspected Docker network ID")
         self.network_id = network_id
         self.execution_scope, self.cgroup_parent = execution_scope, cgroup_parent
@@ -276,7 +291,7 @@ class DockerSupervisor:
 
     def launch(self, claim, *, image: str, command: list[str], read_only_mounts: dict[str, str], journal_directory: Path | None = None, environment: dict[str, str] | None = None, publication_directory: Path | None = None):
         self._binding(claim)
-        if not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or not command:
+        if not IMAGE_ID_PATTERN.fullmatch(image) or not command:
             raise ValueError("launch requires an inspected image ID and command")
         service = isinstance(claim, ServiceGrant)
         if claim.state != ('warming' if service else 'reserved'):
@@ -321,13 +336,7 @@ class DockerSupervisor:
         # Compute gets only attempt scratch and its claim journal writable.
         # The dedicated backend finalizer may also write its publication store.
         for source, target in read_only_mounts.items():
-            resolved = Path(source).resolve(strict=True)
-            if (self.journal == resolved or self.journal.is_relative_to(resolved)
-                    or resolved.name in ("docker.sock", "docker_engine") or not target.startswith("/")
-                    or target == "/" or target == "/work" or target.startswith("/work/")):
-                raise ValueError("unsafe worker mount")
-            if publication_directory is not None and (target == "/app" or target == "/app/shared" or target.startswith("/app/shared/")):
-                raise ValueError("publication mount overlaps a read-only mount")
+            check_read_only_mount(self.journal, source, target, publication_directory)
         deadline = min(claim.lease_expires_at, claim.residence_deadline) if service else claim.staging_deadline
         remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0:

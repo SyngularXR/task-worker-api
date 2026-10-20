@@ -250,7 +250,7 @@ async def test_running_probe_fencing_error_ends_cycle(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("startup_failures", [0, 5])
-@pytest.mark.parametrize("budget", [{}, {"retry_sleep_budget_s": 30}])
+@pytest.mark.parametrize("budget", [{}, {"retry_sleep_budget_s": 30}, {"retry_sleep_budget_s": None}])
 async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_path, monkeypatch, startup_failures, budget):
     from task_worker_api import admission_supervisor
 
@@ -312,6 +312,367 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
         await asyncio.wait_for(admission_supervisor.run(path), timeout=5)
     assert retry_delays == [5, 10, 20, 40, 40][:startup_failures]
     assert client_kwargs["retry_sleep_budget_s"] == budget.get("retry_sleep_budget_s", 600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handlers, error", [
+    ({}, "handlers must map"),
+    (None, "handlers must map"),
+    (["render"], "handlers must map"),
+    ("render", "handlers must map"),
+    ({"not_a_type": "a.b:run"}, "'not_a_type' has no registered schema"),
+    ({"finalize_ct": "a.b:run"}, "'finalize_ct' has no registered schema"),
+    ({"render": "a.b.run"}, "'render' must be module:function"),
+    ({"render": ":run"}, "'render' must be module:function"),
+    ({"render": "a.b:"}, "'render' must be module:function"),
+    ({"render": 1}, "'render' must be module:function"),
+    ({"render": "src.services.resource_render_worker:run_admitted"}, None),
+])
+async def test_supervisor_validates_handlers_before_startup(tmp_path, monkeypatch, handlers, error):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text("test-only")
+    (tmp_path / "private/signing").write_bytes(b"s" * 32)
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        handlers=handlers)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            await admission_supervisor.run(path)
+        assert clients == cycles == []
+        assert not (tmp_path / f"private/worker-{config['worker_instance_id']}.json").exists()
+        assert not (tmp_path / "private/supervisor.lock").exists()
+        assert not (tmp_path / "private/supervisor.sqlite").exists()
+        assert not list((tmp_path / "worker-journal").iterdir())
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await admission_supervisor.run(path)
+        assert len(clients) == 1
+        assert cycles == [["render"]]
+        worker_config = json.loads((tmp_path / f"private/worker-{config['worker_instance_id']}.json").read_text())
+        assert worker_config["handlers"] == handlers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field, value, key, match", [
+    (None, None, b"s" * 16, "signing key requires at least 32 bytes"),
+    ("authority_id", "not-a-uuid", b"s" * 32, None),
+    ("host_id", "not-a-uuid", b"s" * 32, None),
+    ("boot_id", "not-a-uuid", b"s" * 32, None),
+    ("epoch", 0, b"s" * 32, "epoch must be a positive integer"),
+    ("epoch", "1", b"s" * 32, "epoch must be a positive integer"),
+    ("epoch", True, b"s" * 32, "epoch must be a positive integer"),
+])
+async def test_supervisor_validates_key_and_binding_before_startup(tmp_path, monkeypatch, field, value, key, match):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text("test-only")
+    (tmp_path / "private/signing").write_bytes(key)
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        handlers={"render": "src.services.resource_render_worker:run_admitted"})
+    if field is not None:
+        config[field] = value
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    with pytest.raises(ValueError, match=match):
+        await admission_supervisor.run(path)
+    assert clients == cycles == []
+    assert not (tmp_path / f"private/worker-{config['worker_instance_id']}.json").exists()
+    assert not (tmp_path / "private/supervisor.lock").exists()
+    assert not (tmp_path / "private/supervisor.sqlite").exists()
+    assert not list((tmp_path / "worker-journal").iterdir())
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [0, -5, "600", True, float("nan")],
+    ids=["zero", "negative", "string", "bool", "nan"])
+async def test_supervisor_validates_retry_sleep_budget_before_startup(tmp_path, monkeypatch, budget):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text("test-only")
+    (tmp_path / "private/signing").write_bytes(b"s" * 32)
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        handlers={"render": "src.services.resource_render_worker:run_admitted"}, retry_sleep_budget_s=budget)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    with pytest.raises(ValueError, match="retry_sleep_budget_s must be"):
+        await admission_supervisor.run(path)
+    assert clients == cycles == []
+    assert not (tmp_path / f"private/worker-{config['worker_instance_id']}.json").exists()
+    assert not (tmp_path / "private/supervisor.lock").exists()
+    assert not (tmp_path / "private/supervisor.sqlite").exists()
+    assert not list((tmp_path / "worker-journal").iterdir())
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value,message", [
+    ("image_id", "b" * 64, "image ID"),
+    ("image_id", "sha256:" + "B" * 64, "image ID"),
+    ("image_id", "", "image ID"),
+    ("image_id", 123, "image ID"),
+    ("network_id", "bridge", "network ID"),
+    ("network_id", "", "network ID"),
+    ("network_id", 123, "network ID"),
+])
+async def test_supervisor_validates_image_id_and_network_id_before_startup(tmp_path, monkeypatch, field, value, message):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text("test-only")
+    (tmp_path / "private/signing").write_bytes(b"s" * 32)
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        handlers={"render": "src.services.resource_render_worker:run_admitted"})
+    config[field] = value
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    with pytest.raises(ValueError, match=message):
+        await admission_supervisor.run(path)
+    assert clients == cycles == []
+    assert not (tmp_path / f"private/worker-{config['worker_instance_id']}.json").exists()
+    assert not (tmp_path / "private/supervisor.lock").exists()
+    assert not (tmp_path / "private/supervisor.sqlite").exists()
+    assert not list((tmp_path / "worker-journal").iterdir())
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,target,finalizer,error,message", [
+    ("missing-models", "/models", False, FileNotFoundError, None),
+    ("models", "models", False, ValueError, "unsafe worker mount"),
+    ("models", "/work/cache", False, ValueError, "unsafe worker mount"),
+    ("docker.sock", "/models", False, ValueError, "unsafe worker mount"),
+    ("models", "/models", False, None, None),
+    ("models", "/app", True, ValueError, "publication mount overlaps"),
+    ("models", "/app/shared", True, ValueError, "publication mount overlaps"),
+    ("models", "/app/shared/cache", True, ValueError, "publication mount overlaps"),
+    ("models", "/app/shared", False, None, None),
+], ids=["missing-source", "relative-target", "work-target", "docker-sock", "valid",
+        "finalizer-app", "finalizer-shared", "finalizer-child", "compute-shared"])
+async def test_supervisor_validates_read_only_mounts_before_startup(tmp_path, monkeypatch, source, target, finalizer, error, message):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials", "models"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text("test-only")
+    (tmp_path / "private/signing").write_bytes(b"s" * 32)
+    (tmp_path / "docker.sock").touch()
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        read_only_mounts={source: target})
+    if finalizer:
+        for name in ("publication", "artifacts"):
+            (tmp_path / name).mkdir()
+        for name in ("credentials/response", "credentials/database"):
+            (tmp_path / name).write_text("test-only")
+        config["backend_finalizer"] = dict(publication_directory="publication", artifact_root="artifacts",
+            response_key_file="credentials/response", database_url_file="credentials/database")
+    else:
+        config["handlers"] = {"render": "src.services.resource_render_worker:run_admitted"}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        assert launch["read_only_mounts"][str(tmp_path / source)] == target
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    if error is not None:
+        with pytest.raises(error, match=message):
+            await admission_supervisor.run(path)
+        assert clients == cycles == []
+        assert not (tmp_path / f"private/worker-{config['worker_instance_id']}.json").exists()
+        assert not (tmp_path / "private/supervisor.lock").exists()
+        assert not (tmp_path / "private/supervisor.sqlite").exists()
+        assert not list((tmp_path / "worker-journal").iterdir())
+        assert not (tmp_path / "work").exists()
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await admission_supervisor.run(path)
+        assert len(clients) == 1
+        assert cycles == [["render"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential", ["", "  \n"])
+async def test_supervisor_rejects_empty_credential_before_startup(tmp_path, monkeypatch, credential):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text(credential)
+    (tmp_path / "private/signing").write_bytes(b"s" * 32)
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        handlers={"render": "src.services.resource_render_worker:run_admitted"})
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    with pytest.raises(ValueError, match="credential_file is empty"):
+        await admission_supervisor.run(path)
+    assert clients == cycles == []
+    assert not (tmp_path / f"private/worker-{config['worker_instance_id']}.json").exists()
+    assert not (tmp_path / "private/supervisor.lock").exists()
+    assert not (tmp_path / "private/supervisor.sqlite").exists()
+    assert not list((tmp_path / "worker-journal").iterdir())
+    assert not (tmp_path / "work").exists()
 
 
 def test_supervisor_singleton_releases_lock_on_exit(tmp_path):

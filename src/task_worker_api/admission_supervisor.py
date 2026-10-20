@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -20,6 +21,7 @@ import httpx
 from .client import _is_transient_status
 from .resources import AdmissionError
 from .errors import ProtocolError
+from .schemas import TASK_PARAMS_SCHEMAS
 
 
 async def _log_resources(claim, read_report, event, started):
@@ -173,7 +175,7 @@ async def run(config_path):
     """
     from .client import BackendClient
     from .claim_journal import ClaimJournal
-    from .docker_supervisor import DockerSupervisor
+    from .docker_supervisor import DockerSupervisor, IMAGE_ID_PATTERN, NETWORK_ID_PATTERN, check_read_only_mount
     from .resource_protocol import SignedHostReport
 
     config = json.loads(config_path.read_text())
@@ -218,6 +220,16 @@ async def run(config_path):
             mounts[str((config_path.parent / finalizer[name]).resolve(strict=True))] = target
             worker_options[name] = target
     else:
+        handlers = config["handlers"]
+        if not isinstance(handlers, dict) or not handlers:
+            raise ValueError("handlers must map at least one task type to module:function")
+        known = {kind.value for kind in TASK_PARAMS_SCHEMAS}
+        for kind, spec in handlers.items():
+            if kind not in known:
+                raise ValueError(f"handler task type {kind!r} has no registered schema")
+            module_name, colon, name = spec.partition(":") if isinstance(spec, str) else ("", "", "")
+            if not (module_name and colon and name):
+                raise ValueError(f"handler for {kind!r} must be module:function")
         task_types = list(config["handlers"])
         worker_options["handlers"] = config["handlers"]
     for source, target in config.get("read_only_mounts", {}).items():
@@ -227,15 +239,46 @@ async def run(config_path):
             raise ValueError("worker mounts must exclude supervisor journal and signing key")
     if len(set(mounts.values())) != len(mounts):
         raise ValueError("duplicate worker mount targets")
+    for source, target in config.get("read_only_mounts", {}).items():
+        check_read_only_mount(private_journal, config_path.parent / source, target, publication_directory)
+    binding = dict(authority_id=UUID(config["authority_id"]),
+        host_id=UUID(config["host_id"]), boot_id=UUID(config["boot_id"]), epoch=config["epoch"],
+        execution_scope=config["execution_scope"])
+    if type(config["epoch"]) is not int or config["epoch"] < 1:
+        raise ValueError("supervisor epoch must be a positive integer")
+    if launcher == 'docker':
+        for name, pattern, message in (
+                ('image_id', IMAGE_ID_PATTERN, 'launch requires an inspected image ID and command'),
+                ('network_id', NETWORK_ID_PATTERN, 'supervisor requires an inspected Docker network ID')):
+            if not isinstance(config[name], str) or pattern.fullmatch(config[name]) is None:
+                raise ValueError(message)
+    key = key_file.read_bytes()
+    if len(key) < 32:
+        raise ValueError("supervisor signing key requires at least 32 bytes")
+    credential = credential_file.read_text().strip()
+    if not credential:
+        raise ValueError("credential_file is empty")
+    budget = config.get("retry_sleep_budget_s", 600)
+    if budget is not None and (
+        isinstance(budget, bool)
+        or not isinstance(budget, (int, float))
+        or not math.isfinite(budget)
+        or budget <= 0
+    ):
+        raise ValueError(f"retry_sleep_budget_s must be a finite number > 0 (got {budget})")
+    environment = dict(config.get("environment", {}))
+    if finalizer is not None:
+        environment["SHARED_DATA_PATH"] = "/app/shared"
+    if native:
+        from .windows_supervisor import check_environment
+        environment = {**{name: os.environ[name] for name in ('SystemRoot', 'LOCALAPPDATA', 'ProgramFiles')}, **environment}
+        check_environment(environment)
     with _singleton(private_journal.with_suffix(".lock")):
         worker_config.write_text(json.dumps(dict(backend_url=config["worker_backend_url"], worker_id=config["worker_id"],
             credential_file=str(credential_file) if native else "/run/worker-credential",
             journal_file=str(worker_directory/'claim.sqlite') if native else "/run/worker-journal/claim.sqlite",
             report_file=str(report_file) if native else "/run/host-report/" + report_file.name,
             work_dir='.' if native else "/work", **worker_options)))
-        binding = dict(authority_id=UUID(config["authority_id"]),
-            host_id=UUID(config["host_id"]), boot_id=UUID(config["boot_id"]), epoch=config["epoch"],
-            execution_scope=config["execution_scope"])
         if native:
             from .windows_supervisor import WindowsSupervisor
             path('work_root').mkdir(parents=True, exist_ok=True)
@@ -244,17 +287,10 @@ async def run(config_path):
             supervisor = DockerSupervisor(private_journal, path("work_root"), **binding,
                 cgroup_parent=config["cgroup_parent"], network_id=config["network_id"])
         journal = ClaimJournal(worker_directory / "claim.sqlite")
-        key = key_file.read_bytes()
-        if len(key) < 32:
-            raise ValueError("supervisor signing key requires at least 32 bytes")
         instance = UUID(config["worker_instance_id"])
-        environment = dict(config.get("environment", {}))
-        if finalizer is not None:
-            environment["SHARED_DATA_PATH"] = "/app/shared"
         if native:
             launch = dict(command=[str(python), '-I', '-m', module, str(worker_config)],
-                read_only_paths=list(mounts), network=True,
-                environment={**{name: os.environ[name] for name in ('SystemRoot', 'LOCALAPPDATA', 'ProgramFiles')}, **environment})
+                read_only_paths=list(mounts), network=True, environment=environment)
         else:
             launch = dict(image=config["image_id"], command=["python", "-m", module, "/run/worker-config.json"],
                 read_only_mounts=mounts, environment=environment, publication_directory=publication_directory)
@@ -262,8 +298,8 @@ async def run(config_path):
         async def read_report():
             return SignedHostReport.model_validate_json(report_file.read_text())
 
-        async with BackendClient(config["backend_url"], credential_file.read_text().strip(),
-                                 retry_sleep_budget_s=config.get("retry_sleep_budget_s", 600)) as client:
+        async with BackendClient(config["backend_url"], credential,
+                                 retry_sleep_budget_s=budget) as client:
             needs_ready = journal.pending() is None
             failures = 0
             while True:

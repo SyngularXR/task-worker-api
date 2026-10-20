@@ -76,6 +76,17 @@ def scratch_capacities(paths: list[Path], *, headroom_mib: dict[str, int]) -> di
     return result
 
 
+def _scratch_pool_key(key: str):
+    kind, _, value = key.partition(":")
+    if kind not in ("filesystem", "volume") or str(UUID(value)) != value:
+        raise ValueError("scratch headroom must be keyed by filesystem or volume UUID")
+
+
+def _gpu_device_key(device: str):
+    if not device.startswith("GPU-") or str(UUID(device[4:])) != device[4:]:
+        raise ValueError("GPU headroom must be keyed by physical UUID")
+
+
 def nvidia_gpu_capacity(headroom_mib: dict[str, int], *, executable: str = "nvidia-smi") -> dict[str, Capacity]:
     """Measure enrolled physical GPUs; unknown/missing inventory fails closed.
 
@@ -83,8 +94,7 @@ def nvidia_gpu_capacity(headroom_mib: dict[str, int], *, executable: str = "nvid
     attempt's processes or model references have been cleaned up.
     """
     for device, reserve in headroom_mib.items():
-        if not device.startswith("GPU-") or str(UUID(device[4:])) != device[4:]:
-            raise ValueError("GPU headroom must be keyed by physical UUID")
+        _gpu_device_key(device)
         _nonnegative(reserve)
     if not headroom_mib:
         return {}

@@ -19,7 +19,7 @@ import sqlite3
 import subprocess
 from uuid import UUID
 
-from .host_reporter import _snapshot, physical_boot_id
+from .host_reporter import _epoch, _signing_key, _snapshot, physical_boot_id
 from .host_resources import filesystem_identity
 from .resource_protocol import observation_signature
 from .resources import AdmissionError
@@ -36,8 +36,22 @@ def _docker_inventory():
     return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
 
 
+def _static_signing_key(config) -> bytes:
+    reporter = config["reporter"]
+    key = _signing_key(reporter)
+    UUID(config["operation_id"])
+    _epoch(reporter)
+    for value in config["expected_attempts"]:
+        UUID(value)
+    for entry in config["journals"]:
+        if entry["kind"] not in ("docker", "windows"):
+            raise AdmissionError("unknown_supervisor_kind")
+    return key
+
+
 def cleanup_windows_after_reboot(config):
     """Explicit cleanup mode; the default collector remains read-only."""
+    _static_signing_key(config)
     from .windows_launch import WindowsLaunchJournal
 
     reporter = config["reporter"]
@@ -70,6 +84,7 @@ def cleanup_windows_after_reboot(config):
 
 
 def inspect_reboot(config):
+    key = _static_signing_key(config)
     reporter = config["reporter"]
     host, old_boot = UUID(reporter["host_id"]), UUID(reporter["boot_id"])
     boot = physical_boot_id(host, Path(reporter.get("proc_root", "/proc")))
@@ -149,7 +164,7 @@ def inspect_reboot(config):
     return {"operation_id": str(UUID(config["operation_id"])), "action": "verify_reboot", "reason": config["reason"],
         "authority_id": reporter["authority_id"], "epoch": reporter["epoch"], "inspection": inspection,
         "signature": observation_signature("reboot", UUID(reporter["authority_id"]), reporter["epoch"], inspection,
-            Path(reporter["signing_key_file"]).read_bytes())}
+            key)}
 
 
 if __name__ == "__main__":

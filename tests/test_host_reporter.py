@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 import os
 from types import SimpleNamespace
@@ -110,9 +111,95 @@ def test_windows_boot_identity_uses_kernel_guid_not_clock(monkeypatch):
     assert host_reporter.physical_boot_id(host, None) == uuid5(host, str(boot))
 
 
+@pytest.fixture
+def startup_config(tmp_path, monkeypatch):
+    (tmp_path / "key").write_bytes(b"k" * 32)
+
+    def fail(*args, **kwargs):
+        pytest.fail("invalid static config must fail before reporter setup or publication")
+
+    monkeypatch.setattr(host_reporter.httpx, "AsyncClient", fail)
+    monkeypatch.setattr(host_reporter, "publish_report", fail)
+    monkeypatch.setattr("task_worker_api.borrowing_observer.BorrowingObserver", fail)
+    return {"authority_id": str(uuid4()), "host_id": str(uuid4()), "boot_id": str(uuid4()), "epoch": 1,
+            "ram_headroom_mib": 0, "cpu_headroom_millicores": 0,
+            "gpu_headroom_mib": {}, "scratch_headroom_mib": {},
+            "signing_key_file": str(tmp_path / "key"), "borrowing": {}}
+
+
+def test_run_rejects_short_signing_key_at_startup(startup_config, tmp_path):
+    (tmp_path / "key").write_bytes(b"k" * 16)
+    with pytest.raises(ValueError, match="signing key requires at least 32 bytes"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("name", ["authority_id", "host_id", "boot_id"])
+def test_run_rejects_malformed_binding_id_at_startup(startup_config, name):
+    startup_config[name] = "not-a-uuid"
+    with pytest.raises(ValueError, match="badly formed hexadecimal UUID string"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("epoch", [0, -1, "1", 1.0, True])
+def test_run_rejects_invalid_epoch_at_startup(startup_config, epoch):
+    startup_config["epoch"] = epoch
+    with pytest.raises(ValueError, match="epoch must be a positive integer"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("name, value", [
+    ("ram_headroom_mib", -1),
+    ("cpu_headroom_millicores", "0"),
+    ("gpu_headroom_mib", {"GPU-" + str(uuid4()): -1}),
+    ("scratch_headroom_mib", {"filesystem:" + str(uuid4()): 1.5}),
+])
+def test_run_rejects_invalid_headroom_at_startup(startup_config, name, value):
+    startup_config[name] = value
+    with pytest.raises(ValueError, match="resource headroom must be a nonnegative integer"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("name, key", [
+    ("gpu_headroom_mib", "GPU-not-a-uuid"),
+    ("gpu_headroom_mib", "gpu-" + str(uuid4())),
+    ("gpu_headroom_mib", "GPU-123E4567-E89B-42D3-A456-426614174000"),
+    ("scratch_headroom_mib", "disk:" + str(uuid4())),
+    ("scratch_headroom_mib", "filesystem:not-a-uuid"),
+    ("scratch_headroom_mib", "filesystem:123E4567-E89B-42D3-A456-426614174000"),
+])
+def test_run_rejects_unusable_headroom_key_at_startup(startup_config, name, key):
+    startup_config[name] = {key: 0}
+    with pytest.raises(ValueError):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("native_scope", [None, "", " ", "x" * 256, [], "/"])
+def test_run_rejects_invalid_native_scope_at_startup(startup_config, native_scope):
+    startup_config["native_scope"] = native_scope
+    with pytest.raises(ValueError, match="native scope"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+@pytest.mark.parametrize("scope_config", [{}, {"native_scope": "native"}, {"native_scope": "x" * 255}])
+def test_run_accepts_valid_or_omitted_native_scope_at_startup(startup_config, scope_config):
+    startup_config.update(scope_config)
+    with pytest.raises(pytest.fail.Exception, match="invalid static config must fail before"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
+def test_publish_report_rejects_invalid_epoch_before_state_write(tmp_path):
+    (tmp_path / "key").write_bytes(b"k" * 32)
+    state_file = tmp_path / "state.sqlite"
+    config = {"authority_id": str(uuid4()), "host_id": str(uuid4()), "boot_id": str(uuid4()), "epoch": "1",
+              "signing_key_file": str(tmp_path / "key"), "state_file": str(state_file),
+              "report_file": str(tmp_path / "report.json")}
+    with pytest.raises(ValueError, match="epoch must be a positive integer"):
+        host_reporter.publish_report(config)
+    assert not state_file.exists()
+
+
 @pytest.mark.parametrize("headers, posts", [({"Retry-After": "21600"}, 2), ({}, 15)])
-def test_throttled_host_report_resumes_within_heartbeat_ceiling(monkeypatch, headers, posts):
-    import asyncio
+def test_throttled_host_report_resumes_within_heartbeat_ceiling(tmp_path, monkeypatch, headers, posts):
     import httpx
 
     clock, sent = [0.0], []
@@ -132,7 +219,12 @@ def test_throttled_host_report_resumes_within_heartbeat_ceiling(monkeypatch, hea
     monkeypatch.setattr(host_reporter.asyncio, "sleep", tick)
     monkeypatch.setattr(host_reporter.httpx, "AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(reply), **kw))
+    (tmp_path / "key").write_bytes(b"k" * 32)
+    config = {"backend_url": "http://backend/api/v1", "signing_key_file": str(tmp_path / "key"),
+              "ram_headroom_mib": 0, "cpu_headroom_millicores": 0,
+              "gpu_headroom_mib": {}, "scratch_headroom_mib": {},
+              "authority_id": str(uuid4()), "host_id": str(uuid4()), "boot_id": str(uuid4()), "epoch": 1}
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(host_reporter.run({"backend_url": "http://backend/api/v1"}))
+        asyncio.run(host_reporter.run(config))
     assert len(sent) == posts
     assert max(sent) <= 70  # a 6h Retry-After parks the next post for 60s, not hours

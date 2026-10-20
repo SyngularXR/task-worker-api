@@ -61,8 +61,10 @@ def test_reboot_cleanup_removes_only_recorded_native_resources(tmp_path, monkeyp
                 with sqlite3.connect(journal.path) as db:
                     assert db.execute('SELECT phase FROM windows_launches').fetchone()[0] == 'started'
             from task_worker_api.host_recovery import cleanup_windows_after_reboot
+            (tmp_path/'key').write_bytes(b'k' * 32)
             cleanup_windows_after_reboot({"reporter": {"host_id": str(host), "boot_id": str(old_boot),
-                "authority_id": journal.binding['authority'], "epoch": 1}, "expected_attempts": [str(attempt)],
+                "authority_id": journal.binding['authority'], "epoch": 1, "signing_key_file": str(tmp_path/'key')},
+                "operation_id": str(uuid4()), "expected_attempts": [str(attempt)],
                 "journals": [{"kind": "windows", "path": str(journal.path), "work_root": str(root)}]})
             journal.cleanup_after_reboot(attempt, current_boot)
             assert not directory.exists()

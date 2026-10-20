@@ -5,8 +5,9 @@ services/backend/src/utils/extra_model_registry.py:_build_cb_params.
 """
 from __future__ import annotations
 
-from pydantic import Field, StrictStr, model_validator
+from pydantic import Field, StrictStr, field_validator, model_validator
 
+from ..conventions import finalized_filename
 from ._base import TaskParamsBase
 
 
@@ -52,6 +53,22 @@ class CinematicBakingParams(TaskParamsBase):
         default=None, ge=0.0, le=5.0, allow_inf_nan=False,
         description="Optional Bioform displacement cap in millimetres.",
     )
+
+    @field_validator("base_name")
+    @classmethod
+    def published_filename_is_safe(cls, value: str) -> str:
+        if not value:
+            return value
+
+        from ..files import _require_safe_filename
+        from ..errors import ProtocolError
+
+        filename = finalized_filename(value)
+        try:
+            _require_safe_filename(filename, field="base_name", key=filename)
+        except ProtocolError as exc:
+            raise ValueError("base_name must produce a safe published filename") from exc
+        return value
 
     @model_validator(mode="after")
     def validate_material_options(self) -> "CinematicBakingParams":

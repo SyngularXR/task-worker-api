@@ -5,8 +5,9 @@ services/backend/src/utils/extra_model_registry.py:_build_task_params.
 """
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
+from ..conventions import preview_filename
 from ._base import TaskParamsBase
 
 
@@ -33,3 +34,19 @@ class ModelInitializingParams(TaskParamsBase):
     preview_max_triangles: int = Field(default=300_000, ge=300_000, le=300_000)
     remove_interior: bool = False
     yup: bool = True
+
+    @field_validator("base_name")
+    @classmethod
+    def published_filename_is_safe(cls, value: str) -> str:
+        if not value:
+            return value
+
+        from ..files import _require_safe_filename
+        from ..errors import ProtocolError
+
+        filename = preview_filename(value)
+        try:
+            _require_safe_filename(filename, field="base_name", key=filename)
+        except ProtocolError as exc:
+            raise ValueError("base_name must produce a safe published filename") from exc
+        return value

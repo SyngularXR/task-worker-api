@@ -100,8 +100,9 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    backend["Backend: reserve admitted task and frozen input/profile"] --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
-    supervisor --> stage["SDK: enter AttemptLease; validate params and stage private inputs"]
+    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length, binding UUIDs, retry sleep budget, Docker image and network identifier formats, operator read-only mount sources and targets and native merged launch environment before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
+    backend --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
+    supervisor --> stage["SDK: enter AttemptLease; validate params and input paths; stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
     refused --> reconcile
     stage --> start["SDK / backend: acknowledge start with host report and input digest"]
@@ -123,6 +124,59 @@ distinct responsibilities. Do not substitute this route for polling, or imply
 an adapter is deployed because `run_admitted` exists. Staging failures before
 start acknowledgement are reconciled by the supervisor, not failed as started
 compute. The SDK entrypoint imports the handler only after start acknowledgement.
+
+Before claiming, supervisor startup rejects an empty or non-dict compute handler
+map, task types without a registered parameter schema, and specifications without
+nonempty module and function parts separated by `:`. Startup also reads the signing key,
+rejects a key shorter than 32 bytes, and parses `authority_id`, `host_id` and `boot_id`
+as UUIDs. Startup reads and strips `credential_file`, rejecting an empty result
+with `ValueError('credential_file is empty')`. These configuration errors raise
+`ValueError` before the singleton lock, worker configuration write, supervisor
+and claim journal creation or backend
+client construction; startup may already have created directories. The optional
+`retry_sleep_budget_s` is also checked at this boundary: it must be `null` or a
+finite positive number, excluding booleans. Its default remains 600 seconds;
+`null` passes through as `None` to restore the unbounded backend client default.
+Handler modules remain deferred until start acknowledgement. Trusted backend
+finalizers keep their separate task allowlist.
+
+For `launcher='docker'`, startup checks both identifier formats: `image_id` must
+be a string of `sha256:` followed by 64 lowercase hexadecimal digits, and
+`network_id` must be a string of 64 lowercase hexadecimal digits. Another type
+or format raises `ValueError` with the existing inspected image ID or inspected
+Docker network ID message before the singleton lock, worker configuration write,
+supervisor and claim journal creation or backend client construction. Startup
+may already have created directories. This checks formats without Docker CLI
+inspection.
+
+Docker startup also checks each operator `read_only_mounts` entry with the shared
+launch validator. Sources resolve strictly; a missing source raises
+`FileNotFoundError`. A source must not equal or contain the private supervisor
+journal, or be named `docker.sock` or `docker_engine`. Targets must start with
+`/` and must not be `/`, `/work` or under `/work/`. When `backend_finalizer`
+supplies `publication_directory`, targets `/app`, `/app/shared` and paths under
+`/app/shared/` are also rejected. Refusals retain the launch messages
+`ValueError('unsafe worker mount')` and
+`ValueError('publication mount overlaps a read-only mount')`. The existing
+journal/signing-key exclusion and duplicate-target checks run first and retain
+their messages. Internal supervisor mounts are checked at launch; they are
+excluded from startup validation because the worker configuration file does not
+exist until it is written. Operator validation runs before the singleton lock,
+worker configuration write, supervisor and claim journal creation or backend
+client construction; startup may already have created directories.
+
+For `launcher='windows'`, startup merges `SystemRoot`, `LOCALAPPDATA` and
+`ProgramFiles` from `os.environ` with the configured environment. This native
+merged launch environment check rejects case-insensitive duplicate names, names
+outside `[A-Za-z_][A-Za-z0-9_]*`, non-string values and supervisor-owned names
+`CUDA_VISIBLE_DEVICES`, `NVIDIA_VISIBLE_DEVICES`, `SYNPUSHER_TARGETS`,
+`SPECTRA_GPU_BACKEND`, `SPECTRA_GPU_ID`, `TEMP` and `TMP`. It runs before the
+singleton lock, worker configuration write and backend claim, and passes the
+validated environment to launch. Startup may already have created directories.
+
+Input staging rejects case-insensitive duplicate paths and file/directory prefix
+conflicts before creating the attempt directory or downloading bytes. Sibling
+input paths may share a parent directory.
 
 A completion rejected with `invalid_output_manifest` or `artifact_not_committed`
 is recorded as rejected in the private claim journal. While the lease is live,

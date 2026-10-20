@@ -68,3 +68,51 @@ def test_reboot_inspection_reads_journal_and_refuses_leftovers(tmp_path, monkeyp
     assert journal.read_bytes() == before
     if fault == "scratch":
         assert (root / "leftover").read_text() == "never delete me"
+
+
+@pytest.mark.parametrize("key,operation_id,epoch", [
+    (b"k" * 16, str(uuid4()), 1),
+    (b"k" * 32, "not-a-uuid", 1),
+    (b"k" * 32, str(uuid4()), 0),
+    (b"k" * 32, str(uuid4()), "1"),
+], ids=["short-key", "bad-operation-id", "zero-epoch", "string-epoch"])
+def test_static_signing_config_is_rejected_before_any_work(tmp_path, monkeypatch, key, operation_id, epoch):
+    host, old_boot, authority = uuid4(), uuid4(), uuid4()
+    (tmp_path / "key").write_bytes(key)
+    config = {"reporter": {"host_id": str(host), "boot_id": str(old_boot), "authority_id": str(authority),
+        "epoch": epoch, "signing_key_file": str(tmp_path / "key")}, "operation_id": operation_id,
+        "reason": "test reboot", "expected_attempts": [], "journals": []}
+
+    def fail(*args, **kwargs):
+        pytest.fail("work ran before static config validation")
+
+    monkeypatch.setattr(recovery, "physical_boot_id", fail)
+    monkeypatch.setattr(recovery, "_docker_inventory", fail)
+    with pytest.raises(ValueError):
+        recovery.inspect_reboot(config)
+    with pytest.raises(ValueError):
+        recovery.cleanup_windows_after_reboot(config)
+
+
+@pytest.mark.parametrize("invalid_config,error,code", [
+    ({"expected_attempts": ["nope"]}, ValueError, None),
+    ({"journals": [{"kind": "Windows", "path": "x", "work_root": "y"}]},
+        AdmissionError, "unknown_supervisor_kind"),
+], ids=["bad-attempt-id", "unknown-journal-kind"])
+def test_static_attempts_and_journal_kinds_are_rejected_before_any_work(tmp_path, monkeypatch, invalid_config, error, code):
+    host, old_boot, authority = uuid4(), uuid4(), uuid4()
+    (tmp_path / "key").write_bytes(b"k" * 32)
+    config = {"reporter": {"host_id": str(host), "boot_id": str(old_boot), "authority_id": str(authority),
+        "epoch": 1, "signing_key_file": str(tmp_path / "key")}, "operation_id": str(uuid4()),
+        "reason": "test reboot", "expected_attempts": [], "journals": [], **invalid_config}
+
+    def fail(*args, **kwargs):
+        pytest.fail("work ran before static config validation")
+
+    monkeypatch.setattr(recovery, "physical_boot_id", fail)
+    monkeypatch.setattr(recovery, "_docker_inventory", fail)
+    for entry_point in (recovery.inspect_reboot, recovery.cleanup_windows_after_reboot):
+        with pytest.raises(error) as exc:
+            entry_point(config)
+        if code is not None:
+            assert exc.value.code == code
