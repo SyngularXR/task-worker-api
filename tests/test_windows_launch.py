@@ -64,7 +64,7 @@ def test_reboot_cleanup_removes_only_recorded_native_resources(tmp_path, monkeyp
             (tmp_path/'key').write_bytes(b'k' * 32)
             cleanup_windows_after_reboot({"reporter": {"host_id": str(host), "boot_id": str(old_boot),
                 "authority_id": journal.binding['authority'], "epoch": 1, "signing_key_file": str(tmp_path/'key')},
-                "operation_id": str(uuid4()), "expected_attempts": [str(attempt)],
+                "operation_id": str(uuid4()), "reason": "test reboot", "expected_attempts": [str(attempt)],
                 "journals": [{"kind": "windows", "path": str(journal.path), "work_root": str(root)}]})
             journal.cleanup_after_reboot(attempt, current_boot)
             assert not directory.exists()

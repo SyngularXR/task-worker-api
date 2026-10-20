@@ -41,8 +41,12 @@ def _static_signing_key(config) -> bytes:
     key = _signing_key(reporter)
     UUID(config["operation_id"])
     _epoch(reporter)
+    if not isinstance(config["reason"], str):
+        raise ValueError("reason must be a string")
     for value in config["expected_attempts"]:
         UUID(value)
+    if not config["journals"]:
+        raise AdmissionError("launch_inventory_incomplete")
     for entry in config["journals"]:
         if entry["kind"] not in ("docker", "windows"):
             raise AdmissionError("unknown_supervisor_kind")
