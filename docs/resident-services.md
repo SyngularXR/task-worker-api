@@ -57,6 +57,11 @@ engine health, call `await lease.ready(operation_id, host_report)`. Loading uses
 `lease_expires_at` is the latest acknowledged authority timestamp;
 `remaining_seconds` subtracts latency with a monotonic clock. Router freshness
 must also respect that remaining runway.
+`residence_remaining_seconds` separately reports the monotonic finite residence
+deadline. Use it to bound accepted session/request lifetimes, reserving cleanup
+runway, while continuing to enforce `require_dispatch()` and fence work on lease
+loss. A renewed heartbeat never extends the residence deadline. Both remaining
+values become zero on withdrawal; residence runway alone never authorizes work.
 
 `withdraw()` and `close()` immediately fence SDK dispatch without needing the
 event loop. Independent threads call stop and, if reclaim stalls/fails, the exact
