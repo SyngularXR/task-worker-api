@@ -314,6 +314,80 @@ async def test_backend_supervisor_builds_private_finalizer_configuration(tmp_pat
     assert client_kwargs["retry_sleep_budget_s"] == budget.get("retry_sleep_budget_s", 600)
 
 
+_MISSING = object()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value,error", [
+    *[pytest.param("execution_scope", value, "execution_scope must be a string of 1 to 255 characters", id="execution_scope-" + name)
+      for name, value in [("missing", _MISSING), ("int", 1), ("float", 1.5), ("bool", True),
+                          ("null", None), ("list", []), ("dict", {}), ("empty", ""), ("too-long", "x" * 256)]],
+    pytest.param("execution_scope", "x", None, id="execution_scope-length-1"),
+    pytest.param("execution_scope", "x" * 255, None, id="execution_scope-length-255"),
+    *[pytest.param("cgroup_parent", value, "cgroup_parent must be a string", id="cgroup_parent-" + name)
+      for name, value in [("missing", _MISSING), ("int", 1), ("float", 1.5), ("bool", True),
+                          ("null", None), ("list", []), ("dict", {})]],
+    pytest.param("cgroup_parent", "", None, id="cgroup_parent-empty"),
+])
+async def test_supervisor_validates_execution_scope_and_cgroup_parent_before_startup(tmp_path, monkeypatch, field, value, error):
+    from task_worker_api import admission_supervisor
+
+    for name in ("private", "report", "credentials"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "credentials/worker").write_text("test-only")
+    (tmp_path / "private/signing").write_bytes(b"s" * 32)
+    config = dict(authority_id=str(uuid4()), host_id=str(uuid4()), boot_id=str(uuid4()), epoch=1,
+        execution_scope="compute", cgroup_parent="", network_id="d" * 64, supervisor_journal="private/state/supervisor.sqlite",
+        work_root="work", worker_journal_directory="worker-journal", image_id="sha256:" + "b" * 64,
+        worker_instance_id=str(uuid4()), worker_id="test-compute", backend_url="http://test/api/v1", worker_backend_url="http://backend-container/api/v1",
+        credential_file="credentials/worker", report_file="report/snapshot", signing_key_file="private/signing",
+        handlers={"render": "src.services.resource_render_worker:run_admitted"})
+    if value is _MISSING:
+        del config[field]
+    else:
+        config[field] = value
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    clients, cycles = [], []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            clients.append(self)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def resource_ready(self, *args):
+            pass
+
+    async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(types)
+        assert getattr(supervisor, field) == value
+        raise asyncio.CancelledError()
+
+    async def sleep(delay):
+        pytest.fail("unexpected supervisor retry")
+
+    monkeypatch.setattr("task_worker_api.client.BackendClient", Client)
+    monkeypatch.setattr(admission_supervisor, "run_cycle", cycle)
+    monkeypatch.setattr(admission_supervisor.asyncio, "sleep", sleep)
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            await admission_supervisor.run(path)
+        assert clients == cycles == []
+        assert not (tmp_path / f"private/state/worker-{config['worker_instance_id']}.json").exists()
+        assert not (tmp_path / "private/state/supervisor.lock").exists()
+        assert not (tmp_path / "private/state/supervisor.sqlite").exists()
+        assert not (tmp_path / "private/state").exists()
+        assert not (tmp_path / "worker-journal").exists()
+        assert not (tmp_path / "work").exists()
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await admission_supervisor.run(path)
+        assert len(clients) == 1
+        assert cycles == [["render"]]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("handlers, error", [
     ({}, "handlers must map"),

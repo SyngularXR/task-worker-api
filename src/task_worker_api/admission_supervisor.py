@@ -185,6 +185,11 @@ async def run(config_path):
     native = launcher == 'windows'
     if native and (os.name != 'nt' or 'backend_finalizer' in config or 'read_only_mounts' in config):
         raise ValueError('Native Windows compute requires read_only_paths and a Windows host')
+    execution_scope = config.get('execution_scope')
+    if not isinstance(execution_scope, str) or not 1 <= len(execution_scope) <= 255:
+        raise ValueError('execution_scope must be a string of 1 to 255 characters')
+    if launcher == 'docker' and not isinstance(config.get('cgroup_parent'), str):
+        raise ValueError('cgroup_parent must be a string')
     def path(name):
         return (config_path.parent / config[name]).resolve()
 
