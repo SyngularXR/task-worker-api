@@ -85,8 +85,7 @@ def _snapshot(config, sequence):
         scopes = {"/": measured["dockerVm"]}
         if "native_scope" in config:
             native = config["native_scope"]
-            if not isinstance(native, str) or not native.strip() or len(native) > 255 or native in scopes:
-                raise ValueError("native scope must be a unique nonempty identifier of at most 255 characters")
+            _native_scope(native)
             scopes[native] = {"ram": ram, "cpu_millicores": cpu}
     else:
         ram, cpu = linux_host_capacity(**headroom, proc_root=proc_root)
@@ -112,6 +111,11 @@ def _signing_key(config) -> bytes:
 def _epoch(config):
     if type(config["epoch"]) is not int or config["epoch"] < 1:
         raise ValueError("reporter epoch must be a positive integer")
+
+
+def _native_scope(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 255 or value == "/":
+        raise ValueError("native scope must be a unique nonempty identifier of at most 255 characters")
 
 
 def publish_report(config) -> SignedHostReport:
@@ -160,6 +164,8 @@ async def run(config):
         for key, value in config[name].items():
             key_check(key)
             _nonnegative(value)
+    if "native_scope" in config:
+        _native_scope(config["native_scope"])
     observer = None
     if "borrowing" in config:
         try:
