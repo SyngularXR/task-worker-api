@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev65
+
+- Expose `ResidentServiceLease.residence_remaining_seconds` for finite request/session
+  lifetimes independent of the renewable heartbeat window. Callers still require
+  `require_dispatch()` for acknowledged liveness; withdrawal returns zero runway.
+
 ## 0.19.0.dev64
 
 - Add bounded `InteractiveSeeds` with per-lesion mask/box/point prompts, input

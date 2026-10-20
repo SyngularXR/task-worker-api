@@ -245,6 +245,26 @@ def test_deadline_subtracts_latency_and_cannot_extend_residence(monkeypatch):
     assert owned.remaining_seconds==0
 
 
+def test_residence_runway_is_independent_of_heartbeat_and_never_extended(monkeypatch):
+    value=grant()
+    value=value.model_copy(update={'profile':profile(max_residence_seconds=600),
+        'residence_deadline':value.server_time+timedelta(seconds=600)})
+    owned=lease(value)
+    clock=[100]
+    monkeypatch.setattr('task_worker_api.service_execution.time.monotonic',lambda:clock[0])
+    assert owned.residence_remaining_seconds==0
+    owned._accept(state(value,'idle',seconds=120),100)
+    assert 29.9<owned.remaining_seconds<=30
+    assert 599<owned.residence_remaining_seconds<=600
+    residence=owned._residence
+    clock[0]=110
+    owned._accept(state(value,'idle',seconds=120),110)
+    assert owned._residence==residence
+    assert 589<owned.residence_remaining_seconds<=590
+    owned.withdraw()
+    assert owned.remaining_seconds==owned.residence_remaining_seconds==0
+
+
 def test_partial_or_foreign_callback_is_not_owned_release_proof():
     value=grant()
     for evidence in (proof(value).model_copy(update={'models_evicted':False}),
