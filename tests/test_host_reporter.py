@@ -180,6 +180,13 @@ def test_run_rejects_invalid_native_scope_at_startup(startup_config, native_scop
         asyncio.run(host_reporter.run(startup_config))
 
 
+@pytest.mark.parametrize("scope_config", [{}, {"native_scope": "native"}, {"native_scope": "x" * 255}])
+def test_run_accepts_valid_or_omitted_native_scope_at_startup(startup_config, scope_config):
+    startup_config.update(scope_config)
+    with pytest.raises(pytest.fail.Exception, match="invalid static config must fail before"):
+        asyncio.run(host_reporter.run(startup_config))
+
+
 def test_publish_report_rejects_invalid_epoch_before_state_write(tmp_path):
     (tmp_path / "key").write_bytes(b"k" * 32)
     state_file = tmp_path / "state.sqlite"
