@@ -41,6 +41,11 @@ def _static_signing_key(config) -> bytes:
     key = _signing_key(reporter)
     UUID(config["operation_id"])
     _epoch(reporter)
+    for value in config["expected_attempts"]:
+        UUID(value)
+    for entry in config["journals"]:
+        if entry["kind"] not in ("docker", "windows"):
+            raise AdmissionError("unknown_supervisor_kind")
     return key
 
 
