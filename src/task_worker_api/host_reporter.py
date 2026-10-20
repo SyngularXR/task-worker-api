@@ -113,9 +113,8 @@ def _epoch(config):
         raise ValueError("reporter epoch must be a positive integer")
 
 
-def _native_scope(native):
-    # '/' is the reserved Docker VM execution scope.
-    if not isinstance(native, str) or not native.strip() or len(native) > 255 or native == "/":
+def _native_scope(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 255 or value == "/":
         raise ValueError("native scope must be a unique nonempty identifier of at most 255 characters")
 
 

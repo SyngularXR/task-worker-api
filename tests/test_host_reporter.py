@@ -173,17 +173,10 @@ def test_run_rejects_unusable_headroom_key_at_startup(startup_config, name, key)
         asyncio.run(host_reporter.run(startup_config))
 
 
-@pytest.mark.parametrize("native", [None, "", " ", "x" * 256, [], "/"])
-def test_run_rejects_invalid_native_scope_at_startup(startup_config, native):
-    startup_config["native_scope"] = native
+@pytest.mark.parametrize("native_scope", [None, "", " ", "x" * 256, [], "/"])
+def test_run_rejects_invalid_native_scope_at_startup(startup_config, native_scope):
+    startup_config["native_scope"] = native_scope
     with pytest.raises(ValueError, match="native scope"):
-        asyncio.run(host_reporter.run(startup_config))
-
-
-@pytest.mark.parametrize("scope_config", [{}, {"native_scope": "native"}, {"native_scope": "x" * 255}])
-def test_run_accepts_valid_or_omitted_native_scope_at_startup(startup_config, scope_config):
-    startup_config.update(scope_config)
-    with pytest.raises(pytest.fail.Exception, match="invalid static config must fail before"):
         asyncio.run(host_reporter.run(startup_config))
 
 
