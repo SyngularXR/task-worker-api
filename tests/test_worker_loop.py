@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from unittest.mock import ANY, Mock
 
 import httpx
 import pytest
@@ -1769,7 +1770,7 @@ class _HangingFailClient(FakeBackendClient):
 
 @pytest.mark.asyncio
 async def test_interrupted_terminal_report_is_bounded_by_grace(
-    make_worker, tmp_path, caplog,
+    make_worker, tmp_path, caplog, monkeypatch,
 ):
     """A shutdown-interrupted task's terminal report must give up after
     timeout_grace_s so the stop grace is left for teardown, not spent on a
@@ -1792,18 +1793,18 @@ async def test_interrupted_terminal_report_is_bounded_by_grace(
         timeout_grace_s=0.2,
         heartbeat_interval_s=0.01,
     )
-    loop = asyncio.get_running_loop()
+    wait_for = Mock(wraps=asyncio.wait_for)
+    monkeypatch.setattr(asyncio, "wait_for", wait_for)
     with caplog.at_level("ERROR"):
         run = asyncio.create_task(worker.run_one())
         await asyncio.wait_for(in_handler.wait(), timeout=5)
         run.cancel()
-        cancelled_at = loop.time()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(run, timeout=5)
-        elapsed = loop.time() - cancelled_at
 
-    # The hung report is abandoned at the 0.2s grace, not the 5s test cap.
-    assert 0.2 <= elapsed < 0.2 + 0.3, elapsed
+    # Check the report deadline itself: total shutdown also includes workspace
+    # and CUDA cleanup, and CI scheduling can delay even a correct timeout.
+    wait_for.assert_any_call(ANY, worker.timeout_grace_s)
     assert client.terminal_calls == ["fail"]
     assert any(
         "terminal fail report failed" in r.message for r in caplog.records
