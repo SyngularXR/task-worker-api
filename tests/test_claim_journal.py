@@ -1,4 +1,4 @@
-"""Direct claim-response refusals preserve durable worker journal state."""
+"""Direct claim-response and operation refusals preserve durable journal state."""
 from uuid import uuid4
 
 import pytest
@@ -14,6 +14,20 @@ def _assert_refused(journal, request_id, result, code):
     operations = journal.unresolved_operations()
     with pytest.raises(AdmissionError) as caught:
         journal.record_response(request_id, result)
+    assert caught.value.code == code
+    assert str(caught.value) == code
+    assert journal.pending() == pending
+    assert journal.unresolved_operations() == operations
+    reopened = ClaimJournal(journal.path)
+    assert reopened.pending() == pending
+    assert reopened.unresolved_operations() == operations
+
+
+def _assert_operation_refused(journal, call, code):
+    pending = journal.pending()
+    operations = journal.unresolved_operations()
+    with pytest.raises(AdmissionError) as caught:
+        call()
     assert caught.value.code == code
     assert str(caught.value) == code
     assert journal.pending() == pending
@@ -68,3 +82,59 @@ def test_record_response_refuses_claim_to_null(tmp_path):
     assert journal.unresolved_operations() == [("start", operation_id)]
     request, _ = journal.pending()
     _assert_refused(journal, request.claim_request_id, None, "idempotency_conflict")
+
+
+def test_record_operation_refuses_unknown_kind(tmp_path):
+    journal, _ = _admitted_journal(tmp_path, uuid4())
+    operation_id = journal.prepare_operation("start", {}, request={})
+    assert journal.unresolved_operations() == [("start", operation_id)]
+    body = journal.operation_request("start", operation_id)
+    _assert_operation_refused(
+        journal,
+        lambda: journal.record_operation("unknown", operation_id, {"state": "running"}),
+        "operation_unknown",
+    )
+    assert journal.operation_request("start", operation_id) == body
+    assert ClaimJournal(journal.path).operation_request("start", operation_id) == body
+
+
+def test_record_operation_refuses_mismatched_operation_id(tmp_path):
+    journal, _ = _admitted_journal(tmp_path, uuid4())
+    operation_id = journal.prepare_operation("start", {}, request={})
+    assert journal.unresolved_operations() == [("start", operation_id)]
+    body = journal.operation_request("start", operation_id)
+    _assert_operation_refused(
+        journal,
+        lambda: journal.record_operation("start", uuid4(), {"state": "running"}),
+        "operation_unknown",
+    )
+    assert journal.operation_request("start", operation_id) == body
+    assert ClaimJournal(journal.path).operation_request("start", operation_id) == body
+
+
+def test_operation_request_refuses_unknown_kind(tmp_path):
+    journal, _ = _admitted_journal(tmp_path, uuid4())
+    operation_id = journal.prepare_operation("start", {}, request={})
+    assert journal.unresolved_operations() == [("start", operation_id)]
+    body = journal.operation_request("start", operation_id)
+    _assert_operation_refused(
+        journal,
+        lambda: journal.operation_request("unknown", operation_id),
+        "operation_request_missing",
+    )
+    assert journal.operation_request("start", operation_id) == body
+    assert ClaimJournal(journal.path).operation_request("start", operation_id) == body
+
+
+def test_operation_request_refuses_mismatched_operation_id(tmp_path):
+    journal, _ = _admitted_journal(tmp_path, uuid4())
+    operation_id = journal.prepare_operation("start", {}, request={})
+    assert journal.unresolved_operations() == [("start", operation_id)]
+    body = journal.operation_request("start", operation_id)
+    _assert_operation_refused(
+        journal,
+        lambda: journal.operation_request("start", uuid4()),
+        "operation_request_missing",
+    )
+    assert journal.operation_request("start", operation_id) == body
+    assert ClaimJournal(journal.path).operation_request("start", operation_id) == body
