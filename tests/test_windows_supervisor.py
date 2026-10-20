@@ -120,8 +120,13 @@ def test_preparing_recovery_cannot_resume_and_profile_conflict_stays_unknown(tmp
             WindowsAppContainer(name)  # The conflicting profile was not removed.
 
 
+_MISSING = object()
+
+
 @pytest.mark.asyncio
-async def test_native_operator_configuration_excludes_signing_state(tmp_path, monkeypatch):
+@pytest.mark.parametrize('cgroup_parent', [_MISSING, 1, 1.5, True, None, [], {}],
+                         ids=['missing', 'int', 'float', 'bool', 'null', 'list', 'dict'])
+async def test_native_operator_configuration_excludes_signing_state(tmp_path, monkeypatch, cgroup_parent):
     from task_worker_api import admission_supervisor
 
     for name in ('private', 'report', 'credentials', 'runtime'):
@@ -135,6 +140,9 @@ async def test_native_operator_configuration_excludes_signing_state(tmp_path, mo
         backend_url='http://test/api/v1', worker_backend_url='http://appcontainer/api/v1', credential_file='credentials/worker', report_file='report/snapshot.json',
         signing_key_file='private/key', python_executable='runtime/python.exe', read_only_paths=['runtime'],
         handlers={'render': 'src.services.resource_render_worker:run_admitted'})
+    if cgroup_parent is not _MISSING:
+        config['cgroup_parent'] = cgroup_parent
+    cycles = []
     path = tmp_path/'config.json'
     path.write_text(json.dumps(config))
 
@@ -149,6 +157,7 @@ async def test_native_operator_configuration_excludes_signing_state(tmp_path, mo
             pass
 
     async def cycle(client, journal, instance, types, supervisor, launch, read_report, key):
+        cycles.append(supervisor)
         assert isinstance(supervisor, WindowsSupervisor) and types == ['render'] and key == b'k'*32
         command = launch['command']
         assert command[:4] == [str(tmp_path/'runtime/python.exe'), '-I', '-m', 'task_worker_api.admitted_worker']
@@ -166,6 +175,7 @@ async def test_native_operator_configuration_excludes_signing_state(tmp_path, mo
     monkeypatch.setattr(admission_supervisor, 'run_cycle', cycle)
     with pytest.raises(asyncio.CancelledError):
         await admission_supervisor.run(path)
+    assert len(cycles) == 1
     config['read_only_paths'] = ['runtime', 'private']
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match='signing key'):

@@ -100,7 +100,7 @@ percentage or ETA. Handler cancellation must reach its own computation boundary.
 
 ```mermaid
 flowchart TD
-    config["Supervisor startup: validate compute handler map, non-empty worker credential, signing key length, binding UUIDs, retry sleep budget, Docker image and network identifier formats, operator read-only mount sources and targets and native merged launch environment before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
+    config["Supervisor startup: validate execution scope string length 1–255 and Docker cgroup parent string before creating directories; validate compute handler map, non-empty worker credential, signing key length, binding UUIDs, retry sleep budget, Docker image and network identifier formats, operator read-only mount sources and targets and native merged launch environment before locking, writing files or contacting backend"] --> backend["Backend: reserve admitted task and frozen input/profile"]
     backend --> supervisor["Supervisor: journal or replay original claim; launch assigned process/device scope"]
     supervisor --> stage["SDK: enter AttemptLease; validate params and input paths; stage private inputs"]
     supervisor -->|Docker staging/state/backend refusal; claim not running| refused["Supervisor: journal removed attempt without a container"]
@@ -139,6 +139,18 @@ finite positive number, excluding booleans. Its default remains 600 seconds;
 `null` passes through as `None` to restore the unbounded backend client default.
 Handler modules remain deferred until start acknowledgement. Trusted backend
 finalizers keep their separate task allowlist.
+
+Immediately after launcher checks and before creating any directory, startup
+requires `execution_scope` to be a string containing 1–255 characters. A missing,
+non-string, empty or longer value raises
+`ValueError('execution_scope must be a string of 1 to 255 characters')`.
+For `launcher='docker'`, `cgroup_parent` must also exist and be a string;
+missing or non-string values raise `ValueError('cgroup_parent must be a string')`.
+An empty Docker string is valid and continues to omit `--cgroup-parent` at launch.
+Windows ignores `cgroup_parent`, including missing and non-string values.
+These two checks precede worker configuration, singleton lock, supervisor journal,
+worker-journal directory and work directory creation. They preserve the existing
+execution scope binding, claim-owned device assignment and storage boundaries.
 
 For `launcher='docker'`, startup checks both identifier formats: `image_id` must
 be a string of `sha256:` followed by 64 lowercase hexadecimal digits, and
