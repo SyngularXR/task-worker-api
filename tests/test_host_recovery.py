@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 import json
 import sqlite3
+import sys
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -98,7 +100,12 @@ def test_static_signing_config_is_rejected_before_any_work(tmp_path, monkeypatch
     ({"expected_attempts": ["nope"]}, ValueError, None),
     ({"journals": [{"kind": "Windows", "path": "x", "work_root": "y"}]},
         AdmissionError, "unknown_supervisor_kind"),
-], ids=["bad-attempt-id", "unknown-journal-kind"])
+    ({"journals": []}, AdmissionError, "launch_inventory_incomplete"),
+    ({"reason": 123}, ValueError, None),
+    ({"reason": None}, ValueError, None),
+    ({"journals": [{"kind": kind, "path": "x", "work_root": "y"}
+        for kind in ("docker", "windows", "Windows")]}, AdmissionError, "unknown_supervisor_kind"),
+], ids=["bad-attempt-id", "unknown-journal-kind", "empty-journals", "integer-reason", "null-reason", "mixed-journal-kinds"])
 def test_static_attempts_and_journal_kinds_are_rejected_before_any_work(tmp_path, monkeypatch, invalid_config, error, code):
     host, old_boot, authority = uuid4(), uuid4(), uuid4()
     (tmp_path / "key").write_bytes(b"k" * 32)
@@ -111,6 +118,8 @@ def test_static_attempts_and_journal_kinds_are_rejected_before_any_work(tmp_path
 
     monkeypatch.setattr(recovery, "physical_boot_id", fail)
     monkeypatch.setattr(recovery, "_docker_inventory", fail)
+    monkeypatch.setattr(recovery.sqlite3, "connect", fail)
+    monkeypatch.setitem(sys.modules, "task_worker_api.windows_launch", SimpleNamespace(WindowsLaunchJournal=fail))
     for entry_point in (recovery.inspect_reboot, recovery.cleanup_windows_after_reboot):
         with pytest.raises(error) as exc:
             entry_point(config)
