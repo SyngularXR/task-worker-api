@@ -12,8 +12,12 @@ import re
 from pathlib import Path
 import subprocess
 import time
+from threading import Lock
 from contextlib import ExitStack
 from uuid import uuid4
+
+
+_desktop_lock = Lock()
 
 
 class _BasicLimits(c.Structure):
@@ -449,12 +453,13 @@ class WindowsAppContainer:
             security = _SecurityAttributes(c.sizeof(_SecurityAttributes), descriptor, False)
             name = "surgiclaw." + uuid4().hex
             self.station = _check(self.user.CreateWindowStationW(name, 1, 0xF037F, c.byref(security)))
-            original = _check(self.user.GetProcessWindowStation())
-            try:
-                _check(self.user.SetProcessWindowStation(self.station))
-                self.desktop = _check(self.user.CreateDesktopW("worker", None, None, 0, 0xF01FF, c.byref(security)))
-            finally:
-                _check(self.user.SetProcessWindowStation(original))
+            with _desktop_lock:  # Window-station selection is process-wide.
+                original = _check(self.user.GetProcessWindowStation())
+                try:
+                    _check(self.user.SetProcessWindowStation(self.station))
+                    self.desktop = _check(self.user.CreateDesktopW("worker", None, None, 0, 0xF01FF, c.byref(security)))
+                finally:
+                    _check(self.user.SetProcessWindowStation(original))
             self.desktop_name = name + "\\worker"
         finally:
             kernel.LocalFree(descriptor)
