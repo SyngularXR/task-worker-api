@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0.dev66
+
+- Give each Windows AppContainer a private window station and desktop. Native
+  worker Python can initialize SSL and ctypes from noninteractive services without
+  access to the user desktop; file grants, process-tree budgets and cleanup remain
+  enforced.
+
 ## 0.19.0.dev65
 
 - Expose `ResidentServiceLease.residence_remaining_seconds` for finite request/session

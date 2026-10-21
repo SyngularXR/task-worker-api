@@ -24,7 +24,7 @@ def test_appcontainer_denies_supervisor_access_and_preserves_staged_permissions(
     immutable.write_text("frozen input")
     output = work / "result.json"
     script = 'from pathlib import Path\nimport os\n' + inspect.getsource(_canonical_output_path) + r'''
-import ctypes,json,pathlib,sys,subprocess,socket
+import ctypes,json,pathlib,sys,subprocess,socket,ssl
 from ctypes import wintypes as w
 k=ctypes.WinDLL('kernel32',use_last_error=True)
 a=ctypes.WinDLL('advapi32',use_last_error=True)
@@ -41,6 +41,20 @@ a.GetTokenInformation(token,30,None,0,ctypes.byref(size))
 capabilities=ctypes.create_string_buffer(size.value)
 assert a.GetTokenInformation(token,30,capabilities,size.value,ctypes.byref(size))
 k.CloseHandle(token)
+u=ctypes.WinDLL('user32',use_last_error=True)
+u.GetThreadDesktop.argtypes=[w.DWORD];u.GetThreadDesktop.restype=w.HANDLE
+u.GetProcessWindowStation.restype=w.HANDLE
+u.GetUserObjectInformationW.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD,ctypes.POINTER(w.DWORD)]
+def object_name(handle):
+ value=ctypes.create_unicode_buffer(256);needed=w.DWORD()
+ assert u.GetUserObjectInformationW(handle,2,value,ctypes.sizeof(value),ctypes.byref(needed))
+ return value.value
+station=object_name(u.GetProcessWindowStation())
+desktop=object_name(u.GetThreadDesktop(k.GetCurrentThreadId()))
+assert station==sys.argv[6] and desktop=='worker'
+assert ssl.OPENSSL_VERSION
+u.OpenWindowStationW.argtypes=[w.LPCWSTR,w.BOOL,w.DWORD];u.OpenWindowStationW.restype=w.HANDLE
+assert not u.OpenWindowStationW(sys.argv[7],False,1) and ctypes.get_last_error()==5
 result={'app_container':flag.value,'capability_count':w.DWORD.from_buffer(capabilities).value,
  'input':pathlib.Path(sys.argv[2]).read_text()}
 probe=Path(sys.argv[1]).with_name('output.txt')
@@ -75,7 +89,7 @@ with socket.socket() as connection:
  except OSError as exc: result['network']=type(exc).__name__
 pathlib.Path(sys.argv[1]).write_text(json.dumps(result))
 '''
-    with socket.socket() as listener, WindowsAppContainer("surgiclaw." + uuid4().hex, network=network) as app:
+    with socket.socket() as listener, WindowsAppContainer("surgiclaw." + uuid4().hex, network=network) as app, WindowsAppContainer("surgiclaw." + uuid4().hex) as other:
         listener.bind(('127.0.0.1', 0))
         listener.listen()
         with socket.create_connection(listener.getsockname(), timeout=2):
@@ -87,7 +101,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(result))
             grant_access(app, path, access)
         with WindowsJob(memory_bytes=256*1024*1024, cpu_rate=10000, process_limit=8) as job:
             child = job.spawn([str(runtime / "python.exe"), "-I", "-S", "-c", script,
-                str(output), str(immutable), str(secret), str(os.getpid()), str(listener.getsockname()[1])], cwd=work,
+                str(output), str(immutable), str(secret), str(os.getpid()), str(listener.getsockname()[1]), app.desktop_name.split("\\")[0], other.desktop_name.split("\\")[0]], cwd=work,
                 environment={"SystemRoot": os.environ["SystemRoot"], "LOCALAPPDATA": os.environ["LOCALAPPDATA"],
                     "TEMP": str(work), "TMP": str(work)},
                 log_path=tmp_path / "worker.log", app_container=app)

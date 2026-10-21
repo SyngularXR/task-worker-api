@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 import time
 from contextlib import ExitStack
+from uuid import uuid4
 
 
 class _BasicLimits(c.Structure):
@@ -28,6 +29,10 @@ class _Limits(c.Structure):
 
 class _Cpu(c.Structure):
     _fields_ = [("flags", w.DWORD), ("rate", w.DWORD)]
+
+
+class _SecurityAttributes(c.Structure):
+    _fields_ = [("length", w.DWORD), ("descriptor", c.c_void_p), ("inherit", w.BOOL)]
 
 
 class _SecurityCapabilities(c.Structure):
@@ -218,6 +223,8 @@ class WindowsJob:
                     c.byref(security), c.sizeof(security), None, None))
             startup = _StartupEx()
             startup.startup.cb = c.sizeof(startup)
+            if app_container is not None:
+                startup.startup.desktop = app_container.desktop_name
             startup.attributes = c.cast(storage, c.c_void_p)
             if log_path is not None:
                 import msvcrt
@@ -386,6 +393,7 @@ class WindowsAppContainer:
         if type(network) is not bool:
             raise ValueError("network must be a boolean")
         self.name, self.sid = name, c.c_void_p()
+        self.station = self.desktop = None
         self.userenv = c.WinDLL("userenv", use_last_error=True)
         self.userenv.CreateAppContainerProfile.argtypes = [w.LPCWSTR, w.LPCWSTR, w.LPCWSTR,
             c.c_void_p, w.DWORD, c.POINTER(c.c_void_p)]
@@ -408,7 +416,56 @@ class WindowsAppContainer:
         if result < 0:
             raise OSError(f"CreateAppContainerProfile failed: 0x{result & 0xffffffff:08x}")
 
+        try:
+            self._create_desktop()
+        except BaseException:
+            self.close()
+            raise
+
+    def _create_desktop(self):
+        # A service's inherited desktop cannot initialize USER32-dependent Python DLLs.
+        self.user = c.WinDLL("user32", use_last_error=True)
+        signatures = {
+            "GetProcessWindowStation": ([], w.HANDLE),
+            "SetProcessWindowStation": ([w.HANDLE], w.BOOL),
+            "CreateWindowStationW": ([w.LPCWSTR, w.DWORD, w.DWORD, c.POINTER(_SecurityAttributes)], w.HANDLE),
+            "CreateDesktopW": ([w.LPCWSTR, w.LPCWSTR, c.c_void_p, w.DWORD, w.DWORD, c.POINTER(_SecurityAttributes)], w.HANDLE),
+            "CloseDesktop": ([w.HANDLE], w.BOOL),
+            "CloseWindowStation": ([w.HANDLE], w.BOOL),
+        }
+        for name, (args, result) in signatures.items():
+            function = getattr(self.user, name)
+            function.argtypes, function.restype = args, result
+        convert = self.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        convert.argtypes = [w.LPCWSTR, w.DWORD, c.POINTER(c.c_void_p), c.c_void_p]
+        convert.restype = w.BOOL
+        descriptor = c.c_void_p()
+        # Only SYSTEM, this trusted owner and this attempt may access the private desktop.
+        _check(convert("D:P(A;;GA;;;SY)(A;;GA;;;OW)(A;;GA;;;" + self.sid_string() + ")S:(ML;;NW;;;LW)",
+                       1, c.byref(descriptor), None))
+        kernel = c.WinDLL("kernel32", use_last_error=True)
+        kernel.LocalFree.argtypes = [c.c_void_p]
+        try:
+            security = _SecurityAttributes(c.sizeof(_SecurityAttributes), descriptor, False)
+            name = "surgiclaw." + uuid4().hex
+            self.station = _check(self.user.CreateWindowStationW(name, 1, 0xF037F, c.byref(security)))
+            original = _check(self.user.GetProcessWindowStation())
+            try:
+                _check(self.user.SetProcessWindowStation(self.station))
+                self.desktop = _check(self.user.CreateDesktopW("worker", None, None, 0, 0xF01FF, c.byref(security)))
+            finally:
+                _check(self.user.SetProcessWindowStation(original))
+            self.desktop_name = name + "\\worker"
+        finally:
+            kernel.LocalFree(descriptor)
+
     def close(self):
+        if self.desktop:
+            _check(self.user.CloseDesktop(self.desktop))
+            self.desktop = None
+        if self.station:
+            _check(self.user.CloseWindowStation(self.station))
+            self.station = None
         if self.sid:
             self.delete_profile(self.name)
             self.advapi.FreeSid(self.sid)
