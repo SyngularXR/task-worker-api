@@ -16,6 +16,12 @@ from .generate_synthetic import GenerateSyntheticParams
 from .gs_build import GsBuildParams, Gs4dBuildParams, SpatialGsBuildParams
 from .model_initializing import ModelInitializingParams
 from .segmentation import SegmentationParams
+from .interactive_session import (
+    InteractiveClick,
+    InteractiveRound,
+    InteractiveRoundReply,
+    InteractiveSessionParams,
+)
 from .render import RenderParams
 from .spatial_reconstruction import SpatialReconstructionParams
 from .visual_tracking import VisualTrackingParams
@@ -36,6 +42,7 @@ TASK_PARAMS_SCHEMAS: dict[TaskType, type[TaskParamsBase]] = {
     TaskType.GS_BUILD: GsBuildParams,
     TaskType.GS4D_BUILD: Gs4dBuildParams,
     TaskType.SEGMENTATION: SegmentationParams,
+    TaskType.INTERACTIVE_SESSION: InteractiveSessionParams,
     TaskType.DEPLOY_CASE: DeployCaseParams,
     TaskType.PREPARE_DEPLOY: PrepareDeployParams,
     TaskType.GENERATE_SYNTHETIC: GenerateSyntheticParams,
@@ -64,6 +71,10 @@ __all__ = [
     "Gs4dBuildParams",
     "SpatialGsBuildParams",
     "SegmentationParams",
+    "InteractiveSessionParams",
+    "InteractiveRound",
+    "InteractiveRoundReply",
+    "InteractiveClick",
     "SpatialReconstructionParams",
     "VisualTrackingParams",
 ]

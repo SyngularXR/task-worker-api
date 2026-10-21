@@ -53,6 +53,8 @@ class TaskType(str, Enum):
     SPATIAL_RECONSTRUCTION = "spatial_recon"
     SPATIAL_GS_BUILD = "spatial_gs_build"
     VISUAL_TRACKING = "visual_tracking"
+    # A warm MedSAM2 session: one admitted attempt answering many prompt rounds.
+    INTERACTIVE_SESSION = "interactive_session"
 
 
 class TaskStatus(IntEnum):

@@ -15,6 +15,7 @@ from .enums import TaskStatus, TaskType
 
 if TYPE_CHECKING:  # pragma: no cover — avoids circular import at runtime
     from .progress import ProgressReporter
+    from .resource_execution import AttemptLease
     from .resources import ClaimResult, ResourceProfile
 
 
@@ -74,3 +75,6 @@ class TaskContext:
     files: FileContext
     progress: "ProgressReporter"
     profile: "ResourceProfile | None" = None
+    # Admitted attempts only: the lease, for a warm session's
+    # ``next_round`` / ``reply_round`` / ``execution_remaining_seconds``.
+    rounds: "AttemptLease | None" = None

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.19.0.dev68
+
+- Add `TaskType.INTERACTIVE_SESSION` with `InteractiveSessionParams`: one admitted
+  attempt that freezes a volume once and answers many prompt rounds (a warm MedSAM2
+  session). `InteractiveRound` carries every prompted plane at once (`propagate`),
+  one frame's points (`click`) or `close`; `InteractiveRoundReply` returns bounded
+  base64 files with safe names, or an error.
+- Admitted handlers receive the lease as `ctx.rounds`: `next_round(wait_s)`
+  long-polls `GET /tasks/{id}/attempts/{attempt}/rounds/next` (204 = none yet),
+  `reply_round(reply)` sends `PUT …/rounds/{round_id}/reply`, both with the attempt
+  token. A 409 or retired protocol ends the lease as for progress.
+  `execution_remaining_seconds` lets a session complete before its deadline.
+  Backends must serve these routes before enrolling the task type.
+
 ## 0.19.0.dev67
 
 - Add explicit optional GS training flags for fused SSIM and AbsGS. Reject
