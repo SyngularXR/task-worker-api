@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev67
+
+- Add explicit optional GS training flags for fused SSIM and AbsGS. Reject
+  absolute gradients unless the task selects the default densification strategy.
+  Omitted flags retain existing worker behavior.
+
 ## 0.19.0.dev66
 
 - Give each Windows AppContainer a private window station and desktop. Native

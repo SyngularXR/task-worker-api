@@ -234,6 +234,10 @@ export interface GsBuildParams {
   num_threads?: number;
   background?: 'auto' | 'white' | 'black';
   strategy?: 'default' | 'mcmc';
+  /** Use fused CUDA SSIM during training. */
+  fused_ssim?: boolean;
+  /** Use AbsGS absolute gradients with the default strategy. */
+  absgrad?: boolean;
   /** Run COLMAP dense MVS for splat init (adds 5–30 min). */
   dense_init?: boolean;
 }
