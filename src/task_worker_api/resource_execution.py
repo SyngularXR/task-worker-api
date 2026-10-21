@@ -252,11 +252,13 @@ class AttemptLease:
 
         A warm session stops taking rounds well before this reaches zero, so
         it completes its attempt instead of being cut off by the watchdog.
+        The renewable lease window (about 30 s, extended by heartbeats) is not
+        runway; a lost lease reads as zero.
         """
         with self._lock:
             if self._execution_deadline is None or self._expired.is_set():
                 return 0.0
-            return max(0.0, min(self._deadline, self._execution_deadline) - time.monotonic())
+            return max(0.0, self._execution_deadline - time.monotonic())
 
     async def next_round(self, wait_s=20):
         """The next round of a warm session, or None after ``wait_s`` without one."""

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.0.dev69
+
+- `AttemptLease.execution_remaining_seconds` measures the execution deadline only.
+  dev68 also capped it by the renewable lease window (about 30 s), so a warm
+  session saw too little runway and ended right after it became ready.
+
 ## 0.19.0.dev68
 
 - Add `TaskType.INTERACTIVE_SESSION` with `InteractiveSessionParams`: one admitted
