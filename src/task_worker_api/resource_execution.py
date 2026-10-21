@@ -246,6 +246,41 @@ class AttemptLease:
         except Exception:
             log.warning("Attempt progress update failed", exc_info=True)
 
+    @property
+    def execution_remaining_seconds(self):
+        """Monotonic runway before the acknowledged execution deadline (0 before start).
+
+        A warm session stops taking rounds well before this reaches zero, so
+        it completes its attempt instead of being cut off by the watchdog.
+        """
+        with self._lock:
+            if self._execution_deadline is None or self._expired.is_set():
+                return 0.0
+            return max(0.0, min(self._deadline, self._execution_deadline) - time.monotonic())
+
+    async def next_round(self, wait_s=20):
+        """The next round of a warm session, or None after ``wait_s`` without one."""
+        self._require_running()
+        return await self._round_call(self.client.resource_round_next(self.claim, wait_s))
+
+    async def reply_round(self, reply):
+        """Answer a round (an ``InteractiveRoundReply`` or its dict)."""
+        self._require_running()
+        await self._round_call(self.client.resource_round_reply(self.claim, reply))
+
+    async def _round_call(self, call):
+        # Same dead-lease answers as update(): a 409 or a retired protocol
+        # means the token is gone, so stop the session instead of polling on.
+        try:
+            return await call
+        except ProtocolError:
+            self._mark_lost()
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                self._mark_lost()
+            raise
+
     def _require_running(self):
         with self._lock:
             if not self._started or self._closed.is_set() or self._expired.is_set() or time.monotonic() >= self._deadline:

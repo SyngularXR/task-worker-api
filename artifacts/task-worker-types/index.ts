@@ -35,6 +35,7 @@ export type TaskType =
   | 'spatial_recon'
   | 'spatial_gs_build'
   | 'visual_tracking'
+  | 'interactive_session'
 ;
 
 export const TaskType = {
@@ -68,6 +69,7 @@ export const TaskType = {
   SPATIAL_RECONSTRUCTION: 'spatial_recon' as const,
   SPATIAL_GS_BUILD: 'spatial_gs_build' as const,
   VISUAL_TRACKING: 'visual_tracking' as const,
+  INTERACTIVE_SESSION: 'interactive_session' as const,
 } as const;
 
 export enum TaskStatus {
@@ -323,6 +325,24 @@ export interface SegmentationParams {
 }
 
 /**
+ * Input for a warm session; rounds arrive through the attempt, not here.
+ */
+export interface InteractiveSessionParams {
+  /** NIfTI volume on the shared volume. */
+  input_path: string;
+  /** Server-minted shared dir of the session. */
+  output_dir: string;
+  case_id: number;
+  dicom_id: number;
+  dims: [number, number, number];
+  modality: 'mri' | 'ct';
+  window_center?: number;
+  window_width?: number;
+  volume_version?: string;
+  idle_seconds?: number;
+}
+
+/**
  * Input for the assetbundle-builder worker's deploy_case handler.
  */
 export interface DeployCaseParams {
@@ -433,6 +453,7 @@ export interface TaskParamsByType {
   'gs_build': GsBuildParams;
   'gs4d_build': Gs4dBuildParams;
   'segmentation': SegmentationParams;
+  'interactive_session': InteractiveSessionParams;
   'deploy_case': DeployCaseParams;
   'prepare_deploy': PrepareDeployParams;
   'generate_synthetic': GenerateSyntheticParams;

@@ -1168,7 +1168,7 @@ class Worker:
                             lease.raise_if_cancelled()
                     started = True
                     result = await lease.run(handler, TaskContext(task=task, files=files, progress=lease,
-                                                                 profile=claim.profile), params)
+                                                                 profile=claim.profile, rounds=lease), params)
                     result = result or {}
                     if _result_encode_error(result) is not None:
                         raise ProtocolError("handler result cannot be encoded")

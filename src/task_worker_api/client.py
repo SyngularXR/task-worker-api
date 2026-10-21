@@ -140,6 +140,10 @@ _LIFECYCLE_RETRY_AFTER_MAX_S = 5 * 60
 # stop the worker claiming until restarted. Shorter hints pass through as sent.
 # ``int`` for the same decimal-text comparison as above.
 _CLAIM_POLL_HINT_MAX_S = 5 * 60
+# A warm session's round long-poll: the backend holds it at most this long,
+# and the request may take that plus ordinary transport time.
+_ROUND_WAIT_MAX_S = 30
+_ROUND_TRANSPORT_S = 15
 
 # Jitter spread: each delay is multiplied by a uniform random factor in
 # ``[1 - JITTER, 1 + JITTER]``. ±25% is the AWS-recommended "full jitter"
@@ -1583,6 +1587,41 @@ class BackendClient:
         if cancelled is None:
             return await operation
         return await _await_unless_cancelled(operation, cancelled, cancel_message)
+
+    async def resource_round_next(self, claim, wait_s):
+        """Long-poll the next round of a warm session; ``None`` when none came.
+
+        One request, no retry: it runs on the handler's critical path like
+        :meth:`resource_progress`, and the session simply polls again. A 409
+        (dead lease) stays a raw ``HTTPStatusError`` for the lease to act on.
+        """
+        from .schemas import InteractiveRound
+
+        if not 0 < wait_s <= _ROUND_WAIT_MAX_S:
+            raise ValueError("round wait must be positive and bounded")
+        params = claim.ownership.model_dump(mode="json", exclude={"token", "attempt_id"})
+        params.update(protocol_version=2, wait_s=wait_s)
+        response = await self._resource_request_once(
+            "GET", f"/tasks/{claim.task_id}/attempts/{claim.ownership.attempt_id}/rounds/next",
+            params=params, headers={"X-Attempt-Token": claim.ownership.token},
+            timeout=httpx.Timeout(wait_s + _ROUND_TRANSPORT_S))
+        if response.status_code == 204:
+            return None
+        return InteractiveRound.model_validate(response.json())
+
+    async def resource_round_reply(self, claim, reply):
+        """Deliver one round's answer; retried, the backend keeps the first."""
+        from .files import _require_safe_filenames
+        from .schemas import InteractiveRoundReply
+
+        reply = InteractiveRoundReply.model_validate(reply)
+        _require_safe_filenames({name: name for name in reply.files}, field="files")
+        params = claim.ownership.model_dump(mode="json", exclude={"token", "attempt_id"})
+        params["protocol_version"] = 2
+        await self._resource_request(
+            "PUT", f"/tasks/{claim.task_id}/attempts/{claim.ownership.attempt_id}/rounds/{reply.round_id}/reply",
+            params=params, headers={"X-Attempt-Token": claim.ownership.token},
+            json=reply.model_dump(mode="json"), timeout=self._file_timeout)
 
     async def claim_next(
         self, task_types: list, worker_id: str
