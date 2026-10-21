@@ -51,10 +51,18 @@ class GsBuildParams(TaskParamsBase):
     num_threads: Optional[int] = Field(default=None, gt=0)
     background: Optional[Literal["auto", "white", "black"]] = Field(default=None)
     strategy: Optional[Literal["default", "mcmc"]] = Field(default=None)
+    fused_ssim: Optional[bool] = Field(default=None, description="Use fused CUDA SSIM during training.")
+    absgrad: Optional[bool] = Field(default=None, description="Use AbsGS absolute gradients with the default strategy.")
     dense_init: Optional[bool] = Field(
         default=None,
         description="Run COLMAP dense MVS for splat init (adds 5–30 min).",
     )
+
+    @model_validator(mode="after")
+    def require_absgrad_strategy(self):
+        if self.absgrad and self.strategy != "default":
+            raise ValueError("absgrad requires strategy='default'")
+        return self
 
 
 class Gs4dBuildParams(TaskParamsBase):

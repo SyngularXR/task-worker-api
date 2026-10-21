@@ -160,6 +160,18 @@ def test_gs_build_dense_init_optional():
     assert obj.dense_init is None
 
 
+def test_gs_training_flags_are_explicit_and_round_trip():
+    assert GsBuildParams().model_dump(exclude_none=True) == {}
+    flags = dict(strategy="default", absgrad=True, fused_ssim=True, iterations=20000)
+    assert GsBuildParams.model_validate(flags).model_dump(exclude_none=True) == flags
+
+
+@pytest.mark.parametrize("strategy", [None, "mcmc"])
+def test_gs_absgrad_rejects_other_strategies(strategy):
+    with pytest.raises(ValueError, match="absgrad requires"):
+        GsBuildParams(strategy=strategy, absgrad=True)
+
+
 def test_gs_build_accepts_warm_start_ply():
     # 4D warm-chain: each phase after the first seeds from the prior phase's PLY.
     obj = GsBuildParams(scene="/shared/p1/gs", warm_start_ply="/shared/p0/gs/gs_output/gs_p0.ply")
