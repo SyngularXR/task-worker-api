@@ -43,7 +43,7 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Run supervisor verification
         shell: bash
-        run: python -m pytest tests/test_docker_supervisor.py tests/test_windows_supervisor.py -q -ra --junitxml=supervisor-results.xml 2>&1 | tee supervisor-output.txt
+        run: python -m pytest tests/test_docker_supervisor.py tests/test_windows_supervisor.py tests/test_windows_appcontainer.py tests/test_windows_launch.py -q -ra --junitxml=supervisor-results.xml 2>&1 | tee supervisor-output.txt
       - name: Upload supervisor verification evidence
         if: always()
         uses: actions/upload-artifact@v4
