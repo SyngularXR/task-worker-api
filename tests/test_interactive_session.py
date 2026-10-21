@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -119,6 +120,9 @@ async def test_lease_rounds_need_a_start_and_a_409_ends_the_lease():
             await lease.next_round()
         await lease.start(None, "staged-inputs")
         assert 0 < lease.execution_remaining_seconds <= 10
+        # Runway is the execution limit, not the renewable lease window.
+        lease._execution_deadline = time.monotonic() + 600
+        assert lease.execution_remaining_seconds > 590
         with pytest.raises(httpx.HTTPStatusError):
             await lease.next_round()
         assert lease.is_cancelled and lease.execution_remaining_seconds == 0.0
