@@ -10,7 +10,23 @@ from task_worker_api.schemas import (
     PrepareDeployParams,
     GsBuildParams,
     Gs4dBuildParams,
+    RenderParams,
 )
+
+
+RENDER_PARAMS = dict(config_path="render_grid/scene1/config.json", job_id="j", config_hash="h")
+
+
+@pytest.mark.parametrize("field", ["gs_iterations", "gs_max_splats", "gs_sh_degree"])
+def test_render_rejects_negative_gs_overrides(field):
+    with pytest.raises(ValidationError):
+        RenderParams(**RENDER_PARAMS, **{field: -1})
+
+
+@pytest.mark.parametrize("field", ["gs_iterations", "gs_max_splats", "gs_sh_degree"])
+@pytest.mark.parametrize("value", [None, 0])
+def test_render_accepts_gs_override_boundaries(field, value):
+    assert getattr(RenderParams(**RENDER_PARAMS, **{field: value}), field) == value
 
 
 def test_prepare_deploy_requires_the_staged_recipe():
