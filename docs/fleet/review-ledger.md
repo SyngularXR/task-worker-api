@@ -6,6 +6,63 @@ records cross-worker review coverage; detailed findings and candidate decisions
 belong in the affected worker's ledger. Review dates are UTC. Tracking's separate
 model-research review is not duplicated here.
 
+## 2026-10-26
+
+Canonical standard, scopes and index refreshed at
+`9460cbdb37d6f9bdee7ab3ca129453c4cebe1e28`. Fresh source refs, owning guides,
+upstream releases/advisories and active Fleet work were reviewed. Deeper work
+rotated to Unity packaging. Tracking's separate research was not duplicated.
+
+| Role | Reviewed source | Disposition |
+|---|---|---|
+| Blender | `44855a7489515ff97fe600f73647509b0c1a993c` | Existing final-target/UV-array benchmarks, bulk access and material work have landed; not duplicated here. [bpy 5.2.3](https://pypi.org/project/bpy/5.2.3/) appeared on 2026-10-22 and fits the existing Python 3.13 / bpy <6 source range. This is release detection, not an evaluated speed/quality improvement or proof of the deployed wheel. PartUV 0.1.2 and xatlas 0.0.11 release metadata are unchanged. |
+| Gaussian / colmap-splat | `e68d204d05561afe0e4ebe811059bc8aa9c87d3a` | Source now pins SDK dev67 and carries explicit fused SSIM/AbsGS settings, input validation and status-volume recovery. Those existing changes are separate from this review. COLMAP/pycolmap 4.2.1, gsplat 1.5.3, PPISP v1.3.0 and torch 2.14.1 upstream checks leave prior candidate decisions unchanged; no new library benefit was measured. |
+| Neural-Canvas | `963bcd2f94a263a8ad271e315cd48c265e787fb0` | SDK dev69, warm-session work, bounded prediction and CT/CTA point-sampling work are already in source. The guide distinguishes its artifact experiment from clinical/device evidence. MONAI 1.6.1/ImpactSynth 1.8.7 releases are unchanged; no new MONAI advisory published since the previous review was found. |
+| Backend compute | `460cb719e2936414e5f28315b218c277ea4ad079` | Requirements pin SDK dev68; the guide's old dev60 sentence is not authoritative for installed versions. Existing relay/admission planning and preparation-budget work are not duplicated. No renderer or numerical-library upgrade selected. |
+| Trusted finalizers | `460cb719e2936414e5f28315b218c277ea4ad079` | Frozen deploy-selection publication and preparation geometry/recovery work are already documented. No live-data mutation or newly reproduced finalizer defect from this review. |
+| Unity AssetBundle | `055fa8bd0c57155287c5315403eff7386272c970` | [PR 124](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/pull/124) rejects non-object snapshot metadata before licensing/build; ten retained regressions fail before/pass after. Linux suites passed 371 tests on each of Python 3.10 and 3.11, and image verification passed before merge. [PR 125](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/pull/125) separately addresses the Certifi trust-store finding below. Details and rollout limits are in the [owning ledger](https://github.com/SyngularXR/syngar-ml-assetbundle-builder/blob/main/docs/review-ledger.md). |
+| Synthetic reconstruction | `0359b1b50c6561d93534b444d2a6dd591c3b0801` | Existing changes add stale-work cleanup, descendant termination, RSS/timing evidence, output cleanup and source reuse. Source still separates SDK dev35/modern CLI from the pinned legacy NiftyMIC stack. NumPy 2.5.4, SimpleITK 2.5.6 and NiftyMIC release checks do not establish a new compatible upgrade or speed gain. |
+
+New meaningful upstream finding: critical
+[Certifi GHSA-6q48-6c7w-9gw2](https://github.com/certifi/python-certifi/security/advisories/GHSA-6q48-6c7w-9gw2),
+published 2026-10-20, concerns emSign roots after intermediate-key compromise.
+The AssetBundle lock selected 2026.7.22. Adopted
+[2026.10.23](https://pypi.org/project/certifi/2026.10.23/) removes three roots from
+that store, while retaining other roots. A regression through HTTPX's bundled
+default TLS context fails before/pass after; both stores retrieved identical
+bytes from an immutable-version verified-HTTPS control. This is transport trust
+evidence, not rendering/generation performance. The worker package/lock and
+admission/visionOS image paths now enforce the updated store in source. Operator CA
+overrides and native Unity TLS are separate; no verification bypass is used.
+
+PR 124 merged as `a9ec9f0d677b2de3435095be43725ce5a822e761`; PR 125 merged as
+`3aa72af5565e4f90262628000c8835221391e4db`. The security PR passed 372 tests on
+each supported Linux Python version and normal image-build verification before
+merge. Admission and manual visionOS derivative images were not built in this
+review; their source changes add the same standard Certifi install. Overlay
+builds need an approved package index/mirror. No live rollout was performed.
+
+Read-only Orttu observation: backend image
+`sha256:ddd79b08cace33042362e355e317f6bf85a8c9b8fa76f64060b5105e98f65416`;
+hybrid Neural image
+`sha256:ad5c67ad41e68497a79af63f491e7f4ef01cde486b7290f3812efdc37f2278c8`.
+Neural metadata reports Python 3.10.12, SDK dev69, torch 2.11.0+cu128, NumPy
+1.24.2, SimpleITK 2.4.1, MONAI 1.6.0, pycolmap 4.1.1 and Certifi 2026.10.19.
+That installed Certifi version is separate from the affected builder lock; no
+interception or fleet-wide deployment remediation is claimed. Orttu reports an
+RTX 3080, driver 617.42 and 10240 MiB VRAM; hardware metadata does not establish
+an admitted resource profile or validate cached Gaussian CUDA extensions.
+
+No live services were deployed or managed compute run outside admission.
+Builder/deeper-worker deployed image/package/profile identities, configured
+private HTTPS peer compatibility and Android client/device versions remain
+unverified. Actual-consumer views/motion, Android load/memory/frame-time tails
+and generation-speed changes were not measured. The fixes concern invalid
+snapshot rejection and Python TLS trust, not models, shaders, compression or
+rendering settings. Next deeper rotation: trusted publication/recovery or a
+same-input admitted Gaussian comparison when final-artifact/device evidence is
+available.
+
 ## 2026-10-19
 
 Canonical standard, scopes and workflow index refreshed at
