@@ -6,6 +6,85 @@ records cross-worker review coverage; detailed findings and candidate decisions
 belong in the affected worker's ledger. Review dates are UTC. Tracking's separate
 model-research review is not duplicated here.
 
+## 2026-11-02
+
+Canonical standard, improvement scopes and Fleet HQ index refreshed at
+`7c899d9903596d8af168892483341db454cff5fc`. Fresh source refs and owning guides
+were reviewed across all seven roles. Deeper investigation rotated to trusted
+volume publication and its shared snapshot guard; tracking research was excluded.
+
+| Role | Reviewed source | Disposition |
+|---|---|---|
+| Blender | `7ab40902a2dba616b79533484a395604c0048694` | Existing planar bulk-read, composite-padding removal, finalized-texture reporting and retained benchmark work are not duplicated. bpy 5.2.3 / PartUV 0.1.2 / xatlas 0.0.11 release checks are unchanged. Source remains Python >=3.13, bpy >=5.1,<6 and SDK dev47; no new runtime/tooling upgrade selected. |
+| Gaussian / colmap-splat | `e68d204d05561afe0e4ebe811059bc8aa9c87d3a` | Source remains torch 2.7.0/cu128, nvcc 12.9, gsplat 1.5.3, pycolmap 4.2.0, pinned PPISP/fused SSIM and SDK dev67. New [PyTorch 2.15.0](https://github.com/pytorch/pytorch/releases/tag/v2.15.0), published 2026-10-28, has plausible PPISP module-call/indexing benefits but no measured worker gain. The owning ledger records the used path, CUDA/toolchain rebuild requirements and fixed-input benchmark gates; adoption deferred. COLMAP 4.2.1, gsplat 1.5.3 and PPISP v1.3.0 checks are unchanged. |
+| Neural-Canvas | `ca8c0d9c61c68b3a5b78f00b57ed5d4e20cc1d1a` | Recent Python 3.11/stable-interpreter and VISTA3D Ignite changes already landed. Hybrid source pins SDK dev69, NumPy 1.24.2 and SimpleITK 2.4.1; MONAI 1.6.1 remains the latest release checked, with no new published MONAI advisory since 2026-10-26 found. Dedicated CT keeps its separate SDK dev60 / SimpleITK 2.5.2 / KonfAI 1.8.7 and model pins. New ImpactSynth safetensors revision rejected as a revision-only improvement: the unchanged MR app still selects the old checkpoints while `MR/*` staging adds 522,320,420 bytes. Details in the [owning ledger](https://github.com/SyngularXR/Neural-Canvas/blob/main/docs/guide/worker-review-ledger.md). No weights/framework upgrade. |
+| Backend compute | `4ce1e430559092937147147dd8bdd3c109023668` | Existing full-resolution/resource-recovery and render-peer compatibility work remains separate. Requirements pin SDK dev68, NiBabel 5.2.1, NumPy 1.26.4 and SimpleITK 2.3.1. The shared volume guard fix below protects snapshots as well as publication; both workflow guides now report the source SDK pin correctly. |
+| Trusted finalizers | `4ce1e430559092937147147dd8bdd3c109023668` | [PR 1652](https://github.com/SyngularXR/SynPusher-Vue/pull/1652) rejects invalid raw NIfTI spacing that passed the affine/voxel check. The [owning backend ledger](https://github.com/SyngularXR/SynPusher-Vue/blob/main/docs/guide/backend-worker-review-ledger.md) records the 48 before/after fixtures, caller coverage, reader discrepancy, SimpleITK candidate and authentication advisory applicability. |
+| Unity AssetBundle | `324f92adfd3f308b0ed326470fd6825747b6a950` | Existing PR 126 moves admitted Unity project work onto native Docker storage; it is separate from this review. The prior Certifi fix remains in source and no open builder Dependabot alert was returned. Editor source stays 6000.3.25f1; Syngar-ML release 3.11.11 appeared 2026-11-01, but a package tag does not establish the vendored build or supported Android client. No shader/editor/bundle-format upgrade selected. |
+| Synthetic reconstruction | `6d707299e6c5a53e5d87a78ad3417ae5d3cfcde1` | Existing strict ROI bounds, in-plane extent checks, child-group cleanup and real-NiftyMIC benchmark coverage are not duplicated. CLI source still isolates Python 3.10 / NumPy 2.2.6 / SimpleITK 2.5.6 / SDK dev35 from legacy Python 3.6 / NumPy 1.19.5 / SimpleITK 1.2.4 and custom ITK filters. NiftyMIC's old v0.6 release tag is not the image's solver version. No blanket upgrade. |
+
+Reproduced defect: valid sforms hide malformed spatial `pixdim`. NiBabel can
+normalize non-positive spacing; with raw X spacing NaN and a valid `(2,3,4)` mm
+sform, pinned NiBabel reads `(2,3,4)` while pinned SimpleITK reads `(1,3,4)` mm.
+The fix rejects finite-voxel NIfTI-1/2 plain/gzip fixtures with NaN, infinity,
+zero or negative spacing before decoding. Forty-eight cases fail before/pass
+after; twelve existing validation cases pass both. Eight additional valid
+anisotropic/negative-qfac/endian/storage controls retain identical bytes.
+Local function-isolated checks omit backend module/DB and active-stage context;
+the PR's full repository/admission CI is a separate merge gate. PR 1652 merged
+as `d0d30b58e5ecdd2f2bc236e0af35cd5b334e10ee` after all applicable checks passed,
+including 1,442 admission tests and 7,479 backend tests (plus 28 separate checks).
+
+New model-package candidate:
+[ImpactSynth b8c114d](https://huggingface.co/VBoussot/ImpactSynth/commit/b8c114de2eb805a620c16c21d6b27a1af70d531e),
+published 2026-10-30, adds five MR safetensors files. Existing MR object IDs,
+including app/config and `.pt` files, remain unchanged from the qualified
+`18ca36f` revision. No tensor contents were downloaded/compared, and no maintained
+loader/app revision selecting these new files was qualified. The owning Neural
+ledger records the used offline/hash-pinned path and cold-load/inference,
+tensor/final-volume and device acceptance plan. Merely bumping the model
+revision does not demonstrate a quality, safety or speed benefit.
+
+The Gaussian review is [PR 129](https://github.com/SyngularXR/colmap-splat/pull/129),
+merged as `9b6ee1ce563777e381d397bcec7589f3a49328bc` after shellcheck/unit CI
+(458 passed, five skipped). That repository reports no required branch checks;
+its optional CUDA image build remained running at documentation-only merge.
+No CUDA/runtime change is included. The Neural model review is
+[PR 384](https://github.com/SyngularXR/Neural-Canvas/pull/384), merged as
+`f8fa00bb32ad4d67a6abbbb5a69bef0d1db8708c` after code-quality and unit checks
+(1,025 passed, five skipped); its CUDA image publication was skipped on the PR.
+
+Official [SimpleITK 2.5.7](https://github.com/SimpleITK/SimpleITK/releases/tag/v2.5.7)
+was published 2026-10-30, revision `6f729513c34439f6bdc3f734d55436a2f0149a0e`.
+Its streamed-reader capability query does not speed up existing `ReadImage`
+calls or the NiBabel preflight path. No upgrade selected; geometry/voxel/window
+parity and repeated bounded-memory/admitted IO comparisons would be required.
+The new critical python-jose repository alert 600 was reviewed against both
+explicit-HS256 symmetric-secret decode sites. No affected source configuration
+was reproduced and GitHub lists no patched release; the alert remains open.
+This is not a deployed-configuration or fleet-wide security clearance.
+
+Read-only Orttu observations: backend image
+`sha256:073099c14ca32c708357117b22fe831c8db088d5f38af56bb7c3436139f3a31a`,
+Python 3.11.18, SDK dev68, NumPy 1.26.4, NiBabel 5.2.1, SimpleITK 2.3.1,
+python-jose 3.4.0 and Certifi 2026.10.23. Hybrid Neural image
+`sha256:c465a2289686014d309e8cfd3a7ec2c70a9075074dbefb149aa2671dba35bb53`,
+Python 3.11.18, SDK dev69, torch 2.11.0+cu128, NumPy 1.24.2, SimpleITK 2.4.1,
+MONAI 1.6.0, pycolmap 4.1.1 and Certifi 2026.10.23. These are observed installed
+packages, not source-to-image attestations or profile/client qualification.
+A bounded 24-hour/last-2000-line backend log sample had no named malformed-volume,
+model-artifact or synthetic-publication-conflict errors; it contained 16 HTTPException
+and one ValidationError traceback. Counts alone establish no new root cause or
+absence of failures outside that sample; no patient/request data was retained.
+
+No live deployment or model computation outside admission. Active resource
+profiles, other worker image/package identities and Android device/client
+versions remain unverified. Final visual/motion comparisons, Android load,
+memory/frame-time tails and generation-speed changes were not measured. The
+runtime fix tightens invalid-input rejection, without changing valid output
+bytes, algorithms or render settings. Next deeper rotation: backend compute
+or a matched admitted Gaussian comparison when consumer/device evidence exists.
+
 ## 2026-10-26
 
 Canonical standard, scopes and index refreshed at
